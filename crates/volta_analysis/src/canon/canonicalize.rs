@@ -110,7 +110,9 @@ impl Session {
                 Ok(RatV::from_rat(self.arena.rat_poly(p)))
             }
             ExprNode::Symbol(sym) => {
-                let p = self.arena.symbol_poly(&format!("s{}", sym.0));
+                // `SymbolId`'s `Display` is the one source of the machine
+                // name; `volta_z3` correlates the same symbols by it.
+                let p = self.arena.symbol_poly(&sym.to_string());
                 Ok(RatV::from_rat(self.arena.rat_poly(p)))
             }
 

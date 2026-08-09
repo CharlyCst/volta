@@ -112,6 +112,13 @@ cargo run --release -- compare <ref.ptx> <opt.ptx> \
 - `--no-profile`: skip the per-instruction-kind execution profile (shown by default)
 - `--backend decision|z3` (default `decision`): which decision procedure to
   check equivalence with - see [Z3 backend](#z3-backend)
+- `--exp-axiom` (with `--backend z3`): the paper's "with axiom" exp
+  encoding - see [Z3 backend](#z3-backend)
+
+Exit code: `compare` exits 0 only when every checked element was proved
+equivalent (with `--backend z3` that excludes `unknown`/`timeout`/
+`unsupported`/error elements, not just mismatches - a run that verified
+nothing does not exit 0).
 
 **VC dump/replay**: after symbolic execution, persist both kernels'
 verification conditions (the expression arena + output footprint) to disk,
@@ -123,10 +130,15 @@ cargo run --release -- compare <ref.ptx> <opt.ptx> ... --dump-vcs pair.vcdump
 cargo run --release -- compare --from-dump pair.vcdump   # rerun later, instantly
 ```
 
+Dump files carry a magic/version header and are validated on load, so a
+truncated, corrupted, or version-skewed dump fails with a clean error
+rather than a crash.
+
 ### Logging
 
 Every `volta`/`volta-bench` run writes a log file under `volta-logs/`
-(`<timestamp>-<command>.log`), recording the exact command line and a
+(`<unix-seconds>-<pid>-<command>.log`; the pid keeps two runs in the same
+second from clobbering each other), recording the exact command line and a
 one-line outcome summary - independent of the `logging` feature, so it
 works in a plain build. Pass `--log-dir <path>` to change the directory or
 `--no-log-file` to disable it. Building with `--features logging` also
@@ -139,27 +151,54 @@ cargo run --release --features logging -- --log-level info analyze ...
 
 ### Z3 backend
 
-Checks the same verification conditions with Z3 (via SMT-LIB2, shelling out
-to the `z3` CLI - no FFI/bindgen, just `z3` on `PATH`) instead of Volta's
-own decision procedure, for a timing/capability comparison. This reproduces
-the finding from on Volta's
-independent kernel corpus: Z3 decides the polynomial fragment (matmul) and
-is competitive, but returns `unknown` on the exponential fragment
-(softmax/attention) at realistic sizes - not a bug, a fragment Z3's
-decidable theories don't cover, which is exactly why the specialized
-decision procedure exists.
+Checks the same verification conditions with Z3 instead of Volta's own
+decision procedure, for a timing/capability comparison. Queries are
+generated as SMT-LIB2 text (auditable: any query can be replayed against
+a standalone z3) and evaluated in-process through libz3's C API - a
+hand-written eight-function binding, no `z3-sys`/bindgen/libclang, no
+temp files, no per-element process spawns, and no `z3` binary needed at
+runtime. The one prerequisite is the Z3 shared library at build time:
 
 ```bash
-sudo apt-get install -y z3   # only prerequisite - no libz3-dev/libclang-dev
+sudo apt-get install -y libz3-dev
 cargo run --release -- compare <ref.ptx> <opt.ptx> ... --backend z3
 ```
 
-Covers the arithmetic + `Exp` + `Max`/`Min` fragment (same atom-naming
-convention as the decision procedure, so cross-kernel symbol correlation
-matches); anything else (`Select`, comparisons, bitwise ops,
-data-dependent array reads, ...) is reported `unsupported` for that element
-rather than guessed at unsoundly. See `crates/volta_z3/src/translate.rs`
-for the exact boundary.
+The expected shape of the results reproduces the paper's section 6.5 and
+Table 8. Z3 decides the polynomial fragment (reduction/matmul/conv) in
+milliseconds. On the exponential fragment (softmax/attention) there are
+two documented baselines, and the backend implements both:
+
+- **Default encoding**: the exponential is a nonlinear power term with a
+  strictly-bounded base. Z3 returns `unknown` - no decision procedure
+  covers symbolic real exponents. This is the paper's no-intervention
+  baseline.
+- **`--exp-axiom`**: the exponential becomes an uninterpreted function
+  plus the addition-law axiom `forall x y. e^x e^y = e^(x+y)` (the
+  paper's "Z3 with axiom" setup). The axiom sends Z3 into an unbounded
+  quantifier-instantiation loop on softmax-shaped VCs, so instead of a
+  fast `unknown` the query runs until the time budget kills it -
+  reported as `timeout`. The paper used a 10-minute budget.
+
+`--z3-timeout` is a *hard* per-query bound: z3 4.8.12 does not reliably
+honor its own soft timeout in the axiom-induced loop (measured: a
+3-second soft timeout still running after 90 seconds), so each query
+evaluates in a forked worker that is killed on expiry. `timeout` in the
+element counts means the budget expired; `unknown` means z3 itself gave
+up with budget to spare.
+
+Covers the arithmetic + `Exp` + `Max`/`Min` fragment. The translation
+preserves the decision procedure's cross-kernel correlation guarantees:
+identical structure in the two kernels' expressions is interned to shared
+SMT terms (so `max`/`min` opaque atoms with compound arguments line up
+across kernels), float constants use their exact binary values (the same
+reading as the decision procedure and the numeric oracle, not the decimal
+approximation), and user symbol names live in a reserved namespace so they
+can never collide with generated solver names. Anything outside the
+fragment (`Select`, comparisons, bitwise ops, data-dependent array
+reads, ...) is reported `unsupported` for that element rather than guessed
+at unsoundly. See `crates/volta_z3/src/translate.rs` for the exact
+boundary and invariants.
 
 ### Reproduce the paper's evaluation
 
@@ -199,10 +238,35 @@ cargo run --release -p volta_bench -- z3-compare "(Attention, FA1)"
 For every equivalence benchmark matched by the selector (`all`, a category,
 or an exact benchmark name), this runs *both* backends and prints exec/
 decision/Z3 timing side by side, plus Z3's per-element equivalent/
-not-equivalent/unknown/unsupported/error breakdown. `--z3-timeout N` bounds
-each Z3 query in seconds (default 30, `0` = no limit); `--sample`/
-`--recycle-terms` (global flags) apply to both backends. The default
-`all`/`category`/`single` commands never invoke Z3 - `z3-compare` is opt-in.
+not-equivalent/unknown/timeout/unsupported/error breakdown. Benchmarks
+whose VCs contain exponentials additionally get a `+exp-axiom` sub-row:
+the same elements rerun under the paper's addition-law-axiom encoding
+(expected outcome: `timeout`, versus `unknown` on the default row - see
+[Z3 backend](#z3-backend)). Race-check benchmarks (no optimized kernel)
+are skipped with a note when matched by `all` or a category.
+`--z3-timeout N` hard-bounds each Z3 query in seconds (default 30, `0` =
+no limit); the global `--sample` flag applies to both backends, and
+`--recycle-terms`/`--verify-numeric` to the decision-procedure column,
+exactly as in the default commands. Exits nonzero if any benchmark row
+failed outright. The default `all`/`category`/`single` commands never
+invoke Z3 - `z3-compare` is opt-in.
+
+To reproduce the paper's Table 8 exactly - one element per output tensor,
+a 10-minute budget per query:
+
+```bash
+cargo run --release -p volta_bench -- --sample 1 z3-compare all --z3-timeout 600
+```
+
+(Expect the attention/causal rows to spend the full budget per element on
+their `+exp-axiom` sub-rows.) One caveat on small machines: the
+axiom-induced grind also eats memory, and if z3 exhausts memory before
+the deadline it gives up with `unknown` instead of surviving to the kill
+(measured on a 15 GiB box: the memory wall arrives after roughly half a
+minute of grinding; the paper's 10-minute timeouts assume its 220 GB
+machine). Pick a budget below the memory wall - e.g. `--z3-timeout 20` -
+to see the `timeout` outcome on constrained hardware, and run one
+category at a time.
 
 **Memory note**: symbolic execution plus a warm VC session can use tens of
 GiB on the attention benchmarks (each output row retains a large shared

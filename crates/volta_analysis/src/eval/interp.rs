@@ -115,7 +115,11 @@ pub struct Interpreter<'p> {
     regions: MemRegions,
     pub(in crate::eval) race: RaceTracker,
     pub(in crate::eval) stats: Stats,
-    pub(in crate::eval) op_counts: std::collections::BTreeMap<&'static str, u64>,
+    /// Per-kind instruction counts, indexed by `LoweredInstr::kind_index`.
+    /// A fixed array (not a map) because this is bumped once per executed
+    /// instruction in `step`, the interpreter's innermost loop; `finish`
+    /// folds it into the `BTreeMap` shape `AnalysisOutput` exposes.
+    pub(in crate::eval) op_counts: [u64; crate::lowered::KIND_COUNT],
 }
 
 impl<'p> Interpreter<'p> {
@@ -237,7 +241,7 @@ impl<'p> Interpreter<'p> {
             regions,
             race: RaceTracker::new(n_threads as usize),
             stats: Stats::default(),
-            op_counts: std::collections::BTreeMap::new(),
+            op_counts: [0; crate::lowered::KIND_COUNT],
         })
     }
 
@@ -330,11 +334,18 @@ impl<'p> Interpreter<'p> {
     /// Consume the interpreter, producing the analysis output.
     pub fn into_output(self) -> EvalResult<AnalysisOutput> {
         let outputs = self.extract_outputs()?;
+        let op_counts = self
+            .op_counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| count > 0)
+            .map(|(i, &count)| (crate::lowered::KIND_NAMES[i], count))
+            .collect();
         Ok(AnalysisOutput {
             arena: self.arena,
             outputs,
             stats: self.stats,
-            op_counts: self.op_counts,
+            op_counts,
         })
     }
 
@@ -503,7 +514,7 @@ impl<'p> Interpreter<'p> {
         let instr = instr.clone();
 
         self.stats.instructions += 1;
-        *self.op_counts.entry(instr.kind_name()).or_insert(0) += 1;
+        self.op_counts[instr.kind_index()] += 1;
         if self.stats.instructions > self.config.max_instructions {
             return Err(EvalError::InstructionLimit {
                 limit: self.config.max_instructions,

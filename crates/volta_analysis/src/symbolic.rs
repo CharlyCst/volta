@@ -221,6 +221,78 @@ pub enum ExprNode {
     Undefined,
 }
 
+impl ExprNode {
+    /// Call `f` on every child `ExprId` of this node. An exhaustive match
+    /// (no wildcard) so a new variant fails to compile here instead of
+    /// silently having its children skipped.
+    pub fn for_each_child(&self, mut f: impl FnMut(ExprId)) {
+        match self {
+            ExprNode::IntConst(_)
+            | ExprNode::FloatConst(_)
+            | ExprNode::BoolConst(_)
+            | ExprNode::Symbol(_)
+            | ExprNode::NamedSymbol(_)
+            | ExprNode::Discarded
+            | ExprNode::Undefined => {}
+
+            ExprNode::Neg(a)
+            | ExprNode::Exp(a)
+            | ExprNode::Log(a)
+            | ExprNode::Sqrt(a)
+            | ExprNode::Rcp(a)
+            | ExprNode::Abs(a)
+            | ExprNode::BitNot(a)
+            | ExprNode::Not(a)
+            | ExprNode::ToFloat(a)
+            | ExprNode::ToInt(a)
+            | ExprNode::SignExtend { value: a, .. }
+            | ExprNode::ZeroExtend { value: a, .. }
+            | ExprNode::Truncate { value: a, .. }
+            | ExprNode::SymbolicRead { index: a, .. } => f(*a),
+
+            ExprNode::Add(a, b)
+            | ExprNode::Sub(a, b)
+            | ExprNode::Mul(a, b)
+            | ExprNode::Div(a, b)
+            | ExprNode::Rem(a, b)
+            | ExprNode::Max(a, b)
+            | ExprNode::Min(a, b)
+            | ExprNode::BitAnd(a, b)
+            | ExprNode::BitOr(a, b)
+            | ExprNode::BitXor(a, b)
+            | ExprNode::Shl(a, b)
+            | ExprNode::Shr(a, b)
+            | ExprNode::LShr(a, b)
+            | ExprNode::Eq(a, b)
+            | ExprNode::Ne(a, b)
+            | ExprNode::Lt(a, b)
+            | ExprNode::Le(a, b)
+            | ExprNode::Gt(a, b)
+            | ExprNode::Ge(a, b)
+            | ExprNode::And(a, b)
+            | ExprNode::Or(a, b) => {
+                f(*a);
+                f(*b);
+            }
+
+            ExprNode::Select(a, b, c) | ExprNode::Fma(a, b, c) => {
+                f(*a);
+                f(*b);
+                f(*c);
+            }
+        }
+    }
+
+    /// The `StringId` this node references, if any.
+    pub fn string_id(&self) -> Option<StringId> {
+        match self {
+            ExprNode::NamedSymbol(sid) => Some(*sid),
+            ExprNode::SymbolicRead { array, .. } => Some(*array),
+            _ => None,
+        }
+    }
+}
+
 // =========================================================================
 // Arena
 // =========================================================================
@@ -237,18 +309,27 @@ pub struct ExprArena {
 // `IdVec` has no serde support (see id_collections 1.0.1), so the arena is
 // (de)serialized by hand as its two flat `Vec`s - this is the format used by
 // `volta compare --dump-vcs`/`--from-dump` to persist verification
-// conditions across runs.
-#[derive(serde::Serialize, serde::Deserialize)]
+// conditions across runs. Serialization borrows the slices (`ExprArenaDataRef`)
+// rather than cloning them: serde encodes `&[T]` and `Vec<T>` identically (a
+// seq with a length), and attention-scale arenas are large enough that a
+// transient clone at dump time would meaningfully spike peak memory.
+#[derive(serde::Deserialize)]
 struct ExprArenaData {
     nodes: Vec<ExprNode>,
     strings: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
+struct ExprArenaDataRef<'a> {
+    nodes: &'a [ExprNode],
+    strings: &'a [String],
+}
+
 impl serde::Serialize for ExprArena {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ExprArenaData {
-            nodes: self.nodes.as_slice().to_vec(),
-            strings: self.strings.as_slice().to_vec(),
+        ExprArenaDataRef {
+            nodes: self.nodes.as_slice(),
+            strings: self.strings.as_slice(),
         }
         .serialize(serializer)
     }
@@ -299,6 +380,56 @@ impl ExprArena {
     /// Look up a string by its id.
     pub fn string(&self, id: StringId) -> &str {
         &self.strings[id]
+    }
+
+    /// Check that every node's children were pushed strictly before it
+    /// (which also bounds them inside the arena) and every `StringId` is
+    /// in range. Construction guarantees children-before-parents, so a
+    /// freshly built arena always passes; this exists for arenas rebuilt
+    /// from external data (`--from-dump`), where a corrupt or
+    /// version-skewed file could otherwise smuggle in a forward or
+    /// self-reference and send a later consumer into unbounded recursion,
+    /// or an out-of-bounds id into a panic deep inside a check.
+    pub fn validate(&self) -> Result<(), String> {
+        let n_strings = self.strings.len();
+        for (id, node) in self.nodes.as_slice().iter().enumerate() {
+            let mut bad_child = None;
+            node.for_each_child(|child| {
+                if id_collections::Id::to_index(child) as usize >= id && bad_child.is_none() {
+                    bad_child = Some(child);
+                }
+            });
+            if let Some(child) = bad_child {
+                return Err(format!(
+                    "node {} references child expression {}, but children must \
+                     precede their parents (forward, self, or out-of-bounds \
+                     reference)",
+                    id,
+                    id_collections::Id::to_index(child),
+                ));
+            }
+            if let Some(sid) = node.string_id() {
+                if id_collections::Id::to_index(sid) as usize >= n_strings {
+                    return Err(format!(
+                        "node {} references string {} but the arena has {} strings",
+                        id,
+                        id_collections::Id::to_index(sid),
+                        n_strings
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Test-only back door for building arenas that violate construction
+    /// invariants, to exercise `validate`.
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts_for_test(nodes: Vec<ExprNode>, strings: Vec<String>) -> Self {
+        Self {
+            nodes: IdVec::from_vec(nodes),
+            strings: IdVec::from_vec(strings),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1608,5 +1739,44 @@ mod tests {
         // Should contain " + 1" and parentheses
         assert!(s.contains(" + "));
         assert!(s.contains("1"));
+    }
+
+    /// `validate` accepts every arena the constructors can build...
+    #[test]
+    fn validate_accepts_constructed_arenas() {
+        let mut ar = ExprArena::new();
+        let x = ar.named("x");
+        let y = ar.symbol();
+        let s = ar.add(x, y);
+        let m = ar.max(s, x);
+        let _ = ar.select(m, s, x);
+        assert_eq!(ar.validate(), Ok(()));
+    }
+
+    /// ...and rejects forward/self references and out-of-range string
+    /// ids, which only a corrupt or crafted dump can contain. A self
+    /// reference like `Add(0, 0)` at node 0 previously passed the
+    /// bounds-only check and sent consumers into unbounded recursion.
+    #[test]
+    fn validate_rejects_malformed_arenas() {
+        use id_collections::Id;
+
+        let cyclic = ExprArena::from_raw_parts_for_test(
+            vec![ExprNode::Add(Id::from_index(0), Id::from_index(0))],
+            vec![],
+        );
+        assert!(cyclic.validate().is_err());
+
+        let forward = ExprArena::from_raw_parts_for_test(
+            vec![ExprNode::Neg(Id::from_index(1)), ExprNode::IntConst(1)],
+            vec![],
+        );
+        assert!(forward.validate().is_err());
+
+        let oob_string = ExprArena::from_raw_parts_for_test(
+            vec![ExprNode::NamedSymbol(Id::from_index(3))],
+            vec!["x".to_string()],
+        );
+        assert!(oob_string.validate().is_err());
     }
 }

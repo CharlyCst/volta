@@ -15,7 +15,7 @@ pub mod z3_compare;
 
 pub use benchmarks::all_benchmarks;
 pub use config::{BenchmarkCategory, BenchmarkDef, BenchmarkSuite, ExpectedOutcome, KernelRun};
-pub use reporter::{export_json, print_all_results, print_op_counts, print_results_table, print_summary};
+pub use reporter::{export_json, print_all_results, print_results_table, print_summary};
 pub use runner::{ActualOutcome, BenchmarkResult, BenchmarkRunner, BenchmarkStats, RunnerConfig};
 pub use z3_compare::{Z3CompareRow, compare_one};
 

@@ -15,9 +15,10 @@ Volta is an abstract interpreter for NVIDIA PTX kernels, implementing the approa
 
 ```
 crates/
-├── volta_common/     # Base utilities (spans, file caching, error reporting)
+├── volta_common/     # Base utilities (spans, file caching, error reporting, run logs)
 ├── volta_frontend/   # PTX lexer and parser
 ├── volta_analysis/   # Abstract interpreter
+├── volta_z3/         # Z3 comparison backend (SMT-LIB2 via the `z3` CLI)
 ├── volta_bench/      # Paper-evaluation benchmark harness
 └── volta_cli/        # Command-line interface
 ```
@@ -26,6 +27,8 @@ crates/
 
 ```
 volta_cli ──┐         volta_bench ──┐
+    ├── volta_z3 ◄──────────────────┤
+    │       └── volta_analysis      │
     ├── volta_analysis ◄────────────┤
     │       ├── volta_frontend ◄────┘
     │       │       └── volta_common
@@ -33,6 +36,9 @@ volta_cli ──┐         volta_bench ──┐
     └── volta_frontend
             └── volta_common
 ```
+
+(`volta_cli` and `volta_bench` also depend on `volta_common` directly, for
+`run_log`.)
 
 ## Crate: volta_common
 
@@ -42,6 +48,7 @@ volta_cli ──┐         volta_bench ──┐
 - `FileCache` - Caches file content to make sure we always use a consistent version of each file
 - `Locate<E>` - Error wrapper with optional location info (span + file path)
 - `report_error` - Produces an error message from a title, message, span, and file content. Extracts out and includes the code snippet at the given span in the given file content
+- `run_log::RunLog` - Per-invocation log file (`<unix-seconds>-<pid>-<command>.log` under `--log-dir`, default `volta-logs/`), shared by the `volta` and `volta-bench` binaries; `tee` mirrors an `env_logger` target into it under the binaries' `logging` features
 
 The pattern is to create an error kind type, and then an alias for `Locate` of that error kind. `locate_span` can be used to tag a `Locate` with a span if it does not already have one. `locate_path` can be used to tag a `Locate` with a path if it does not already have one.
 
@@ -108,6 +115,9 @@ Converts AST to linear instruction format:
 - `SymbolTable` - Register/param/label name → ID resolution; assigns addresses to shared/local/module-global variables
 - `SourceMap` - Maps lowered elements back to source spans
 - The nvcc callseq idiom for `call __symexpf` (the paper's symbolic-exp hook) collapses to `UnaryOp::Exp` at lowering time
+- `define_instr_kinds!` generates the profiling table from one variant
+  list: `KIND_COUNT`, `KIND_NAMES`, `kind_index()` (dense index for the
+  interpreter's fixed-size counters), `kind_name()`
 
 ### Special Registers (`symbols.rs`)
 
@@ -133,7 +143,10 @@ nvcc's `selp` accumulator-init idiom both rely on this.
 ### Driver (`driver.rs`)
 
 - `analyze_kernel(module, kernel_name, config) -> Result<AnalysisOutput, AnalysisError>`
-- `AnalysisOutput`: per-output-array written elements as `(index, ExprId)` + `Stats` (instructions, block syncs; warp syncs counted per fired group, not per thread)
+- `AnalysisOutput`: per-output-array written elements as `(index, ExprId)` + `Stats` (instructions, block syncs; warp syncs counted per fired group, not per thread) + `op_counts` (per-instruction-kind execution counts; the interpreter tallies into a fixed `[u64; KIND_COUNT]` and folds to this `BTreeMap` at the end)
+- `paired_elements(ref, opt, footprints)` - pairs the two outputs' written
+  elements per array under a `FootprintPolicy`; shared by the decision
+  procedure and `volta_z3` so both backends check exactly the same elements
 - `check_output_equivalence_with(ref, opt, options)` - the per-element
   check via one shared `EquivSession`. `EquivCheckOptions`:
   `FootprintPolicy::{Exact, Intersect}` (Intersect compares the common
@@ -142,6 +155,12 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   report with the outcome plus checked/total element counts.
 - `check_output_equivalence(ref, opt)` - the strict Default-options wrapper
   (identical footprints, all elements)
+- `VcSnapshot`/`VcDump` - serde-serializable arena + output footprint, the
+  payload of `volta compare --dump-vcs`/`--from-dump`; `validate()` bounds-
+  checks every id so a corrupt dump errors instead of panicking. The arena
+  serializes via borrowed slices (no clone of GiB-scale arenas at dump time).
+- `write_op_counts(out, label, counts)` - the one profile-table formatter,
+  used by both `volta` and `volta-bench`
 
 ### Decision procedure (`canon/`, `equiv.rs`, `numeric.rs`)
 
@@ -179,6 +198,55 @@ completion stats, and VC session recycles (info), fraction-equality
 escalation (debug). `cargo run -p volta_cli --features logging --
 --log-level info analyze ...` narrates a run.
 
+## Crate: volta_z3
+
+**Path**: `crates/volta_z3/`
+
+Z3 comparison backend for the same verification conditions: generates
+SMT-LIB2 text and evaluates it through libz3's C API (`ffi.rs`, a
+hand-written eight-function binding - no `z3-sys`/bindgen; building
+requires `libz3-dev`). Each query runs in a **forked worker** killed on
+timeout expiry: z3 4.8.12 does not reliably honor its soft timeout or
+`Z3_interrupt` in the quantifier loop the exp-axiom mode provokes
+(measured), so a hard kill is the only real bound - which also gives
+per-element crash containment. Fork requires the process to be
+effectively single-threaded at query time (the volta binaries are).
+A capability/timing comparison point against `canon`, not a replacement.
+
+Two `ExpMode`s reproduce the paper's section 6.5 baselines: the default
+`PowerBounded` (`(^ e a)`, bounded free `e`; attention VCs come back
+`unknown`) and `AdditionAxiom` (uninterpreted `uexp` plus
+`forall x y. uexp(x) uexp(y) = uexp(x+y)`; attention VCs run until the
+budget kills them, reported `Timeout` - Table 8's "with axiom" column,
+10-minute budget in the paper).
+
+- `translate.rs` - the fragment boundary (arithmetic + `Exp` +
+  `Max`/`Min`; everything else `Unsupported` rather than modeled
+  unsoundly) and the load-bearing invariants: *structural interning over
+  signed multisets* across both arenas (Add/Sub/Neg/Fma flatten into one
+  sum term with signed counts, Mul/Div/Rcp into one product term with
+  signed exponents, negations hoist, negative literals normalize, so
+  grouping/sharing/sign-placement differences between the two kernels'
+  DAGs cannot split opaque `Max`/`Min` atom keys; `x - x` is literally
+  `0.0`), user symbols quoted into a reserved `u!` namespace (a param
+  named `t0`/`e` cannot capture generated names), float constants
+  rendered as their exact binary rationals (same reading as
+  `canon`/`numeric`), the exp base as a free constant strictly bounded
+  around Euler's e (a definite rational base proved false equivalences),
+  iterative chain flattening + `stacker`-guarded recursion (deep Fma/Add
+  accumulator spines must not overflow the stack), and linear
+  `let`-chain assembly (deeply nested `let`s are fine for z3;
+  `define-fun` chains are not - measured, macro expansion chokes).
+- `ffi.rs` - `eval_smtlib2` (fresh context per query, no-op error
+  handler so z3 API errors surface as `(error ...)` text instead of
+  aborting, soft timeout via the process-global `timeout` param) and
+  `z3_version`.
+- `lib.rs` - per-element querying (`check_equivalent`; identical interned
+  terms short-circuit to Equivalent without a solver run), verdict
+  parsing, `Z3Counts`, `check_output_equivalence` over
+  `driver::paired_elements` (the same element pairing as the decision
+  procedure), and the regression tests for every invariant above.
+
 ## Crate: volta_bench
 
 **Path**: `crates/volta_bench/`
@@ -191,6 +259,13 @@ category <reduction|matmul|attention|causal|conv|agent|tilelang|race>
 [--sample N] [--verify-numeric] [--recycle-terms N]` (also `all`, `single
 <name>`, `list`; release mode matters: ~20x). The element loop is
 `driver::check_output_equivalence_with` with `FootprintPolicy::Intersect`.
+`z3-compare <all|category|name>` runs equivalence benchmarks through both
+the decision procedure and `volta_z3` side by side (skips race-check
+benchmarks; exits nonzero if any row fails outright); benchmarks whose
+VCs contain exponentials get a second `+exp-axiom` sub-row rerun under
+`ExpMode::AdditionAxiom`. Paper Table 8 reproduction:
+`--sample 1 z3-compare all --z3-timeout 600`. Every run writes a
+`volta_common::run_log` file (`--log-dir`/`--no-log-file`).
 Memory: full-element attention wants tens of GiB warm - on small machines
 run one category at a time under `ulimit -v` with `--recycle-terms 250000`
 (bounded at ~5 GiB, slower VCs).
@@ -202,7 +277,16 @@ run one category at a time under `ulimit -v` with `--recycle-terms 250000`
 Commands:
 
 - `volta parse <file>` - Check syntax
-- `volta analyze <file> -k <kernel> -b 32,4 -g 1,2 --array name:base:width:len:kind --param ptr:name ...` - Run symbolic execution, report races/deadlocks, print output expressions
+- `volta analyze <file> -k <kernel> -b 32,4 -g 1,2 --array name:base:width:len:kind --param ptr:name ...` - Run symbolic execution, report races/deadlocks, print output expressions (+ a per-instruction-kind profile; `--no-profile` to skip)
+- `volta compare <ref.ptx> <opt.ptx> --kernel1 .. --kernel2 ..` - Two-kernel
+  equivalence check (launch flags shared with `analyze` via a flattened
+  `LaunchArgs`; `--block2`/`--grid2` override the optimized kernel's dims).
+  `--backend decision|z3`, `--footprint exact|intersect`, `--dump-vcs`/
+  `--from-dump` (validated, versioned dump files). Exits 0 only when every
+  checked element is proved equivalent.
+
+Every run writes a `volta_common::run_log` file (`--log-dir`/
+`--no-log-file`).
 
 ## Data Flow
 

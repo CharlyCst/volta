@@ -359,6 +359,29 @@ impl VcSnapshot {
             op_counts: std::collections::BTreeMap::new(),
         }
     }
+
+    /// Check that every id in the snapshot points inside its arena. Run
+    /// this on snapshots rebuilt from external data (a dump file): a
+    /// corrupt or version-skewed file that still decodes would otherwise
+    /// panic with an index-out-of-bounds deep inside the equivalence check.
+    pub fn validate(&self) -> Result<(), String> {
+        self.arena.validate()?;
+        let n_nodes = self.arena.node_count();
+        for (name, elems) in &self.outputs {
+            for &(index, root) in elems {
+                if id_collections::Id::to_index(root) as usize >= n_nodes {
+                    return Err(format!(
+                        "output '{}' element {} references expression {} but the arena has {} nodes",
+                        name,
+                        index,
+                        id_collections::Id::to_index(root),
+                        n_nodes
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The reference and optimized kernels' verification conditions, as
@@ -367,6 +390,40 @@ impl VcSnapshot {
 pub struct VcDump {
     pub reference: VcSnapshot,
     pub optimized: VcSnapshot,
+}
+
+impl VcDump {
+    /// Validate both snapshots (see `VcSnapshot::validate`).
+    pub fn validate(&self) -> Result<(), String> {
+        self.reference
+            .validate()
+            .map_err(|e| format!("reference: {}", e))?;
+        self.optimized
+            .validate()
+            .map_err(|e| format!("optimized: {}", e))
+    }
+}
+
+/// Write a per-instruction-kind execution profile, most-executed first.
+/// The one formatter for `AnalysisOutput::op_counts`, shared by `volta`
+/// and `volta-bench` so their profile tables cannot drift.
+pub fn write_op_counts(
+    out: &mut dyn std::io::Write,
+    label: &str,
+    counts: &std::collections::BTreeMap<&'static str, u64>,
+) -> std::io::Result<()> {
+    if counts.is_empty() {
+        return Ok(());
+    }
+    let total: u64 = counts.values().sum();
+    let mut entries: Vec<_> = counts.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    writeln!(out, "{} profile:", label)?;
+    for (kind, count) in entries {
+        let pct = 100.0 * *count as f64 / total as f64;
+        writeln!(out, "  {:<16} {:>10}  ({:>5.1}%)", kind, count, pct)?;
+    }
+    Ok(())
 }
 
 /// Check that two analysis outputs agree on every element of every output

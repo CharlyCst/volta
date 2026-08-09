@@ -213,9 +213,12 @@ impl BenchmarkRunner {
         Ok((outcome, stats))
     }
 
-    /// Run one kernel. The outer error is an infrastructure failure (I/O,
-    /// parse, lowering); the inner error is an analysis rejection (race,
-    /// deadlock, structured-CTA violation, ...).
+    /// Run one kernel, splitting the two failure modes the runner cares
+    /// about: the outer error is an infrastructure failure (I/O, parse,
+    /// lowering); the inner error is an analysis rejection (race, deadlock,
+    /// structured-CTA violation, ...), which for a race-check benchmark is
+    /// itself the expected outcome. Callers that don't need that
+    /// distinction (e.g. `z3_compare`) use the flat [`run_kernel`] instead.
     fn analyze(&self, run: &KernelRun) -> Result<Result<AnalysisOutput, EvalError>> {
         let path = self.config.kernels_dir.join(&run.path);
         let module = load_module(&path)?;
@@ -274,6 +277,19 @@ fn rejected_outcome(e: EvalError) -> ActualOutcome {
         description: e.to_string(),
         is_race,
     }
+}
+
+/// Load and analyze one kernel, flattening every failure (I/O, parse,
+/// lowering, or an analysis rejection such as a data race) into a single
+/// `anyhow` error tagged with the kernel's path - the runner's own
+/// path-context formatting. Used by callers that treat any failure as an
+/// error rather than a benchmark outcome (see `z3_compare`); the runner's
+/// `analyze` method keeps the typed race/deadlock split it needs.
+pub fn run_kernel(kernels_dir: &Path, run: &KernelRun) -> Result<AnalysisOutput> {
+    let path = kernels_dir.join(&run.path);
+    let module = load_module(&path)?;
+    analyze_kernel(&module, Some(&run.kernel), run.config.clone())
+        .map_err(|e| anyhow!("{}: {}", run.path, e))
 }
 
 /// Load and parse a PTX module.

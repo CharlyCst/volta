@@ -499,50 +499,91 @@ pub enum LoweredInstr {
     Nop,
 }
 
-impl LoweredInstr {
-    /// Short, static instruction-kind name for profiling/stats. An
-    /// exhaustive match so a new variant fails to compile here instead of
-    /// silently falling through to a catch-all.
-    pub fn kind_name(&self) -> &'static str {
-        match self {
-            LoweredInstr::LoadParam { .. } => "LoadParam",
-            LoweredInstr::Load { .. } => "Load",
-            LoweredInstr::LoadVec { .. } => "LoadVec",
-            LoweredInstr::Store { .. } => "Store",
-            LoweredInstr::StoreVec { .. } => "StoreVec",
-            LoweredInstr::Mov { .. } => "Mov",
-            LoweredInstr::Cvta { .. } => "Cvta",
-            LoweredInstr::BinOp { .. } => "BinOp",
-            LoweredInstr::UnaryOp { .. } => "UnaryOp",
-            LoweredInstr::Fma { .. } => "Fma",
-            LoweredInstr::Mad { .. } => "Mad",
-            LoweredInstr::MulWide { .. } => "MulWide",
-            LoweredInstr::MulHi { .. } => "MulHi",
-            LoweredInstr::Bfi { .. } => "Bfi",
-            LoweredInstr::Setp { .. } => "Setp",
-            LoweredInstr::Selp { .. } => "Selp",
-            LoweredInstr::Set { .. } => "Set",
-            LoweredInstr::Cvt { .. } => "Cvt",
-            LoweredInstr::Bra { .. } => "Bra",
-            LoweredInstr::Ret => "Ret",
-            LoweredInstr::Exit => "Exit",
-            LoweredInstr::BarSync { .. } => "BarSync",
-            LoweredInstr::BarSyncCount { .. } => "BarSyncCount",
-            LoweredInstr::BarWarpSync { .. } => "BarWarpSync",
-            LoweredInstr::Membar { .. } => "Membar",
-            LoweredInstr::Shfl { .. } => "Shfl",
-            LoweredInstr::ShflSync { .. } => "ShflSync",
-            LoweredInstr::Ldmatrix { .. } => "Ldmatrix",
-            LoweredInstr::Mma { .. } => "Mma",
-            LoweredInstr::WmmaLoad { .. } => "WmmaLoad",
-            LoweredInstr::WmmaStore { .. } => "WmmaStore",
-            LoweredInstr::WmmaMma { .. } => "WmmaMma",
-            LoweredInstr::Activemask { .. } => "Activemask",
-            LoweredInstr::Trap => "Trap",
-            LoweredInstr::Nop => "Nop",
-        }
-    }
+/// Generates the instruction-kind profiling table from one variant list:
+/// `KIND_COUNT`, `KIND_NAMES` (indexed by `kind_index`), `kind_index`, and
+/// `kind_name` all come from the same source, so they cannot drift. The
+/// `kind_list_is_exhaustive` helper is a compile-time check: adding a
+/// `LoweredInstr` variant without adding it to the list fails to compile
+/// there, and a misspelled list entry fails as an unknown pattern.
+macro_rules! define_instr_kinds {
+    ($($variant:ident),+ $(,)?) => {
+        /// Number of distinct `LoweredInstr` kinds.
+        pub const KIND_COUNT: usize = KIND_NAMES.len();
 
+        /// Short, static name of each instruction kind, indexed by
+        /// `LoweredInstr::kind_index`.
+        pub const KIND_NAMES: [&str; [$(stringify!($variant)),+].len()] =
+            [$(stringify!($variant)),+];
+
+        impl LoweredInstr {
+            /// Dense index of this instruction's kind, for `KIND_NAMES`
+            /// and fixed-size per-kind counters.
+            pub fn kind_index(&self) -> usize {
+                let mut i = 0usize;
+                $(
+                    if matches!(self, LoweredInstr::$variant { .. }) {
+                        return i;
+                    }
+                    i += 1;
+                )+
+                let _ = i;
+                unreachable!("variant missing from define_instr_kinds!")
+            }
+
+            /// Short, static instruction-kind name for profiling/stats.
+            pub fn kind_name(&self) -> &'static str {
+                KIND_NAMES[self.kind_index()]
+            }
+
+            #[allow(dead_code)]
+            fn kind_list_is_exhaustive(&self) {
+                match self {
+                    $(LoweredInstr::$variant { .. } => {}),+
+                }
+            }
+        }
+    };
+}
+
+define_instr_kinds!(
+    LoadParam,
+    Load,
+    LoadVec,
+    Store,
+    StoreVec,
+    Mov,
+    Cvta,
+    BinOp,
+    UnaryOp,
+    Fma,
+    Mad,
+    MulWide,
+    MulHi,
+    Bfi,
+    Setp,
+    Selp,
+    Set,
+    Cvt,
+    Bra,
+    Ret,
+    Exit,
+    BarSync,
+    BarSyncCount,
+    BarWarpSync,
+    Membar,
+    Shfl,
+    ShflSync,
+    Ldmatrix,
+    Mma,
+    WmmaLoad,
+    WmmaStore,
+    WmmaMma,
+    Activemask,
+    Trap,
+    Nop,
+);
+
+impl LoweredInstr {
     /// Collect all general-purpose registers read by this instruction.
     ///
     /// Does not include predicate guards (check `LoweredProgram::predicate`

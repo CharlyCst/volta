@@ -1,5 +1,6 @@
 pub mod file_cache;
 pub mod report;
+pub mod run_log;
 
 /// A span in the source code (start and end byte offsets)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -603,6 +603,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "id_collections",
  "log",
  "serde",
  "serde_json",
@@ -646,6 +647,8 @@ dependencies = [
 name = "volta_z3"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "stacker",
  "thiserror",
  "volta_analysis",
 ]

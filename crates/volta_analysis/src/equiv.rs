@@ -46,6 +46,13 @@ pub type EquivResult<T> = Result<T, EquivError>;
 pub struct EquivSession {
     session: Session,
     recycle_terms: usize,
+    /// The arena pair this session's memo entries refer to (by address).
+    /// Session memos key on `(Side, ExprId)`, and an `ExprId` is only
+    /// meaningful within its own arena - reusing one session across
+    /// different arena pairs would silently resolve ids against the wrong
+    /// arena's memo entries and can return wrong verdicts. Debug-asserted
+    /// in `check`.
+    arenas: Option<(*const ExprArena, *const ExprArena)>,
 }
 
 /// Default recycle bound. Bytes per term are workload-dependent: polynomial
@@ -66,10 +73,15 @@ impl EquivSession {
         Self {
             session: Session::new(),
             recycle_terms,
+            arenas: None,
         }
     }
 
     /// Check whether two expressions are equivalent over the reals.
+    ///
+    /// One session serves ONE arena pair: all calls must pass the same
+    /// `arena1`/`arena2` the session first saw (any elements of that
+    /// pair). Use a fresh session per kernel pair.
     pub fn check(
         &mut self,
         arena1: &ExprArena,
@@ -77,6 +89,16 @@ impl EquivSession {
         arena2: &ExprArena,
         e2: ExprId,
     ) -> EquivResult<bool> {
+        let pair = (arena1 as *const ExprArena, arena2 as *const ExprArena);
+        match self.arenas {
+            None => self.arenas = Some(pair),
+            Some(seen) => debug_assert!(
+                seen == pair,
+                "EquivSession reused across different arena pairs: session \
+                 memos key on ExprIds, which are only meaningful within one \
+                 arena"
+            ),
+        }
         if self.recycle_terms != 0 && self.session.interned_terms() > self.recycle_terms {
             info!(
                 "recycling VC session at {} interned terms",

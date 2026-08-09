@@ -5,21 +5,21 @@
 //! - `volta analyze <file>` - Symbolically execute one kernel
 //! - `volta compare <file1> <file2>` - Check two kernels for equivalence
 
-mod run_log;
-
-use std::collections::BTreeMap;
 use std::io;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use bincode::Options;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use volta_analysis::driver::{
     EquivCheckOptions, EquivOutcome, FootprintPolicy, VcDump, VcSnapshot, analyze_kernel,
-    check_output_equivalence_with,
+    check_output_equivalence_with, write_op_counts,
 };
 use volta_analysis::equiv::DEFAULT_RECYCLE_TERMS;
 use volta_analysis::eval::{AnalysisConfig, AnalysisOutput, ArrayDef, ArrayKind, ParamValue};
+use volta_common::run_log;
 use volta_frontend::ascii::{AsAscii, AsciiChar};
 use volta_frontend::ast::{Module, TopLevelItem};
 use volta_frontend::file_cache::FileCache;
@@ -81,7 +81,7 @@ impl From<FootprintArg> for FootprintPolicy {
 enum BackendArg {
     /// `volta_analysis::canon` - Volta's own decision procedure (default)
     Decision,
-    /// Z3, via SMT-LIB2 shelled out to the `z3` CLI binary. Covers a
+    /// Z3, via SMT-LIB2 evaluated in-process through libz3. Covers a
     /// narrower fragment (see `volta_z3::translate`'s docs) and reports
     /// per-element unsat/sat/unknown rather than a single verdict.
     Z3,
@@ -119,143 +119,145 @@ enum Commands {
 
     /// Symbolically execute a kernel: detect races/deadlocks and print the
     /// symbolic output tensors
-    Analyze {
-        /// PTX file to analyze
-        file: PathBuf,
-
-        /// Kernel entry name (defaults to the first kernel in the module)
-        #[arg(short, long)]
-        kernel: Option<String>,
-
-        /// Block dimensions, e.g. "128" or "32,4,1"
-        #[arg(short, long, default_value = "1")]
-        block: String,
-
-        /// Grid dimensions, e.g. "64,64"
-        #[arg(short, long, default_value = "1")]
-        grid: String,
-
-        /// Global array: "name:base:elem_width:len:kind" where kind is
-        /// in|out|inout|index (e.g. "in:0x10000:4:128:in"). Repeatable.
-        #[arg(long = "array")]
-        arrays: Vec<String>,
-
-        /// Kernel parameter (in declaration order): "int:N", "float:X",
-        /// "sym:name", or "ptr:array_name". Repeatable.
-        #[arg(long = "param")]
-        params: Vec<String>,
-
-        /// Module-scope .global variable value: "NAME=value". Repeatable.
-        #[arg(long = "global")]
-        globals: Vec<String>,
-
-        /// Dynamic (extern) shared memory size in bytes
-        #[arg(long, default_value_t = 0)]
-        dyn_shared: u64,
-
-        /// Print up to N elements of each output array
-        #[arg(long, default_value_t = 8)]
-        print_outputs: u64,
-
-        /// Skip the per-instruction-kind execution profile (shown by default)
-        #[arg(long = "no-profile", action = clap::ArgAction::SetFalse, default_value_t = true)]
-        profile: bool,
-    },
+    Analyze(AnalyzeArgs),
 
     /// Check two kernels for semantic equivalence (each is also checked for
     /// data races/deadlocks). Arrays/params/globals are shared by both
     /// kernels unless a `--block2`/`--grid2` override is given.
-    Compare {
-        /// Reference PTX file (omit when using --from-dump)
-        file1: Option<PathBuf>,
+    Compare(CompareArgs),
+}
 
-        /// Optimized PTX file (omit when using --from-dump)
-        file2: Option<PathBuf>,
+/// Launch configuration shared by `analyze` and `compare`: the flags that
+/// feed `build_config`. Flattened into both subcommands so their
+/// block/grid/array/param/global handling cannot drift apart. (For
+/// `compare` these describe the reference kernel; `--block2`/`--grid2` on
+/// `CompareArgs` override the dims for the optimized kernel only.)
+#[derive(Args)]
+struct LaunchArgs {
+    /// Block dimensions, e.g. "128" or "32,4,1"
+    #[arg(short, long, default_value = "1")]
+    block: String,
 
-        /// Reference kernel entry name (defaults to the first in the module)
-        #[arg(long)]
-        kernel1: Option<String>,
+    /// Grid dimensions, e.g. "64,64"
+    #[arg(short, long, default_value = "1")]
+    grid: String,
 
-        /// Optimized kernel entry name (defaults to the first in the module)
-        #[arg(long)]
-        kernel2: Option<String>,
+    /// Global array: "name:base:elem_width:len:kind" where kind is
+    /// in|out|inout|index (e.g. "in:0x10000:4:128:in"). Repeatable.
+    #[arg(long = "array")]
+    arrays: Vec<String>,
 
-        /// Block dimensions for both kernels, e.g. "128" or "32,4,1"
-        #[arg(short, long, default_value = "1")]
-        block: String,
+    /// Kernel parameter (in declaration order): "int:N", "float:X",
+    /// "sym:name", or "ptr:array_name". Repeatable.
+    #[arg(long = "param")]
+    params: Vec<String>,
 
-        /// Block dimensions for the optimized kernel only, if it differs
-        #[arg(long)]
-        block2: Option<String>,
+    /// Module-scope .global variable value: "NAME=value". Repeatable.
+    #[arg(long = "global")]
+    globals: Vec<String>,
 
-        /// Grid dimensions for both kernels, e.g. "64,64"
-        #[arg(short, long, default_value = "1")]
-        grid: String,
+    /// Dynamic (extern) shared memory size in bytes
+    #[arg(long, default_value_t = 0)]
+    dyn_shared: u64,
+}
 
-        /// Grid dimensions for the optimized kernel only, if it differs
-        #[arg(long)]
-        grid2: Option<String>,
+#[derive(Args)]
+struct AnalyzeArgs {
+    /// PTX file to analyze
+    file: PathBuf,
 
-        /// Global array, shared by both kernels: "name:base:elem_width:len:kind"
-        /// (e.g. "in:0x10000:4:128:in"). Repeatable.
-        #[arg(long = "array")]
-        arrays: Vec<String>,
+    /// Kernel entry name (defaults to the first kernel in the module)
+    #[arg(short, long)]
+    kernel: Option<String>,
 
-        /// Kernel parameter, shared by both kernels (in declaration order):
-        /// "int:N", "float:X", "sym:name", or "ptr:array_name". Repeatable.
-        #[arg(long = "param")]
-        params: Vec<String>,
+    #[command(flatten)]
+    launch: LaunchArgs,
 
-        /// Module-scope .global variable, shared by both kernels:
-        /// "NAME=value". Repeatable.
-        #[arg(long = "global")]
-        globals: Vec<String>,
+    /// Print up to N elements of each output array
+    #[arg(long, default_value_t = 8)]
+    print_outputs: u64,
 
-        /// Dynamic (extern) shared memory size in bytes, shared by both kernels
-        #[arg(long, default_value_t = 0)]
-        dyn_shared: u64,
+    /// Skip the per-instruction-kind execution profile (shown by default)
+    #[arg(long = "no-profile", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    profile: bool,
+}
 
-        /// How to pair up the two kernels' written footprints
-        #[arg(long, value_enum, default_value = "intersect")]
-        footprint: FootprintArg,
+#[derive(Args)]
+struct CompareArgs {
+    /// Reference PTX file (omit when using --from-dump)
+    file1: Option<PathBuf>,
 
-        /// Check at most this many common elements per array (0 = all)
-        #[arg(long, default_value_t = 0)]
-        sample: u64,
+    /// Optimized PTX file (omit when using --from-dump)
+    file2: Option<PathBuf>,
 
-        /// Confirm every verdict with the f64 numeric oracle
-        #[arg(long)]
-        verify_numeric: bool,
+    /// Reference kernel entry name (defaults to the first in the module)
+    #[arg(long)]
+    kernel1: Option<String>,
 
-        /// Recycle the VC intern tables past this many interned terms (0 = never)
-        #[arg(long, default_value_t = DEFAULT_RECYCLE_TERMS)]
-        recycle_terms: usize,
+    /// Optimized kernel entry name (defaults to the first in the module)
+    #[arg(long)]
+    kernel2: Option<String>,
 
-        /// Skip the per-instruction-kind execution profile (shown by default)
-        #[arg(long = "no-profile", action = clap::ArgAction::SetFalse, default_value_t = true)]
-        profile: bool,
+    #[command(flatten)]
+    launch: LaunchArgs,
 
-        /// Which decision procedure to use
-        #[arg(long, value_enum, default_value = "decision")]
-        backend: BackendArg,
+    /// Block dimensions for the optimized kernel only, if it differs
+    #[arg(long)]
+    block2: Option<String>,
 
-        /// Per-query Z3 timeout in seconds, only used with --backend z3 (0 = no limit)
-        #[arg(long, default_value_t = 30)]
-        z3_timeout: u64,
+    /// Grid dimensions for the optimized kernel only, if it differs
+    #[arg(long)]
+    grid2: Option<String>,
 
-        /// After symbolic execution, dump both kernels' verification
-        /// conditions (the expression arena + output footprint) to this
-        /// file. Reload them later with --from-dump to rerun the
-        /// equivalence check without parsing/symbolic execution.
-        #[arg(long)]
-        dump_vcs: Option<PathBuf>,
+    /// How to pair up the two kernels' written footprints
+    #[arg(long, value_enum, default_value = "intersect")]
+    footprint: FootprintArg,
 
-        /// Skip parsing and symbolic execution entirely and check
-        /// equivalence directly from a --dump-vcs file. FILE1/FILE2 and the
-        /// launch-config flags are ignored when this is set.
-        #[arg(long)]
-        from_dump: Option<PathBuf>,
-    },
+    /// Check at most this many common elements per array (0 = all)
+    #[arg(long, default_value_t = 0)]
+    sample: u64,
+
+    /// Confirm every verdict with the f64 numeric oracle
+    #[arg(long)]
+    verify_numeric: bool,
+
+    /// Recycle the VC intern tables past this many interned terms (0 = never)
+    #[arg(long, default_value_t = DEFAULT_RECYCLE_TERMS)]
+    recycle_terms: usize,
+
+    /// Skip the per-instruction-kind execution profile (shown by default)
+    #[arg(long = "no-profile", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    profile: bool,
+
+    /// Which decision procedure to use
+    #[arg(long, value_enum, default_value = "decision")]
+    backend: BackendArg,
+
+    /// Per-query Z3 timeout in seconds, only used with --backend z3 (0 =
+    /// no limit). A hard bound: the solver worker is killed on expiry.
+    #[arg(long, default_value_t = 30)]
+    z3_timeout: u64,
+
+    /// With --backend z3: encode the exponential as an uninterpreted
+    /// function with the addition-law axiom (forall x y. e^x e^y =
+    /// e^(x+y)) instead of the default bounded-base power encoding - the
+    /// paper's "Z3 with axiom" baseline, which drives Z3 into a timeout
+    /// on softmax-shaped VCs rather than a fast `unknown`.
+    #[arg(long)]
+    exp_axiom: bool,
+
+    /// After symbolic execution, dump both kernels' verification
+    /// conditions (the expression arena + output footprint) to this
+    /// file. Reload them later with --from-dump to rerun the
+    /// equivalence check without parsing/symbolic execution.
+    #[arg(long)]
+    dump_vcs: Option<PathBuf>,
+
+    /// Skip parsing and symbolic execution entirely and check
+    /// equivalence directly from a --dump-vcs file. FILE1/FILE2 and the
+    /// launch-config flags are ignored when this is set.
+    #[arg(long)]
+    from_dump: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -263,8 +265,8 @@ fn main() -> ExitCode {
 
     let command_name = match &cli.command {
         Commands::Parse { .. } => "parse",
-        Commands::Analyze { .. } => "analyze",
-        Commands::Compare { .. } => "compare",
+        Commands::Analyze(_) => "analyze",
+        Commands::Compare(_) => "compare",
     };
     let mut log = run_log::RunLog::open(&cli.log_dir, command_name, cli.no_log_file);
 
@@ -278,75 +280,8 @@ fn main() -> ExitCode {
 
     let code = match cli.command {
         Commands::Parse { file } => cmd_parse(&file),
-        Commands::Analyze {
-            file,
-            kernel,
-            block,
-            grid,
-            arrays,
-            params,
-            globals,
-            dyn_shared,
-            print_outputs,
-            profile,
-        } => cmd_analyze(
-            &file,
-            kernel.as_deref(),
-            &block,
-            &grid,
-            &arrays,
-            &params,
-            &globals,
-            dyn_shared,
-            print_outputs,
-            profile,
-            &mut log,
-        ),
-        Commands::Compare {
-            file1,
-            file2,
-            kernel1,
-            kernel2,
-            block,
-            block2,
-            grid,
-            grid2,
-            arrays,
-            params,
-            globals,
-            dyn_shared,
-            footprint,
-            sample,
-            verify_numeric,
-            recycle_terms,
-            profile,
-            backend,
-            z3_timeout,
-            dump_vcs,
-            from_dump,
-        } => cmd_compare(CompareArgs {
-            file1,
-            file2,
-            kernel1,
-            kernel2,
-            block,
-            block2,
-            grid,
-            grid2,
-            arrays,
-            params,
-            globals,
-            dyn_shared,
-            footprint,
-            sample,
-            verify_numeric,
-            recycle_terms,
-            profile,
-            backend,
-            z3_timeout,
-            dump_vcs,
-            from_dump,
-        }, &mut log),
+        Commands::Analyze(args) => cmd_analyze(args, &mut log),
+        Commands::Compare(args) => cmd_compare(args, &mut log),
     };
 
     if let Some(path) = log.path() {
@@ -440,6 +375,22 @@ struct ConfigInput<'a> {
     dyn_shared: u64,
 }
 
+impl<'a> ConfigInput<'a> {
+    /// The reference-kernel launch config straight from the shared flags.
+    /// `compare` overrides `block`/`grid` afterwards for the optimized
+    /// kernel via `--block2`/`--grid2`.
+    fn from_launch(launch: &'a LaunchArgs) -> Self {
+        Self {
+            block: &launch.block,
+            grid: &launch.grid,
+            arrays: &launch.arrays,
+            params: &launch.params,
+            globals: &launch.globals,
+            dyn_shared: launch.dyn_shared,
+        }
+    }
+}
+
 fn build_config(input: ConfigInput) -> Result<AnalysisConfig, String> {
     let block_dim = parse_dims(input.block).map_err(|e| format!("invalid --block: {}", e))?;
     let mut config = AnalysisConfig::new(block_dim);
@@ -467,48 +418,14 @@ fn build_config(input: ConfigInput) -> Result<AnalysisConfig, String> {
     Ok(config)
 }
 
-/// Print a per-instruction-kind execution profile, most-executed first.
-fn print_op_counts(label: &str, counts: &BTreeMap<&'static str, u64>) {
-    if counts.is_empty() {
-        return;
-    }
-    let total: u64 = counts.values().sum();
-    let mut entries: Vec<_> = counts.iter().collect();
-    entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-    println!("  {} profile:", label);
-    for (kind, count) in entries {
-        let pct = 100.0 * *count as f64 / total.max(1) as f64;
-        println!("    {:<16} {:>10}  ({:>5.1}%)", kind, count, pct);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_analyze(
-    file: &Path,
-    kernel: Option<&str>,
-    block: &str,
-    grid: &str,
-    arrays: &[String],
-    params: &[String],
-    globals: &[String],
-    dyn_shared: u64,
-    print_outputs: u64,
-    profile: bool,
-    log: &mut run_log::RunLog,
-) -> ExitCode {
+fn cmd_analyze(args: AnalyzeArgs, log: &mut run_log::RunLog) -> ExitCode {
+    let file = &args.file;
     let module = match load_module(file) {
         Ok(m) => m,
         Err(code) => return code,
     };
 
-    let config = match build_config(ConfigInput {
-        block,
-        grid,
-        arrays,
-        params,
-        globals,
-        dyn_shared,
-    }) {
+    let config = match build_config(ConfigInput::from_launch(&args.launch)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -517,7 +434,7 @@ fn cmd_analyze(
     };
 
     let start = Instant::now();
-    let result = analyze_kernel(&module, kernel, config);
+    let result = analyze_kernel(&module, args.kernel.as_deref(), config);
     let elapsed = start.elapsed().as_secs_f64();
 
     match result {
@@ -532,7 +449,7 @@ fn cmd_analyze(
             );
             for (name, elems) in &output.outputs {
                 println!("  output '{}': {} element(s) written", name, elems.len());
-                for (index, expr) in elems.iter().take(print_outputs as usize) {
+                for (index, expr) in elems.iter().take(args.print_outputs as usize) {
                     println!(
                         "    {}[{}] = {}",
                         name,
@@ -540,12 +457,16 @@ fn cmd_analyze(
                         output.arena.display_expr(*expr)
                     );
                 }
-                if elems.len() as u64 > print_outputs {
-                    println!("    ... ({} more)", elems.len() as u64 - print_outputs);
+                if elems.len() as u64 > args.print_outputs {
+                    println!("    ... ({} more)", elems.len() as u64 - args.print_outputs);
                 }
             }
-            if profile {
-                print_op_counts("instruction", &output.op_counts);
+            if args.profile {
+                let _ = write_op_counts(
+                    &mut std::io::stdout().lock(),
+                    "instruction",
+                    &output.op_counts,
+                );
             }
             log.record(&format!(
                 "analyze {}: OK in {:.3}s, {} instructions",
@@ -563,34 +484,41 @@ fn cmd_analyze(
     }
 }
 
-/// Arguments for `cmd_compare`, bundled to keep the call site readable.
-struct CompareArgs {
-    file1: Option<PathBuf>,
-    file2: Option<PathBuf>,
-    kernel1: Option<String>,
-    kernel2: Option<String>,
-    block: String,
-    block2: Option<String>,
-    grid: String,
-    grid2: Option<String>,
-    arrays: Vec<String>,
-    params: Vec<String>,
-    globals: Vec<String>,
-    dyn_shared: u64,
-    footprint: FootprintArg,
-    sample: u64,
-    verify_numeric: bool,
-    recycle_terms: usize,
-    profile: bool,
-    backend: BackendArg,
-    z3_timeout: u64,
-    dump_vcs: Option<PathBuf>,
-    from_dump: Option<PathBuf>,
+/// How a whole Z3 comparison run maps to a process exit status. `compare`
+/// is a verification command, so only a run that *proved* every element
+/// equivalent may exit 0; an undecided-only run is distinguished from a
+/// real difference purely so we can explain the nonzero exit.
+#[derive(Debug, PartialEq, Eq)]
+enum Z3Verdict {
+    /// Every checked element proved equivalent (vacuously true for an empty
+    /// footprint) - exit 0.
+    AllEquivalent,
+    /// At least one element is definitively not equivalent - exit nonzero.
+    HasDifference,
+    /// No differences, but some elements could not be decided
+    /// (unknown/unsupported/solver error) - exit nonzero, since undecided
+    /// is not a proof.
+    OnlyUndecided { undecided: usize },
+}
+
+fn z3_verdict(counts: &volta_z3::Z3Counts) -> Z3Verdict {
+    if counts.all_equivalent() {
+        Z3Verdict::AllEquivalent
+    } else if counts.not_equivalent > 0 {
+        Z3Verdict::HasDifference
+    } else {
+        Z3Verdict::OnlyUndecided {
+            undecided: counts.unknown + counts.timeout + counts.unsupported + counts.error,
+        }
+    }
 }
 
 fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
     if args.from_dump.is_some() && args.dump_vcs.is_some() {
         eprintln!("note: --dump-vcs is a no-op with --from-dump (nothing new to dump)");
+    }
+    if args.exp_axiom && !matches!(args.backend, BackendArg::Z3) {
+        eprintln!("note: --exp-axiom only affects --backend z3");
     }
 
     let (reference, optimized, exec_secs): (AnalysisOutput, AnalysisOutput, Option<f64>) =
@@ -625,14 +553,7 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                 Err(code) => return code,
             };
 
-            let config1 = match build_config(ConfigInput {
-                block: &args.block,
-                grid: &args.grid,
-                arrays: &args.arrays,
-                params: &args.params,
-                globals: &args.globals,
-                dyn_shared: args.dyn_shared,
-            }) {
+            let config1 = match build_config(ConfigInput::from_launch(&args.launch)) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -640,12 +561,9 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                 }
             };
             let config2 = match build_config(ConfigInput {
-                block: args.block2.as_deref().unwrap_or(&args.block),
-                grid: args.grid2.as_deref().unwrap_or(&args.grid),
-                arrays: &args.arrays,
-                params: &args.params,
-                globals: &args.globals,
-                dyn_shared: args.dyn_shared,
+                block: args.block2.as_deref().unwrap_or(&args.launch.block),
+                grid: args.grid2.as_deref().unwrap_or(&args.launch.grid),
+                ..ConfigInput::from_launch(&args.launch)
             }) {
                 Ok(c) => c,
                 Err(e) => {
@@ -674,8 +592,9 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
             let exec_secs = start.elapsed().as_secs_f64();
 
             if args.profile {
-                print_op_counts("reference instruction", &reference.op_counts);
-                print_op_counts("optimized instruction", &optimized.op_counts);
+                let mut out = std::io::stdout().lock();
+                let _ = write_op_counts(&mut out, "reference instruction", &reference.op_counts);
+                let _ = write_op_counts(&mut out, "optimized instruction", &optimized.op_counts);
             }
             println!(
                 "Exec: {:.3}s  instructions: {}  block syncs: {}  warp syncs: {}",
@@ -762,14 +681,11 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
             }
         }
         BackendArg::Z3 => {
-            if !volta_z3::z3_available() {
-                eprintln!("error: z3 is not installed / not on PATH (try: apt-get install z3)");
-                return ExitCode::FAILURE;
-            }
-            let timeout = if args.z3_timeout == 0 {
-                None
+            let timeout = volta_z3::timeout_from_secs(args.z3_timeout);
+            let mode = if args.exp_axiom {
+                volta_z3::ExpMode::AdditionAxiom
             } else {
-                Some(std::time::Duration::from_secs(args.z3_timeout))
+                volta_z3::ExpMode::PowerBounded
             };
             let vc_start = Instant::now();
             let report = volta_z3::check_output_equivalence(
@@ -778,35 +694,50 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                 args.footprint.into(),
                 args.sample,
                 timeout,
+                mode,
             );
             let vc_secs = vc_start.elapsed().as_secs_f64();
 
             match report {
                 Ok(report) => {
-                    let (equiv, not_equiv, unknown, unsupported, error) = report.counts();
+                    let counts = report.counts();
                     println!(
                         "VC check: {:.3}s (z3 solve time {:.3}s)  elements: {}",
                         vc_secs,
                         report.total_solve_secs(),
                         report.elements.len()
                     );
-                    println!(
-                        "  equivalent: {}  not-equivalent: {}  unknown: {}  unsupported: {}  error: {}",
-                        equiv, not_equiv, unknown, unsupported, error
-                    );
-                    for e in report.elements.iter().filter(|e| {
-                        !matches!(e.outcome, volta_z3::ElementOutcome::Equivalent)
-                    }).take(10) {
+                    println!("  {}", counts);
+                    for e in report
+                        .elements
+                        .iter()
+                        .filter(|e| !matches!(e.outcome, volta_z3::ElementOutcome::Equivalent))
+                        .take(10)
+                    {
                         println!("  {}[{}]: {:?}", e.array, e.index, e.outcome);
                     }
                     log.record(&format!(
-                        "compare (z3): equiv={} not_equiv={} unknown={} unsupported={} error={} (vc {:.3}s)",
-                        equiv, not_equiv, unknown, unsupported, error, vc_secs
+                        "compare (z3): {} (vc {:.3}s)",
+                        counts.compact(),
+                        vc_secs
                     ));
-                    if not_equiv > 0 {
-                        ExitCode::FAILURE
-                    } else {
-                        ExitCode::SUCCESS
+                    // `compare` is a verification command: exit 0 must mean
+                    // "every element proved equivalent". A definitive
+                    // NotEquivalent aside, a run that only failed to *decide*
+                    // some elements (unknown/unsupported/solver error) still
+                    // exits nonzero, so no undecided result is mistaken for a
+                    // proof.
+                    match z3_verdict(&counts) {
+                        Z3Verdict::AllEquivalent => ExitCode::SUCCESS,
+                        Z3Verdict::HasDifference => ExitCode::FAILURE,
+                        Z3Verdict::OnlyUndecided { undecided } => {
+                            println!(
+                                "z3 could not decide {} element(s); exiting nonzero \
+                                 (only fully-proved runs exit 0)",
+                                undecided
+                            );
+                            ExitCode::FAILURE
+                        }
                     }
                 }
                 Err(e) => {
@@ -819,16 +750,63 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
     }
 }
 
+/// 12-byte header (magic + format version) written ahead of the bincode
+/// payload. Reloading checks it before decoding, so a truncated/foreign
+/// file fails with a clear message instead of a bincode parse deep in the
+/// stream; bumping the trailing digit rejects old dumps after a
+/// `VcDump`-layout change.
+const DUMP_MAGIC: &[u8; 12] = b"VOLTAVCDUMP1";
+
 fn write_dump(dump: &VcDump, path: &Path) -> io::Result<()> {
     let file = std::fs::File::create(path)?;
-    let writer = io::BufWriter::new(file);
-    bincode::serialize_into(writer, dump).map_err(io::Error::other)
+    let mut writer = io::BufWriter::new(file);
+    writer.write_all(DUMP_MAGIC)?;
+    // `serialize_into` uses fixint little-endian; `load_dump` must decode
+    // with a matching `with_fixint_encoding()` (bincode's `options()`
+    // default is varint, which would not round-trip).
+    bincode::serialize_into(&mut writer, dump).map_err(io::Error::other)?;
+    writer.flush()
 }
 
 fn load_dump(path: &Path) -> io::Result<VcDump> {
     let file = std::fs::File::open(path)?;
-    let reader = io::BufReader::new(file);
-    bincode::deserialize_from(reader).map_err(io::Error::other)
+    // Cap decode allocations at the file size, so a crafted length prefix
+    // can't make bincode try to allocate (e.g.) a terabyte before it ever
+    // reads that many bytes.
+    let file_len = file.metadata()?.len();
+    let mut reader = io::BufReader::new(file);
+
+    let mut magic = [0u8; DUMP_MAGIC.len()];
+    reader.read_exact(&mut magic).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a volta VC dump (file is shorter than the header)",
+            )
+        } else {
+            e
+        }
+    })?;
+    if &magic != DUMP_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a volta VC dump (bad magic/version)",
+        ));
+    }
+
+    let dump: VcDump = bincode::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(file_len)
+        .deserialize_from(&mut reader)
+        .map_err(io::Error::other)?;
+    dump.validate().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("dump is corrupt or from an incompatible version: {}", e),
+        )
+    })?;
+    Ok(dump)
 }
 
 /// Load and parse a module, reporting errors nicely.
@@ -926,5 +904,134 @@ fn print_module_summary(module: &Module) {
     println!("  Entries (kernels): {}", entries);
     if functions > 0 {
         println!("  Functions: {}", functions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use volta_analysis::symbolic::ExprArena;
+    use volta_z3::Z3Counts;
+
+    fn counts(equivalent: usize, not_equivalent: usize, unknown: usize) -> Z3Counts {
+        Z3Counts {
+            equivalent,
+            not_equivalent,
+            unknown,
+            ..Z3Counts::default()
+        }
+    }
+
+    #[test]
+    fn z3_verdict_all_equivalent_exits_success() {
+        assert_eq!(z3_verdict(&counts(3, 0, 0)), Z3Verdict::AllEquivalent);
+        // An empty footprint is vacuously all-equivalent (matches the
+        // decision backend), so it too exits 0.
+        assert_eq!(z3_verdict(&counts(0, 0, 0)), Z3Verdict::AllEquivalent);
+    }
+
+    #[test]
+    fn z3_verdict_any_difference_exits_failure() {
+        assert_eq!(z3_verdict(&counts(2, 1, 0)), Z3Verdict::HasDifference);
+        // A difference dominates even when other elements are undecided.
+        assert_eq!(z3_verdict(&counts(0, 1, 5)), Z3Verdict::HasDifference);
+    }
+
+    #[test]
+    fn z3_verdict_undecided_only_exits_failure() {
+        // The regression this guards: an all-unknown run used to exit 0.
+        assert_eq!(
+            z3_verdict(&counts(0, 0, 3)),
+            Z3Verdict::OnlyUndecided { undecided: 3 }
+        );
+        // Partial proof with leftover undecided is still not a full proof.
+        assert_eq!(
+            z3_verdict(&counts(4, 0, 2)),
+            Z3Verdict::OnlyUndecided { undecided: 2 }
+        );
+        assert_eq!(
+            z3_verdict(&Z3Counts {
+                equivalent: 1,
+                not_equivalent: 0,
+                unknown: 1,
+                timeout: 1,
+                unsupported: 2,
+                error: 3,
+            }),
+            Z3Verdict::OnlyUndecided { undecided: 7 }
+        );
+    }
+
+    /// A dump written by `write_dump` reloads to an identical structure via
+    /// `load_dump` - the fixint round-trip and the magic header together.
+    #[test]
+    fn dump_round_trips() {
+        let mut arena = ExprArena::new();
+        let x = arena.named("x");
+        let one = arena.int(1);
+        let sum = arena.add(x, one);
+        let dump = VcDump {
+            reference: VcSnapshot {
+                arena: arena.clone(),
+                outputs: vec![("out".to_string(), vec![(0, sum), (1, x)])],
+            },
+            optimized: VcSnapshot {
+                arena,
+                outputs: vec![("out".to_string(), vec![(0, sum), (1, x)])],
+            },
+        };
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("volta_cli_dump_test_{}.vcdump", std::process::id()));
+        write_dump(&dump, &path).expect("write_dump");
+        let loaded = load_dump(&path).expect("load_dump");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.reference.outputs, dump.reference.outputs,
+            "reference footprint survived the round-trip"
+        );
+        assert_eq!(loaded.optimized.outputs, dump.optimized.outputs);
+    }
+
+    /// `load_dump` on a corrupt file yields the given `InvalidData` error
+    /// containing `needle` - never `Ok`, never a panic. (`VcDump` isn't
+    /// `Debug`, so we can't use `expect_err`.)
+    fn assert_load_rejects(bytes: &[u8], tag: &str, needle: &str) {
+        let path =
+            std::env::temp_dir().join(format!("volta_cli_{}_{}.bin", tag, std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let result = load_dump(&path);
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Ok(_) => panic!("{}: corrupt dump was accepted", tag),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{}: error kind", tag);
+                assert!(
+                    e.to_string().contains(needle),
+                    "{}: message {:?} lacks {:?}",
+                    tag,
+                    e.to_string(),
+                    needle
+                );
+            }
+        }
+    }
+
+    /// A file without the magic header is rejected cleanly (not decoded).
+    #[test]
+    fn load_dump_rejects_bad_magic() {
+        assert_load_rejects(
+            b"not a volta dump at all, definitely",
+            "badmagic",
+            "not a volta VC dump",
+        );
+    }
+
+    /// A file shorter than the 12-byte header is rejected with the header
+    /// message rather than a raw EOF.
+    #[test]
+    fn load_dump_rejects_short_file() {
+        assert_load_rejects(b"VOLTA", "short", "shorter than the header");
     }
 }
