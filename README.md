@@ -190,18 +190,24 @@ evaluates in a forked worker that is killed on expiry. `timeout` in the
 element counts means the budget expired; `unknown` means z3 itself gave
 up with budget to spare.
 
-Covers the arithmetic + `Exp` + `Max`/`Min` fragment. The translation
-preserves the decision procedure's cross-kernel correlation guarantees:
-identical structure in the two kernels' expressions is interned to shared
-SMT terms (so `max`/`min` opaque atoms with compound arguments line up
-across kernels), float constants use their exact binary values (the same
-reading as the decision procedure and the numeric oracle, not the decimal
-approximation), and user symbol names live in a reserved namespace so they
-can never collide with generated solver names. Anything outside the
-fragment (`Select`, comparisons, bitwise ops, data-dependent array
-reads, ...) is reported `unsupported` for that element rather than guessed
-at unsoundly. See `crates/volta_z3/src/translate.rs` for the exact
-boundary and invariants.
+Covers the arithmetic + `Exp` + `Max`/`Min` fragment as a **direct
+semantic image**: every expression node maps to its defining SMT term
+and all algebraic reasoning (commutativity, cancellation, distribution,
+max/min case analysis - `max`/`min` render as `ite` over real
+comparisons) is left to the solver, so the timings measure Z3, not the
+translator. What the translation owns is fidelity and transport: float
+constants as their exact binary values (the same reading as the decision
+procedure and the numeric oracle), user symbol names in reserved
+namespaces so they cannot collide with generated solver names, and
+`let`-bound DAG sharing so query text stays linear in the expression
+arena. One inherited SMT semantic: real division is total but
+underspecified at zero, so field identities like `x/x = 1` are
+falsifiable (countermodel `x = 0`) - corpus VCs only divide inside
+exp-laden softmax terms, where the verdict is `unknown` regardless.
+Anything outside the fragment (`Select`, comparisons, bitwise ops,
+data-dependent array reads, ...) is reported `unsupported` for that
+element rather than guessed at unsoundly. See
+`crates/volta_z3/src/translate.rs` for the exact boundary.
 
 ### Reproduce the paper's evaluation
 

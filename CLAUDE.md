@@ -226,24 +226,24 @@ Two `ExpMode`s reproduce the paper's section 6.5 baselines: the default
 budget kills them, reported `Timeout` - Table 8's "with axiom" column,
 10-minute budget in the paper).
 
-- `translate.rs` - the fragment boundary (arithmetic + `Exp` +
-  `Max`/`Min`; everything else `Unsupported` rather than modeled
-  unsoundly) and the load-bearing invariants: *structural interning over
-  signed multisets* across both arenas (Add/Sub/Neg/Fma flatten into one
-  sum term with signed counts, Mul/Div/Rcp into one product term with
-  signed exponents, negations hoist, negative literals normalize, so
-  grouping/sharing/sign-placement differences between the two kernels'
-  DAGs cannot split opaque `Max`/`Min` atom keys; `x - x` is literally
-  `0.0`), user symbols rendered as an injection of the typed `SymbolRef`
-  namespaces (`|p!name|` params, `|e!array[i]|` elements - a param named
-  `t0`/`e` cannot capture generated names), float constants
-  rendered as their exact binary rationals (same reading as
-  `canon`/`numeric`), the exp base as a free constant strictly bounded
-  around Euler's e (a definite rational base proved false equivalences),
-  iterative chain flattening + `stacker`-guarded recursion (deep Fma/Add
-  accumulator spines must not overflow the stack), and linear
-  `let`-chain assembly (deeply nested `let`s are fine for z3;
-  `define-fun` chains are not - measured, macro expansion chokes).
+- `translate.rs` - a *direct semantic image* of the fragment
+  (arithmetic + `Exp` + `Max`/`Min`; everything else `Unsupported`):
+  every node maps to its defining SMT term and ALL algebraic reasoning
+  is left to the solver, so timings measure Z3, not the translator
+  (`max`/`min` are `ite` case splits, not opaque atoms; no
+  canonicalization, no structural short-circuit). The translation owns
+  fidelity/transport only: exact binary-rational float literals (same
+  reading as `canon`/`numeric`), user symbols as an injection of the
+  typed `SymbolRef` namespaces (`|p!name|` params, `|e!array[i]|`
+  elements - a param named `t0`/`e` cannot capture generated names),
+  memoized `let`-bound DAG sharing (query text linear in the arena;
+  deeply nested `let`s are fine for z3, `define-fun` chains are not -
+  measured), `stacker`-guarded recursion for deep accumulator spines,
+  linear `let`-chain assembly, and the exp base as a strictly-bounded
+  free constant (a definite rational base proved false equivalences).
+  Inherited SMT semantic: division is underspecified at zero, so
+  `x/x = 1` is falsifiable - unlike canon's field model (moot on the
+  corpus: division only occurs inside exp-laden VCs).
 - `ffi.rs` - `eval_smtlib2` (fresh context per query, no-op error
   handler so z3 API errors surface as `(error ...)` text instead of
   aborting, soft timeout via the process-global `timeout` param) and

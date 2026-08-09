@@ -19,7 +19,7 @@ mod ffi;
 mod translate;
 
 pub use ffi::z3_version;
-pub use translate::{Builder, ExpMode, MaxMin, Unsupported, translate_root};
+pub use translate::{Builder, ExpMode, Unsupported, translate_root};
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -30,14 +30,14 @@ use volta_analysis::symbolic::{ExprArena, ExprId};
 /// Outcome of one Z3 query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Z3Verdict {
-    /// `unsat` on `(not (= a b))` (or the two sides translated to the
-    /// same interned term): the expressions are proved equal.
+    /// `unsat` on `(not (= a b))`: the expressions are proved equal.
     Equivalent,
-    /// `sat`: Z3 found a model where the two translations differ. This is
-    /// definitive when the query contains no opaque `max`/`min` atoms;
-    /// with opaque atoms it inherits the same uninterpreted-atom
-    /// incompleteness as the decision procedure's own DIFF verdicts (the
-    /// model may assign an atom a value no real max could take).
+    /// `sat`: Z3 found a model where the two sides differ. The
+    /// translation is a direct semantic image (max/min are real `ite`
+    /// case splits, not opaque atoms), so this is a genuine countermodel
+    /// for exp-free queries; when the query contains the exponential it
+    /// is not definitive (the bounded-free `e`, or `uexp` under
+    /// [`ExpMode::AdditionAxiom`], underconstrain the real exp).
     NotEquivalent,
     /// `unknown` - Z3 gave up on the query without exhausting its time
     /// budget (no decision procedure applies). The expected result for
@@ -66,8 +66,6 @@ pub enum Z3Error {
 /// One element's check: the verdict and how long the solver evaluation
 /// took. Translation time isn't included - that front-end cost is the
 /// same for both backends and isn't the thing being compared.
-/// (`solve_secs` is 0 when the two sides interned to the same term and no
-/// solver ran.)
 #[derive(Debug, Clone)]
 pub struct Z3CheckResult {
     pub verdict: Z3Verdict,
@@ -103,16 +101,6 @@ pub fn check_equivalent(
     let mut builder = Builder::with_exp_mode(mode);
     let ta = translate_root(&mut builder, arena_a, a)?;
     let tb = translate_root(&mut builder, arena_b, b)?;
-
-    // The two sides interned to the same term: structurally identical,
-    // hence equal over the reals - no solver needed. (This is also what
-    // makes comparing a kernel against itself instant.)
-    if ta == tb {
-        return Ok(Z3CheckResult {
-            verdict: Z3Verdict::Equivalent,
-            solve_secs: 0.0,
-        });
-    }
 
     let body = builder.wrap_in_lets(&format!("(not (= {} {}))", ta, tb));
     let mut query = builder.preamble();
@@ -329,15 +317,18 @@ mod tests {
         b: ExprId,
         mode: ExpMode,
     ) -> Z3Verdict {
-        check_equivalent(arena_a, a, arena_b, b, Some(Duration::from_secs(10)), mode)
+        // Generous: solver needs only ms uncontended, but the whole suite
+        // shares the cores and every test really runs z3 (no structural
+        // short-circuits by design).
+        check_equivalent(arena_a, a, arena_b, b, Some(Duration::from_secs(60)), mode)
             .unwrap()
             .verdict
     }
 
     #[test]
     fn commutative_add_is_equivalent() {
-        // x + 1 vs 1 + x: same arena, different tree shape. Sorted n-ary
-        // interning collapses both to one term - no solver run needed.
+        // x + 1 vs 1 + x: commutativity is the solver's job now - Z3
+        // proves it, the translation does not pre-normalize it away.
         let mut ar = ExprArena::new();
         let x = ar.param_symbol("x");
         let one = ar.int(1);
@@ -469,11 +460,9 @@ mod tests {
         assert!(matches!(result, Err(Z3Error::Unsupported(_))));
     }
 
-    /// Regression: max/min atoms with COMPOUND arguments used to be keyed
-    /// by side-local let-binder names, so two structurally identical maxes
-    /// from the two arenas became distinct free constants and the query
-    /// was trivially sat - a false NOT-EQUIVALENT, even comparing a
-    /// kernel against itself.
+    /// max/min are real ite case splits, so structurally different but
+    /// equal maxes across the two arenas are proved equal by the solver.
+    /// (Two earlier opaque-atom designs got this wrong or incomplete.)
     #[test]
     fn maxmin_compound_args_unify_across_arenas() {
         let build = |flip: bool| {
@@ -490,10 +479,8 @@ mod tests {
         assert_eq!(check(&ar_a, ma, &ar_b, mb), Z3Verdict::Equivalent);
     }
 
-    /// Regression: the atom key used to depend on traversal order (an
-    /// inner max already translated for another parent was kept as one
-    /// pre-flattened leaf), so identical running-max expressions keyed
-    /// differently between the two sides.
+    /// Nested running-max chains reassociated differently across the two
+    /// sides are proved equal via the ite semantics.
     #[test]
     fn maxmin_key_is_traversal_order_independent() {
         let build = |outer_first: bool| {
@@ -648,10 +635,11 @@ mod tests {
         assert!(translate_root(&mut bld2, &ar2, y).is_ok());
     }
 
-    /// Structurally identical sides short-circuit to Equivalent without
-    /// running the solver at all (solve_secs 0) - the self-compare case.
+    /// The self-compare case goes to the solver like everything else
+    /// (there is deliberately no structural short-circuit - the point is
+    /// to measure Z3) and is proved.
     #[test]
-    fn identical_structure_short_circuits() {
+    fn self_compare_is_proved_by_the_solver() {
         let mut ar = ExprArena::new();
         let x = ar.param_symbol("x");
         let y = ar.param_symbol("y");
@@ -659,7 +647,6 @@ mod tests {
         let m = ar.max(sum, x);
         let res = check_equivalent(&ar, m, &ar, m, None, ExpMode::PowerBounded).unwrap();
         assert_eq!(res.verdict, Z3Verdict::Equivalent);
-        assert_eq!(res.solve_secs, 0.0);
     }
 
     /// Regression (adversarial find): `exp(1)` used to prove equal to the
@@ -712,11 +699,9 @@ mod tests {
         assert_eq!(check(&ar_a, root_a, &ar_b, root_b), Z3Verdict::Equivalent);
     }
 
-    /// Regression (parity-fleet find): `min(y - max(x,z), w)` vs
-    /// `min(y + (-max(x,z)), w)` used to produce two distinct min atoms
-    /// (Sub vs Add-of-Neg argument shapes) - false NOT-EQUIVALENT at a
-    /// measured 12% rate on equal-by-construction max/min pairs. The
-    /// signed sum multiset makes Sub and Add+Neg the same term.
+    /// `min(y - max(x,z), w)` vs `min(y + (-max(x,z)), w)`: Sub vs
+    /// Add-of-Neg inside min/max arguments - the solver proves it (this
+    /// was a measured false-DIFF class under the old opaque-atom design).
     #[test]
     fn sub_and_add_neg_are_one_term_inside_atoms() {
         let mut ar_a = ExprArena::new();
@@ -741,8 +726,8 @@ mod tests {
         assert_eq!(check(&ar_a, root_a, &ar_b, root_b), Z3Verdict::Equivalent);
     }
 
-    /// Fma(a, b, c) and a*b + c are the same canonical term (common
-    /// compiler variance between the two kernels).
+    /// Fma(a, b, c) renders as its definition a*b + c, so it is proved
+    /// equal to the written-out form (common compiler variance).
     #[test]
     fn fma_desugars_to_mul_add() {
         let mut ar_a = ExprArena::new();
@@ -760,10 +745,9 @@ mod tests {
 
         let res = check_equivalent(&ar_a, lhs, &ar_b, rhs, None, ExpMode::PowerBounded).unwrap();
         assert_eq!(res.verdict, Z3Verdict::Equivalent);
-        assert_eq!(res.solve_secs, 0.0, "should unify structurally, no solver");
     }
 
-    /// Exact cancellation in the canonical form: x - x is the literal 0,
+    /// Exact cancellation: x - x is the literal 0,
     /// x / x is the literal 1, -(-x) is x.
     #[test]
     fn cancellation_and_involution() {
@@ -779,6 +763,12 @@ mod tests {
             Z3Verdict::Equivalent
         );
 
+        // x / x vs 1 is NOT valid over SMT reals: division is total but
+        // underspecified at zero, so x = 0 is a genuine countermodel.
+        // (canon's rational-field semantics formally cancels x/x to 1 - a
+        // documented modeling divergence of the two backends; corpus VCs
+        // only divide inside exp-laden softmax terms, where z3 answers
+        // unknown regardless.)
         let q = ar.div(x, x);
         let mut on = ExprArena::new();
         let one = on.float(1.0);
@@ -786,21 +776,17 @@ mod tests {
             check_equivalent(&ar, q, &on, one, None, ExpMode::PowerBounded)
                 .unwrap()
                 .verdict,
-            Z3Verdict::Equivalent
+            Z3Verdict::NotEquivalent
         );
 
         let n = ar.neg(x);
         let nn = ar.neg(n);
         let res = check_equivalent(&ar, nn, &ar, x, None, ExpMode::PowerBounded).unwrap();
         assert_eq!(res.verdict, Z3Verdict::Equivalent);
-        assert_eq!(res.solve_secs, 0.0);
     }
 
-    /// Regression (parity-fleet residual): `FloatConst(-c)` used to be a
-    /// distinct negative-literal atom from `Neg(FloatConst(c))`'s sum
-    /// form, so `-c` and `+c` entries failed to cancel and max/min atom
-    /// keys split. Negative literals now canonicalize as negated-positive
-    /// sums.
+    /// `x + (-0.1)` vs `x - 0.1`: negative literals vs negated positives
+    /// are the solver's problem now, and it proves them equal.
     #[test]
     fn negative_literals_unify_with_negated_positives() {
         let mut ar_a = ExprArena::new();
@@ -815,7 +801,6 @@ mod tests {
 
         let res = check_equivalent(&ar_a, lhs, &ar_b, rhs, None, ExpMode::PowerBounded).unwrap();
         assert_eq!(res.verdict, Z3Verdict::Equivalent);
-        assert_eq!(res.solve_secs, 0.0, "should unify structurally, no solver");
 
         // And exact cancellation across the two spellings: (x + -0.1) -
         // (x - 0.1) is the literal 0.
