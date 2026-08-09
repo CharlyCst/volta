@@ -280,8 +280,8 @@ mod tests {
     fn test_combine_halves_into_pair() {
         let mut arena = ExprArena::new();
         let mut mem = Memory::new();
-        let lo = arena.named("lo");
-        let hi = arena.named("hi");
+        let lo = arena.param_symbol("lo");
+        let hi = arena.param_symbol("hi");
         mem.write(0x10, 2, Value::Scalar(lo)).unwrap();
         mem.write(0x12, 2, Value::Scalar(hi)).unwrap();
         assert_eq!(mem.read(0x10, 4).unwrap(), Value::Pair(lo, hi));
@@ -291,8 +291,8 @@ mod tests {
     fn test_split_pair_on_half_read() {
         let mut arena = ExprArena::new();
         let mut mem = Memory::new();
-        let lo = arena.named("lo");
-        let hi = arena.named("hi");
+        let lo = arena.param_symbol("lo");
+        let hi = arena.param_symbol("hi");
         mem.write(0x10, 4, Value::Pair(lo, hi)).unwrap();
         assert_eq!(mem.read(0x10, 2).unwrap(), Value::Scalar(lo));
         assert_eq!(mem.read(0x12, 2).unwrap(), Value::Scalar(hi));
@@ -302,11 +302,11 @@ mod tests {
     fn test_split_pair_on_half_write() {
         let mut arena = ExprArena::new();
         let mut mem = Memory::new();
-        let lo = arena.named("lo");
-        let hi = arena.named("hi");
+        let lo = arena.param_symbol("lo");
+        let hi = arena.param_symbol("hi");
         mem.write(0x10, 4, Value::Pair(lo, hi)).unwrap();
         // Overwrite just the low half; the high half must survive.
-        let new_lo = arena.named("new_lo");
+        let new_lo = arena.param_symbol("new_lo");
         mem.write(0x10, 2, Value::Scalar(new_lo)).unwrap();
         assert_eq!(mem.read(0x10, 2).unwrap(), Value::Scalar(new_lo));
         assert_eq!(mem.read(0x12, 2).unwrap(), Value::Scalar(hi));

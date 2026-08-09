@@ -32,41 +32,38 @@ impl fmt::Display for SymbolId {
     }
 }
 
+/// The identity of a symbolic atom, shared by every backend that must
+/// agree on which symbols are equal (canon, the numeric oracle,
+/// `volta_z3`). Only launch-config names carry identity - PTX-source
+/// names are scoped and must not (bind those to fresh machine
+/// [`Symbol`](ExprNode::Symbol)s instead) - and the three namespaces are
+/// disjoint by construction rather than by string formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolRef<'a> {
+    /// A launch-config symbolic parameter (`sym:NAME`), by config name.
+    Param(&'a str),
+    /// One element of a launch-config input array, by config array name
+    /// and element index.
+    Element { array: &'a str, index: u64 },
+    /// A machine-generated `Symbol`, identified by its `SymbolId`.
+    Machine(SymbolId),
+}
+
 // =========================================================================
 // Arena IDs
 // =========================================================================
 
 /// A lightweight handle to an expression node in an `ExprArena`.
-#[id_type]
+///
+/// The serde impls (via `id_collections`) encode the bare index; an id is
+/// only meaningful when paired with the `ExprArena` that produced it -
+/// see `ExprArena`'s serialization below.
+#[id_type(serde = true)]
 pub struct ExprId(pub u32);
 
 /// A handle to a string stored in the arena's string table.
-#[id_type]
+#[id_type(serde = true)]
 pub struct StringId(pub u32);
-
-// `#[id_type]` doesn't derive serde impls, so these go through `Id::to_index`/
-// `Id::from_index` by hand. Only meaningful when paired with the `ExprArena`
-// that produced them - see `ExprArena`'s own (de)serialization below.
-macro_rules! impl_id_serde {
-    ($ty:ty) => {
-        impl serde::Serialize for $ty {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                id_collections::Id::to_index(*self).serialize(serializer)
-            }
-        }
-
-        impl<'de> serde::Deserialize<'de> for $ty {
-            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                Ok(id_collections::Id::from_index(u32::deserialize(
-                    deserializer,
-                )?))
-            }
-        }
-    };
-}
-
-impl_id_serde!(ExprId);
-impl_id_serde!(StringId);
 
 // =========================================================================
 // Expression node
@@ -87,10 +84,13 @@ pub enum ExprNode {
     FloatConst(f64),
     /// Boolean constant (for predicates)
     BoolConst(bool),
-    /// Symbolic variable (from input tensors)
+    /// Machine-generated symbolic variable: a fresh unknown with no
+    /// launch-config identity, correlated with nothing (see [`SymbolRef`]).
     Symbol(SymbolId),
-    /// Named symbol (e.g., "x[0]", "input[5]")
-    NamedSymbol(StringId),
+    /// A launch-config symbolic parameter (`sym:NAME`), by config name.
+    ParamSymbol(StringId),
+    /// Element `index` of the launch-config input array named `array`.
+    InputElement { array: StringId, index: u64 },
 
     // =====================================================================
     // Arithmetic (over reals)
@@ -207,11 +207,11 @@ pub enum ExprNode {
     // =====================================================================
     /// Fused multiply-add: a * b + c
     Fma(ExprId, ExprId, ExprId),
-    /// Symbolic read from a named array at a symbolic index.
+    /// Symbolic read from a launch-config input array at a symbolic index.
     ///
-    /// Represents `array_name[index]`. When `index` is substituted to a
-    /// concrete integer `i`, this resolves to `NamedSymbol("array_name[i]")`,
-    /// matching the convention used by `init_symbolic_array`.
+    /// Represents `array[index]`. When `index` is substituted to a
+    /// concrete integer `i`, this resolves to `InputElement { array, i }`,
+    /// the same identity lazy input materialization produces.
     SymbolicRead { array: StringId, index: ExprId },
     /// Discarded per-thread value. Set during re-aggregation when static
     /// liveness analysis proves the register will be overwritten before being
@@ -231,7 +231,8 @@ impl ExprNode {
             | ExprNode::FloatConst(_)
             | ExprNode::BoolConst(_)
             | ExprNode::Symbol(_)
-            | ExprNode::NamedSymbol(_)
+            | ExprNode::ParamSymbol(_)
+            | ExprNode::InputElement { .. }
             | ExprNode::Discarded
             | ExprNode::Undefined => {}
 
@@ -286,8 +287,23 @@ impl ExprNode {
     /// The `StringId` this node references, if any.
     pub fn string_id(&self) -> Option<StringId> {
         match self {
-            ExprNode::NamedSymbol(sid) => Some(*sid),
+            ExprNode::ParamSymbol(sid) => Some(*sid),
+            ExprNode::InputElement { array, .. } => Some(*array),
             ExprNode::SymbolicRead { array, .. } => Some(*array),
+            _ => None,
+        }
+    }
+
+    /// The symbol identity this node denotes, if it is a symbolic atom -
+    /// the single mapping from node representation to [`SymbolRef`].
+    pub fn symbol_ref<'a>(&self, arena: &'a ExprArena) -> Option<SymbolRef<'a>> {
+        match self {
+            ExprNode::ParamSymbol(sid) => Some(SymbolRef::Param(arena.string(*sid))),
+            ExprNode::InputElement { array, index } => Some(SymbolRef::Element {
+                array: arena.string(*array),
+                index: *index,
+            }),
+            ExprNode::Symbol(sym) => Some(SymbolRef::Machine(*sym)),
             _ => None,
         }
     }
@@ -301,48 +317,15 @@ impl ExprNode {
 ///
 /// All expression nodes live here. Callers manipulate expressions via
 /// lightweight, copyable `ExprId` handles.
+///
+/// The serde impls are the `volta compare --dump-vcs`/`--from-dump`
+/// persistence format: `IdVec` (via `id_collections`'s `serde` feature)
+/// encodes exactly like a `Vec`, serialized in place - no transient clone
+/// of GiB-scale arenas at dump time.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExprArena {
     nodes: IdVec<ExprId, ExprNode>,
     strings: IdVec<StringId, String>,
-}
-
-// `IdVec` has no serde support (see id_collections 1.0.1), so the arena is
-// (de)serialized by hand as its two flat `Vec`s - this is the format used by
-// `volta compare --dump-vcs`/`--from-dump` to persist verification
-// conditions across runs. Serialization borrows the slices (`ExprArenaDataRef`)
-// rather than cloning them: serde encodes `&[T]` and `Vec<T>` identically (a
-// seq with a length), and attention-scale arenas are large enough that a
-// transient clone at dump time would meaningfully spike peak memory.
-#[derive(serde::Deserialize)]
-struct ExprArenaData {
-    nodes: Vec<ExprNode>,
-    strings: Vec<String>,
-}
-
-#[derive(serde::Serialize)]
-struct ExprArenaDataRef<'a> {
-    nodes: &'a [ExprNode],
-    strings: &'a [String],
-}
-
-impl serde::Serialize for ExprArena {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ExprArenaDataRef {
-            nodes: self.nodes.as_slice(),
-            strings: self.strings.as_slice(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ExprArena {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let data = ExprArenaData::deserialize(deserializer)?;
-        Ok(ExprArena {
-            nodes: IdVec::from_vec(data.nodes),
-            strings: IdVec::from_vec(data.strings),
-        })
-    }
 }
 
 impl ExprArena {
@@ -451,15 +434,30 @@ impl ExprArena {
         self.push(ExprNode::BoolConst(v))
     }
 
-    /// Create a fresh symbolic variable.
+    /// Create a fresh machine symbolic variable - the constructor for any
+    /// value without a launch-config identity (see [`SymbolRef`]).
     pub fn symbol(&mut self) -> ExprId {
         self.push(ExprNode::Symbol(SymbolId::fresh()))
     }
 
-    /// Create a named symbolic variable.
-    pub fn named(&mut self, name: impl Into<String>) -> ExprId {
+    /// Intern a string, returning its id. Does not deduplicate; callers
+    /// creating many nodes that share a string (e.g. one array's elements)
+    /// should intern once and reuse the id.
+    pub fn intern_string(&mut self, s: impl Into<String>) -> StringId {
+        self.strings.push(s.into())
+    }
+
+    /// Create a launch-config symbolic parameter (`sym:NAME`); the name
+    /// must come from the launch config (see [`SymbolRef`]).
+    pub fn param_symbol(&mut self, name: impl Into<String>) -> ExprId {
         let sid = self.strings.push(name.into());
-        self.push(ExprNode::NamedSymbol(sid))
+        self.push(ExprNode::ParamSymbol(sid))
+    }
+
+    /// Create the symbol for element `index` of the launch-config input
+    /// array whose name is interned at `array`.
+    pub fn input_element(&mut self, array: StringId, index: u64) -> ExprId {
+        self.push(ExprNode::InputElement { array, index })
     }
 
     /// Create an undefined-value node.
@@ -665,17 +663,22 @@ impl ExprArena {
         self.push(ExprNode::Fma(a, b, c))
     }
 
-    /// Create a symbolic array read: `array_name[index]`.
+    /// Create a symbolic read from launch-config input array `array_name`:
+    /// `array_name[index]`.
     ///
-    /// When `index` is concrete, immediately resolves to
-    /// `NamedSymbol("array_name[i]")`. Otherwise stores a `SymbolicRead`
-    /// node that resolves upon TID substitution.
+    /// When `index` is concrete, immediately resolves to the typed
+    /// `InputElement` identity - the same one lazy input materialization
+    /// produces. Otherwise stores a `SymbolicRead` node that resolves upon
+    /// TID substitution. (A negative concrete index wraps into `u64`;
+    /// every resolver uses the same wrapping, and no materialized element
+    /// can collide with it since element indices are bounded by the
+    /// array's length.)
     pub fn symbolic_read(&mut self, array_name: &str, index: ExprId) -> ExprId {
+        let sid = self.strings.push(array_name.to_string());
         // Eagerly resolve if index is concrete
         if let Some(i) = self.as_i64(index) {
-            return self.named(format!("{}[{}]", array_name, i));
+            return self.input_element(sid, i as u64);
         }
-        let sid = self.strings.push(array_name.to_string());
         self.push(ExprNode::SymbolicRead { array: sid, index })
     }
 
@@ -1022,7 +1025,10 @@ impl ExprArena {
             ExprNode::FloatConst(v) => write!(f, "{}", v),
             ExprNode::BoolConst(b) => write!(f, "{}", b),
             ExprNode::Symbol(sid) => write!(f, "{}", sid),
-            ExprNode::NamedSymbol(sid) => write!(f, "{}", self.string(*sid)),
+            ExprNode::ParamSymbol(sid) => write!(f, "{}", self.string(*sid)),
+            ExprNode::InputElement { array, index } => {
+                write!(f, "{}[{}]", self.string(*array), index)
+            }
             ExprNode::Add(a, b) => {
                 write!(f, "(")?;
                 self.fmt_expr(*a, f)?;
@@ -1315,53 +1321,6 @@ impl Clone for ExprArena {
     }
 }
 
-/// Visit each direct child of a node.
-pub fn for_each_child(node: &ExprNode, mut f: impl FnMut(ExprId)) {
-    use ExprNode::*;
-    match node {
-        IntConst(_) | FloatConst(_) | BoolConst(_) | Symbol(_) | NamedSymbol(_) | Discarded
-        | Undefined => {}
-
-        Neg(a) | Exp(a) | Log(a) | Sqrt(a) | Rcp(a) | Abs(a) | BitNot(a) | Not(a) | ToFloat(a)
-        | ToInt(a) => f(*a),
-
-        SignExtend { value, .. } | ZeroExtend { value, .. } | Truncate { value, .. } => f(*value),
-
-        Add(a, b)
-        | Sub(a, b)
-        | Mul(a, b)
-        | Div(a, b)
-        | Rem(a, b)
-        | Max(a, b)
-        | Min(a, b)
-        | BitAnd(a, b)
-        | BitOr(a, b)
-        | BitXor(a, b)
-        | Shl(a, b)
-        | Shr(a, b)
-        | LShr(a, b)
-        | Eq(a, b)
-        | Ne(a, b)
-        | Lt(a, b)
-        | Le(a, b)
-        | Gt(a, b)
-        | Ge(a, b)
-        | And(a, b)
-        | Or(a, b) => {
-            f(*a);
-            f(*b);
-        }
-
-        Fma(a, b, c) | Select(a, b, c) => {
-            f(*a);
-            f(*b);
-            f(*c);
-        }
-
-        SymbolicRead { index, .. } => f(*index),
-    }
-}
-
 /// Check structural equality of two expressions across different arenas.
 ///
 /// Walks both expression trees in lockstep, comparing node variants and
@@ -1384,7 +1343,17 @@ fn structurally_equal_inner(
         (FloatConst(x), FloatConst(y)) => x == y,
         (BoolConst(x), BoolConst(y)) => x == y,
         (Symbol(x), Symbol(y)) => x == y,
-        (NamedSymbol(x), NamedSymbol(y)) => a_arena.string(*x) == b_arena.string(*y),
+        (ParamSymbol(x), ParamSymbol(y)) => a_arena.string(*x) == b_arena.string(*y),
+        (
+            InputElement {
+                array: xa,
+                index: xi,
+            },
+            InputElement {
+                array: ya,
+                index: yi,
+            },
+        ) => xi == yi && a_arena.string(*xa) == b_arena.string(*ya),
         (Undefined, Undefined) => true,
 
         // Binary ops
@@ -1664,12 +1633,19 @@ mod tests {
         let c = arena.bool_val(true);
         assert_eq!(arena.node(c), &ExprNode::BoolConst(true));
 
-        let d = arena.named("input[0]");
-        if let ExprNode::NamedSymbol(sid) = arena.node(d) {
-            assert_eq!(arena.string(*sid), "input[0]");
+        let d = arena.param_symbol("alpha");
+        if let ExprNode::ParamSymbol(sid) = arena.node(d) {
+            assert_eq!(arena.string(*sid), "alpha");
         } else {
-            panic!("expected NamedSymbol");
+            panic!("expected ParamSymbol");
         }
+
+        let sid = arena.intern_string("input");
+        let e = arena.input_element(sid, 0);
+        assert!(matches!(
+            arena.node(e),
+            ExprNode::InputElement { array, index: 0 } if arena.string(*array) == "input"
+        ));
 
         let u = arena.undefined();
         assert_eq!(arena.node(u), &ExprNode::Undefined);
@@ -1745,7 +1721,7 @@ mod tests {
     #[test]
     fn validate_accepts_constructed_arenas() {
         let mut ar = ExprArena::new();
-        let x = ar.named("x");
+        let x = ar.param_symbol("x");
         let y = ar.symbol();
         let s = ar.add(x, y);
         let m = ar.max(s, x);
@@ -1774,7 +1750,7 @@ mod tests {
         assert!(forward.validate().is_err());
 
         let oob_string = ExprArena::from_raw_parts_for_test(
-            vec![ExprNode::NamedSymbol(Id::from_index(3))],
+            vec![ExprNode::ParamSymbol(Id::from_index(3))],
             vec!["x".to_string()],
         );
         assert!(oob_string.validate().is_err());

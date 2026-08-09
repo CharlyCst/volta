@@ -18,27 +18,23 @@ crates/
 ├── volta_common/     # Base utilities (spans, file caching, error reporting, run logs)
 ├── volta_frontend/   # PTX lexer and parser
 ├── volta_analysis/   # Abstract interpreter
-├── volta_z3/         # Z3 comparison backend (SMT-LIB2 via the `z3` CLI)
+├── volta_z3/         # Z3 comparison backend (SMT-LIB2 via linked libz3)
 ├── volta_bench/      # Paper-evaluation benchmark harness
 └── volta_cli/        # Command-line interface
 ```
 
 ### Dependency Graph
 
-```
-volta_cli ──┐         volta_bench ──┐
-    ├── volta_z3 ◄──────────────────┤
-    │       └── volta_analysis      │
-    ├── volta_analysis ◄────────────┤
-    │       ├── volta_frontend ◄────┘
-    │       │       └── volta_common
-    │       └── volta_common
-    └── volta_frontend
-            └── volta_common
-```
+Direct dependencies of each crate:
 
-(`volta_cli` and `volta_bench` also depend on `volta_common` directly, for
-`run_log`.)
+```
+volta_cli      → volta_z3, volta_analysis, volta_frontend, volta_common
+volta_bench    → volta_z3, volta_analysis, volta_frontend, volta_common
+volta_z3       → volta_analysis
+volta_analysis → volta_frontend, volta_common
+volta_frontend → volta_common
+volta_common   → (nothing)
+```
 
 ## Crate: volta_common
 
@@ -98,7 +94,12 @@ to its subsystem:
 Arena-allocated: nodes live in an `ExprArena`, referenced by copyable `ExprId`
 handles. Constructors constant-fold eagerly.
 
-- **Atoms**: `IntConst`, `FloatConst`, `BoolConst`, `Symbol(SymbolId)`, `NamedSymbol(StringId)`, `Undefined`
+- **Atoms**: `IntConst`, `FloatConst`, `BoolConst`, `Symbol(SymbolId)`, `ParamSymbol(StringId)`, `InputElement { array, index }`, `Undefined`
+- Symbol identity is typed (`SymbolRef`: `Param`/`Element`/`Machine`,
+  disjoint namespaces; one mapping in `ExprNode::symbol_ref`). Identity
+  comes only from launch-config names - PTX-source names are scoped and
+  must not carry identity; values without a config binding are fresh
+  machine `Symbol`s. `AnalysisConfig::validate` rejects ambiguous configs.
 - **Arithmetic**: `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Fma`
 - **Transcendental**: `Exp`, `Log`, `Sqrt`, `Rcp`
 - **Bitwise**: `BitAnd`, `BitOr`, `BitXor`, `BitNot`, `Shl`, `Shr`, `LShr`
@@ -144,21 +145,26 @@ nvcc's `selp` accumulator-init idiom both rely on this.
 
 - `analyze_kernel(module, kernel_name, config) -> Result<AnalysisOutput, AnalysisError>`
 - `AnalysisOutput`: per-output-array written elements as `(index, ExprId)` + `Stats` (instructions, block syncs; warp syncs counted per fired group, not per thread) + `op_counts` (per-instruction-kind execution counts; the interpreter tallies into a fixed `[u64; KIND_COUNT]` and folds to this `BTreeMap` at the end)
-- `paired_elements(ref, opt, footprints)` - pairs the two outputs' written
-  elements per array under a `FootprintPolicy`; shared by the decision
-  procedure and `volta_z3` so both backends check exactly the same elements
+- `paired_elements(ref, opt, arrays)` - pairs the two outputs' written
+  elements for each array the caller names (both sides must have each
+  named array with identical index sets; unnamed arrays are not compared
+  - FlashAttention's optimized-only `l`/`m` exports rely on this; an
+  empty list is an error). Callers derive the list explicitly: the bench
+  harness and CLI use the reference config's declared output arrays.
+  Shared by the decision procedure and `volta_z3` so both backends check
+  exactly the same elements
 - `check_output_equivalence_with(ref, opt, options)` - the per-element
-  check via one shared `EquivSession`. `EquivCheckOptions`:
-  `FootprintPolicy::{Exact, Intersect}` (Intersect compares the common
-  written indices - a grid-stride reference vs a tiled kernel), `sample`,
+  check via one shared `EquivSession`. `EquivCheckOptions`: `sample`,
   `verify_numeric` (f64 oracle per element), `recycle_terms`. Returns a
   report with the outcome plus checked/total element counts.
-- `check_output_equivalence(ref, opt)` - the strict Default-options wrapper
-  (identical footprints, all elements)
+- `check_output_equivalence(ref, opt)` - the Default-options wrapper
+  (all elements, no oracle)
 - `VcSnapshot`/`VcDump` - serde-serializable arena + output footprint, the
-  payload of `volta compare --dump-vcs`/`--from-dump`; `validate()` bounds-
-  checks every id so a corrupt dump errors instead of panicking. The arena
-  serializes via borrowed slices (no clone of GiB-scale arenas at dump time).
+  payload of `volta compare --dump-vcs`/`--from-dump`; `validate()` checks
+  every id (in bounds and children-before-parents) so a corrupt dump errors
+  instead of panicking. The arena's serde impls are plain derives over
+  `IdVec` via `id_collections`'s `serde` feature (wire-identical to `Vec`,
+  serialized in place - no clone of GiB-scale arenas at dump time).
 - `write_op_counts(out, label, counts)` - the one profile-table formatter,
   used by both `volta` and `volta-bench`
 
@@ -228,8 +234,9 @@ budget kills them, reported `Timeout` - Table 8's "with axiom" column,
   signed exponents, negations hoist, negative literals normalize, so
   grouping/sharing/sign-placement differences between the two kernels'
   DAGs cannot split opaque `Max`/`Min` atom keys; `x - x` is literally
-  `0.0`), user symbols quoted into a reserved `u!` namespace (a param
-  named `t0`/`e` cannot capture generated names), float constants
+  `0.0`), user symbols rendered as an injection of the typed `SymbolRef`
+  namespaces (`|p!name|` params, `|e!array[i]|` elements - a param named
+  `t0`/`e` cannot capture generated names), float constants
   rendered as their exact binary rationals (same reading as
   `canon`/`numeric`), the exp base as a free constant strictly bounded
   around Euler's e (a definite rational base proved false equivalences),
@@ -258,7 +265,8 @@ Benchmark definitions with full launch/param configs live in
 category <reduction|matmul|attention|causal|conv|agent|tilelang|race>
 [--sample N] [--verify-numeric] [--recycle-terms N]` (also `all`, `single
 <name>`, `list`; release mode matters: ~20x). The element loop is
-`driver::check_output_equivalence_with` with `FootprintPolicy::Intersect`.
+`driver::check_output_equivalence_with` (exact per-array footprints
+against the reference; every corpus pair is footprint-identical).
 `z3-compare <all|category|name>` runs equivalence benchmarks through both
 the decision procedure and `volta_z3` side by side (skips race-check
 benchmarks; exits nonzero if any row fails outright); benchmarks whose
@@ -281,7 +289,7 @@ Commands:
 - `volta compare <ref.ptx> <opt.ptx> --kernel1 .. --kernel2 ..` - Two-kernel
   equivalence check (launch flags shared with `analyze` via a flattened
   `LaunchArgs`; `--block2`/`--grid2` override the optimized kernel's dims).
-  `--backend decision|z3`, `--footprint exact|intersect`, `--dump-vcs`/
+  `--backend decision|z3`, `--dump-vcs`/
   `--from-dump` (validated, versioned dump files). Exits 0 only when every
   checked element is proved equivalent.
 

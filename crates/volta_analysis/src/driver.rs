@@ -145,24 +145,9 @@ impl From<EquivError> for EquivCheckError {
     }
 }
 
-/// How to pair up the two kernels' written footprints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FootprintPolicy {
-    /// The footprints must be identical: same output arrays, same written
-    /// indices, element for element.
-    Exact,
-    /// Compare only the intersection of the written indices per array
-    /// (e.g. a grid-stride reference and a tiled kernel cover different
-    /// slices of the output). Arrays present only in the optimized output
-    /// (auxiliary buffers) are ignored; an empty intersection over a
-    /// nonempty array is an error.
-    Intersect,
-}
-
 /// Options for [`check_output_equivalence_with`].
 #[derive(Debug, Clone)]
 pub struct EquivCheckOptions {
-    pub footprints: FootprintPolicy,
     /// Check at most this many common elements per array (0 = all).
     pub sample: u64,
     /// Confirm every verdict with the f64 numeric oracle.
@@ -175,7 +160,6 @@ pub struct EquivCheckOptions {
 impl Default for EquivCheckOptions {
     fn default() -> Self {
         Self {
-            footprints: FootprintPolicy::Exact,
             sample: 0,
             verify_numeric: false,
             recycle_terms: DEFAULT_RECYCLE_TERMS,
@@ -189,90 +173,64 @@ pub struct EquivCheckReport {
     pub outcome: EquivOutcome,
     /// Elements actually compared (less than total when sampling).
     pub elements_checked: u64,
-    /// Comparable elements in the (possibly intersected) footprints.
+    /// Comparable elements in the reference footprints.
     pub elements_total: u64,
 }
 
-/// Pair up the reference and optimized outputs' written elements per array,
-/// according to `footprints`. Shared by `check_output_equivalence_with` (the
-/// decision procedure) and any other backend (e.g. `volta_z3`) that needs
-/// the exact same element correspondence to be a fair comparison.
+/// Pair up the two runs' written elements for each array the caller
+/// names: both runs must have written every named array with an
+/// identical index set, element for element (arrays the caller does not
+/// name are not compared - e.g. auxiliary exports like FlashAttention's
+/// softmax `l`/`m` statistics that only the optimized kernel computes).
+/// The list must be nonempty: checking nothing is an error, not a
+/// vacuous pass. Shared by `check_output_equivalence_with` (the decision
+/// procedure) and any other backend (e.g. `volta_z3`) that needs the
+/// exact same element correspondence to be a fair comparison.
 pub fn paired_elements(
     reference: &AnalysisOutput,
     optimized: &AnalysisOutput,
-    footprints: FootprintPolicy,
+    arrays: &[String],
 ) -> Result<Vec<(String, Vec<(u64, ExprId, ExprId)>)>, EquivCheckError> {
-    if footprints == FootprintPolicy::Exact && reference.outputs.len() != optimized.outputs.len() {
+    if arrays.is_empty() {
         return Err(EquivCheckError::ShapeMismatch {
-            message: format!(
-                "{} output arrays vs {}",
-                reference.outputs.len(),
-                optimized.outputs.len()
-            ),
+            message: "no arrays specified to check".to_string(),
         });
     }
-
-    let mut result = Vec::with_capacity(reference.outputs.len());
-    for (name, ref_elems) in &reference.outputs {
+    let mut result = Vec::with_capacity(arrays.len());
+    for name in arrays {
+        let Some((_, ref_elems)) = reference.outputs.iter().find(|(n, _)| n == name) else {
+            return Err(EquivCheckError::ShapeMismatch {
+                message: format!("reference run has no output array '{}'", name),
+            });
+        };
         let Some((_, opt_elems)) = optimized.outputs.iter().find(|(n, _)| n == name) else {
             return Err(EquivCheckError::ShapeMismatch {
                 message: format!("optimized run has no output array '{}'", name),
             });
         };
 
-        let common: Vec<(u64, ExprId, ExprId)> = match footprints {
-            FootprintPolicy::Exact => {
-                if ref_elems.len() != opt_elems.len() {
-                    return Err(EquivCheckError::ShapeMismatch {
-                        message: format!(
-                            "array '{}': {} elements written vs {}",
-                            name,
-                            ref_elems.len(),
-                            opt_elems.len()
-                        ),
-                    });
-                }
-                let mut common = Vec::with_capacity(ref_elems.len());
-                for (&(ri, r), &(oi, o)) in ref_elems.iter().zip(opt_elems.iter()) {
-                    if ri != oi {
-                        return Err(EquivCheckError::ShapeMismatch {
-                            message: format!(
-                                "array '{}': written footprints differ (element {} vs {})",
-                                name, ri, oi
-                            ),
-                        });
-                    }
-                    common.push((ri, r, o));
-                }
-                common
+        if ref_elems.len() != opt_elems.len() {
+            return Err(EquivCheckError::ShapeMismatch {
+                message: format!(
+                    "array '{}': {} elements written vs {}",
+                    name,
+                    ref_elems.len(),
+                    opt_elems.len()
+                ),
+            });
+        }
+        let mut common = Vec::with_capacity(ref_elems.len());
+        for (&(ri, r), &(oi, o)) in ref_elems.iter().zip(opt_elems.iter()) {
+            if ri != oi {
+                return Err(EquivCheckError::ShapeMismatch {
+                    message: format!(
+                        "array '{}': written footprints differ (element {} vs {})",
+                        name, ri, oi
+                    ),
+                });
             }
-            FootprintPolicy::Intersect => {
-                let mut common = Vec::new();
-                let (mut i, mut j) = (0usize, 0usize);
-                while i < ref_elems.len() && j < opt_elems.len() {
-                    let (ri, r) = ref_elems[i];
-                    let (oi, o) = opt_elems[j];
-                    match ri.cmp(&oi) {
-                        std::cmp::Ordering::Less => i += 1,
-                        std::cmp::Ordering::Greater => j += 1,
-                        std::cmp::Ordering::Equal => {
-                            common.push((ri, r, o));
-                            i += 1;
-                            j += 1;
-                        }
-                    }
-                }
-                if common.is_empty() && !(ref_elems.is_empty() && opt_elems.is_empty()) {
-                    return Err(EquivCheckError::ShapeMismatch {
-                        message: format!(
-                            "array '{}': the two kernels' CTA-0 footprints do not overlap",
-                            name
-                        ),
-                    });
-                }
-                common
-            }
-        };
+            common.push((ri, r, o));
+        }
         result.push((name.clone(), common));
     }
     Ok(result)
@@ -284,11 +242,13 @@ pub fn paired_elements(
 pub fn check_output_equivalence_with(
     reference: &AnalysisOutput,
     optimized: &AnalysisOutput,
+    arrays: &[String],
     options: &EquivCheckOptions,
 ) -> Result<EquivCheckReport, EquivCheckError> {
-    let paired = paired_elements(reference, optimized, options.footprints)?;
+    let paired = paired_elements(reference, optimized, arrays)?;
 
-    let mut session = EquivSession::with_recycle_terms(options.recycle_terms);
+    let mut session =
+        EquivSession::with_recycle_terms(&reference.arena, &optimized.arena, options.recycle_terms);
     let mut mismatches = Vec::new();
     let mut elements_checked = 0u64;
     let mut elements_total = 0u64;
@@ -300,7 +260,7 @@ pub fn check_output_equivalence_with(
             n => common.len().min(n as usize),
         };
         for &(index, r, o) in common.iter().take(limit) {
-            let equivalent = session.check(&reference.arena, r, &optimized.arena, o)?;
+            let equivalent = session.check(r, o)?;
             if options.verify_numeric {
                 numeric::verify_verdict(&reference.arena, r, &optimized.arena, o, equivalent)
                     .map_err(|message| EquivCheckError::Numeric {
@@ -426,13 +386,73 @@ pub fn write_op_counts(
     Ok(())
 }
 
-/// Check that two analysis outputs agree on every element of every output
-/// array under the default options: identical footprints required, all
-/// elements checked, no numeric oracle.
+/// Check that two analysis outputs agree on every element of every named
+/// array under the default options: all elements checked, no numeric
+/// oracle.
 pub fn check_output_equivalence(
     reference: &AnalysisOutput,
     optimized: &AnalysisOutput,
+    arrays: &[String],
 ) -> Result<EquivOutcome, EquivCheckError> {
-    check_output_equivalence_with(reference, optimized, &EquivCheckOptions::default())
+    check_output_equivalence_with(reference, optimized, arrays, &EquivCheckOptions::default())
         .map(|report| report.outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::Stats;
+
+    fn output_with(arrays: &[(&str, &[u64])]) -> AnalysisOutput {
+        let mut arena = ExprArena::new();
+        let outputs = arrays
+            .iter()
+            .map(|(name, indices)| {
+                let elems = indices
+                    .iter()
+                    .map(|&i| {
+                        let sid = arena.intern_string(*name);
+                        (i, arena.input_element(sid, i))
+                    })
+                    .collect();
+                (name.to_string(), elems)
+            })
+            .collect();
+        AnalysisOutput {
+            arena,
+            outputs,
+            stats: Stats::default(),
+            op_counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The caller's array list is the spec: named arrays must exist on
+    /// BOTH sides, unnamed arrays on either side are ignored, and naming
+    /// nothing is an error rather than a vacuous pass.
+    #[test]
+    fn paired_elements_follows_the_callers_list() {
+        let reference = output_with(&[("out", &[0, 1])]);
+        let optimized = output_with(&[("out", &[0, 1]), ("aux", &[0])]);
+
+        // Unnamed optimized-only "aux" is ignored.
+        let paired = paired_elements(&reference, &optimized, &names(&["out"])).unwrap();
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].1.len(), 2);
+
+        // Naming an array absent from either side is an error.
+        assert!(paired_elements(&reference, &optimized, &names(&["aux"])).is_err());
+        assert!(paired_elements(&optimized, &reference, &names(&["out", "aux"])).is_err());
+        assert!(paired_elements(&reference, &optimized, &names(&["missing"])).is_err());
+
+        // An empty list is an error, not a vacuous pass.
+        assert!(paired_elements(&reference, &optimized, &[]).is_err());
+
+        // Differing footprints for a named array are an error.
+        let narrower = output_with(&[("out", &[0])]);
+        assert!(paired_elements(&reference, &narrower, &names(&["out"])).is_err());
+    }
 }

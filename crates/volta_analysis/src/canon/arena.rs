@@ -19,6 +19,7 @@ use std::hash::Hash;
 use id_collections::{IdVec, id_type};
 
 use super::coeff::Coeff;
+use crate::symbolic::{SymbolId, SymbolRef};
 
 #[id_type]
 pub struct PolyId(pub u32);
@@ -159,10 +160,31 @@ impl<Id: id_collections::Id, T: Clone + Eq + Hash> Interner<Id, T> {
     }
 }
 
+/// Owned mirror of [`SymbolRef`] for the symbol intern table.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SymbolKey {
+    Param(String),
+    Element { array: String, index: u64 },
+    Machine(SymbolId),
+}
+
+impl From<SymbolRef<'_>> for SymbolKey {
+    fn from(sym: SymbolRef<'_>) -> Self {
+        match sym {
+            SymbolRef::Param(name) => SymbolKey::Param(name.to_string()),
+            SymbolRef::Element { array, index } => SymbolKey::Element {
+                array: array.to_string(),
+                index,
+            },
+            SymbolRef::Machine(id) => SymbolKey::Machine(id),
+        }
+    }
+}
+
 /// The intern tables for one canonicalization session.
 #[derive(Debug)]
 pub struct CanonArena {
-    pub symbols: Interner<SymId, String>,
+    pub symbols: Interner<SymId, SymbolKey>,
     pub factors: Interner<FactorId, Factor>,
     pub terms: Interner<TermId, Term>,
     pub polys: Interner<PolyId, Poly>,
@@ -225,9 +247,9 @@ impl CanonArena {
         }
     }
 
-    /// The polynomial consisting of a single named symbol.
-    pub fn symbol_poly(&mut self, name: &str) -> PolyId {
-        let sym = self.symbols.intern(name.to_string());
+    /// The polynomial consisting of a single symbol.
+    pub fn symbol_poly(&mut self, sym: SymbolRef<'_>) -> PolyId {
+        let sym = self.symbols.intern(SymbolKey::from(sym));
         let factor = self.factors.intern(Factor::Symbol(sym));
         let term = self.terms.intern(Term {
             factors: vec![(factor, 1)],

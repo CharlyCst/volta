@@ -14,7 +14,7 @@ use std::time::Instant;
 use bincode::Options;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use volta_analysis::driver::{
-    EquivCheckOptions, EquivOutcome, FootprintPolicy, VcDump, VcSnapshot, analyze_kernel,
+    EquivCheckOptions, EquivOutcome, VcDump, VcSnapshot, analyze_kernel,
     check_output_equivalence_with, write_op_counts,
 };
 use volta_analysis::equiv::DEFAULT_RECYCLE_TERMS;
@@ -52,26 +52,6 @@ impl From<LogLevel> for log::LevelFilter {
             LogLevel::Info => log::LevelFilter::Info,
             LogLevel::Debug => log::LevelFilter::Debug,
             LogLevel::Trace => log::LevelFilter::Trace,
-        }
-    }
-}
-
-/// How to pair up two kernels' written footprints (mirrors
-/// `driver::FootprintPolicy`, just with `clap::ValueEnum` attached).
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FootprintArg {
-    /// Same output arrays, same written indices, element for element.
-    Exact,
-    /// Compare only the common written indices per array (e.g. a
-    /// grid-stride reference vs. a tiled kernel).
-    Intersect,
-}
-
-impl From<FootprintArg> for FootprintPolicy {
-    fn from(f: FootprintArg) -> Self {
-        match f {
-            FootprintArg::Exact => FootprintPolicy::Exact,
-            FootprintArg::Intersect => FootprintPolicy::Intersect,
         }
     }
 }
@@ -208,10 +188,6 @@ struct CompareArgs {
     /// Grid dimensions for the optimized kernel only, if it differs
     #[arg(long)]
     grid2: Option<String>,
-
-    /// How to pair up the two kernels' written footprints
-    #[arg(long, value_enum, default_value = "intersect")]
-    footprint: FootprintArg,
 
     /// Check at most this many common elements per array (0 = all)
     #[arg(long, default_value_t = 0)]
@@ -628,16 +604,20 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
         println!("Loaded verification conditions from dump (no fresh symbolic execution).");
     }
 
+    // The arrays to check: the launch config's declared output arrays, as
+    // recorded in the reference run (a dump records the same list).
+    let check_arrays: Vec<String> = reference.outputs.iter().map(|(n, _)| n.clone()).collect();
+
     match args.backend {
         BackendArg::Decision => {
             let options = EquivCheckOptions {
-                footprints: args.footprint.into(),
                 sample: args.sample,
                 verify_numeric: args.verify_numeric,
                 recycle_terms: args.recycle_terms,
             };
             let vc_start = Instant::now();
-            let report = check_output_equivalence_with(&reference, &optimized, &options);
+            let report =
+                check_output_equivalence_with(&reference, &optimized, &check_arrays, &options);
             let vc_secs = vc_start.elapsed().as_secs_f64();
 
             match report {
@@ -691,7 +671,7 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
             let report = volta_z3::check_output_equivalence(
                 &reference,
                 &optimized,
-                args.footprint.into(),
+                &check_arrays,
                 args.sample,
                 timeout,
                 mode,
@@ -755,12 +735,20 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
 /// file fails with a clear message instead of a bincode parse deep in the
 /// stream; bumping the trailing digit rejects old dumps after a
 /// `VcDump`-layout change.
-const DUMP_MAGIC: &[u8; 12] = b"VOLTAVCDUMP1";
+const DUMP_MAGIC: &[u8; 8] = b"VOLTAVCD";
+/// Dump format version, semver-style: bump `DUMP_MINOR` for
+/// backwards-compatible additions (older files stay loadable), bump
+/// `DUMP_MAJOR` and reset minor for breaking changes (e.g. any change to
+/// `ExprNode`'s bincode layout).
+const DUMP_MAJOR: u16 = 1;
+const DUMP_MINOR: u16 = 0;
 
 fn write_dump(dump: &VcDump, path: &Path) -> io::Result<()> {
     let file = std::fs::File::create(path)?;
     let mut writer = io::BufWriter::new(file);
     writer.write_all(DUMP_MAGIC)?;
+    writer.write_all(&DUMP_MAJOR.to_le_bytes())?;
+    writer.write_all(&DUMP_MINOR.to_le_bytes())?;
     // `serialize_into` uses fixint little-endian; `load_dump` must decode
     // with a matching `with_fixint_encoding()` (bincode's `options()`
     // default is varint, which would not round-trip).
@@ -776,8 +764,8 @@ fn load_dump(path: &Path) -> io::Result<VcDump> {
     let file_len = file.metadata()?.len();
     let mut reader = io::BufReader::new(file);
 
-    let mut magic = [0u8; DUMP_MAGIC.len()];
-    reader.read_exact(&mut magic).map_err(|e| {
+    let mut header = [0u8; 12];
+    reader.read_exact(&mut header).map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -787,10 +775,21 @@ fn load_dump(path: &Path) -> io::Result<VcDump> {
             e
         }
     })?;
-    if &magic != DUMP_MAGIC {
+    if &header[..8] != DUMP_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not a volta VC dump (bad magic/version)",
+            "not a volta VC dump (bad magic)",
+        ));
+    }
+    let major = u16::from_le_bytes([header[8], header[9]]);
+    let minor = u16::from_le_bytes([header[10], header[11]]);
+    if major != DUMP_MAJOR || minor > DUMP_MINOR {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported dump version {}.{} (this build reads {}.0 through {}.{})",
+                major, minor, DUMP_MAJOR, DUMP_MAJOR, DUMP_MINOR
+            ),
         ));
     }
 
@@ -967,7 +966,7 @@ mod tests {
     #[test]
     fn dump_round_trips() {
         let mut arena = ExprArena::new();
-        let x = arena.named("x");
+        let x = arena.param_symbol("x");
         let one = arena.int(1);
         let sum = arena.add(x, one);
         let dump = VcDump {
@@ -1033,5 +1032,21 @@ mod tests {
     #[test]
     fn load_dump_rejects_short_file() {
         assert_load_rejects(b"VOLTA", "short", "shorter than the header");
+    }
+
+    /// Semver acceptance: same-major newer-minor files (written by a
+    /// future backwards-compatible writer) and other-major files are both
+    /// refused by this reader with a version message.
+    #[test]
+    fn load_dump_rejects_unsupported_versions() {
+        let mut newer_minor = Vec::from(*DUMP_MAGIC);
+        newer_minor.extend_from_slice(&DUMP_MAJOR.to_le_bytes());
+        newer_minor.extend_from_slice(&(DUMP_MINOR + 1).to_le_bytes());
+        assert_load_rejects(&newer_minor, "newerminor", "unsupported dump version");
+
+        let mut other_major = Vec::from(*DUMP_MAGIC);
+        other_major.extend_from_slice(&(DUMP_MAJOR + 1).to_le_bytes());
+        other_major.extend_from_slice(&0u16.to_le_bytes());
+        assert_load_rejects(&other_major, "othermajor", "unsupported dump version");
     }
 }

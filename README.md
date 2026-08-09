@@ -94,8 +94,14 @@ cargo run --release -- analyze <file.ptx> -k <kernel> -b 32,4 -g 1 \
 `volta compare` checks a reference/optimized pair for equivalence directly
 from the CLI (races/deadlocks are still checked for each kernel individually).
 Arrays/params/globals are shared by both kernels by default; give `--block2`/
-`--grid2` if the optimized kernel's launch config differs (e.g. a tiled
-kernel vs. a grid-stride reference).
+`--grid2` if the optimized kernel's launch config differs (e.g. a
+single-thread reference vs. a 128-thread optimized kernel computing the
+same tile). Comparison follows the paper's CTA-to-CTA model: it runs
+along the declared output arrays (`out`/`inout` kinds), and both CTA-0
+runs must write each of them with identical per-array footprints.
+Arrays not declared as outputs are not compared - which is how
+auxiliary exports like FlashAttention's softmax statistics stay out of
+a comparison against a reference that never computes them.
 
 ```bash
 cargo run --release -- compare <ref.ptx> <opt.ptx> \
@@ -104,9 +110,6 @@ cargo run --release -- compare <ref.ptx> <opt.ptx> \
     --param ptr:in --param ptr:out
 ```
 
-- `--footprint exact|intersect` (default `intersect`): how to pair up the
-  two kernels' written output indices - `intersect` compares only the
-  common indices (e.g. a grid-stride reference vs. a tiled kernel)
 - `--sample N`, `--verify-numeric`, `--recycle-terms N`: same meaning as the
   `volta_bench` flags below
 - `--no-profile`: skip the per-instruction-kind execution profile (shown by default)

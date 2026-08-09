@@ -8,6 +8,12 @@ use std::path::PathBuf;
 
 use volta_analysis::AnalysisError;
 use volta_analysis::driver::{EquivOutcome, analyze_kernel, check_output_equivalence};
+
+/// Check equivalence along the reference run's output arrays.
+fn check_equiv(a: &AnalysisOutput, b: &AnalysisOutput) -> EquivOutcome {
+    let arrays: Vec<String> = a.outputs.iter().map(|(n, _)| n.clone()).collect();
+    check_output_equivalence(a, b, &arrays).unwrap()
+}
 use volta_analysis::eval::{
     AnalysisConfig, AnalysisOutput, ArrayDef, ArrayKind, EvalError, ParamValue,
 };
@@ -512,20 +518,14 @@ fn test_red1_race_free() {
 fn test_red1_self_equivalence() {
     let a = red1();
     let b = red1();
-    assert!(matches!(
-        check_output_equivalence(&a, &b).unwrap(),
-        EquivOutcome::Equivalent
-    ));
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
 }
 
 #[test]
 fn test_red1_red2_equivalent() {
     let a = red1();
     let b = run_reduction("01_reduction/Red-2.ptx", "_Z7reduce2PiS_", 128, 128, 0);
-    assert!(matches!(
-        check_output_equivalence(&a, &b).unwrap(),
-        EquivOutcome::Equivalent
-    ));
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
 }
 
 #[test]
@@ -533,10 +533,7 @@ fn test_red1_red3_equivalent() {
     let a = red1();
     // Red-3 uses extern (dynamic) shared memory: 128 ints.
     let b = run_reduction("01_reduction/Red-3.ptx", "_Z7reduce3PiS_", 128, 128, 512);
-    assert!(matches!(
-        check_output_equivalence(&a, &b).unwrap(),
-        EquivOutcome::Equivalent
-    ));
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
 }
 
 #[test]
@@ -548,10 +545,7 @@ fn test_red1_red4_equivalent() {
     // `in[0..128)`. The input array must span 192 elements to keep the loads
     // in bounds.
     let b = run_reduction("01_reduction/Red-4.ptx", "_Z7reduce0PiS_", 128, 192, 0);
-    assert!(matches!(
-        check_output_equivalence(&a, &b).unwrap(),
-        EquivOutcome::Equivalent
-    ));
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
 }
 
 /// A deliberately wrong reduction (dropping one element) must be caught.
@@ -566,7 +560,7 @@ fn test_red1_wrong_input_not_equivalent() {
     config.params[0] = ParamValue::ArrayPtr("other".to_string());
     let b = analyze_kernel(&module, Some("_Z17reduce1024_1blockPKiPi"), config).unwrap();
     assert!(matches!(
-        check_output_equivalence(&a, &b).unwrap(),
+        check_equiv(&a, &b),
         EquivOutcome::NotEquivalent { .. }
     ));
 }

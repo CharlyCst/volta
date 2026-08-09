@@ -151,7 +151,11 @@ mod tests {
     #[test]
     fn test_commutativity_and_association() {
         let mut ar = ExprArena::new();
-        let (a, b, c) = (ar.named("a"), ar.named("b"), ar.named("c"));
+        let (a, b, c) = (
+            ar.param_symbol("a"),
+            ar.param_symbol("b"),
+            ar.param_symbol("c"),
+        );
         let ab = ar.add(a, b);
         let e1 = ar.add(ab, c);
         let bc = ar.add(b, c);
@@ -164,7 +168,11 @@ mod tests {
     #[test]
     fn test_distribution() {
         let mut ar = ExprArena::new();
-        let (a, b, c) = (ar.named("a"), ar.named("b"), ar.named("c"));
+        let (a, b, c) = (
+            ar.param_symbol("a"),
+            ar.param_symbol("b"),
+            ar.param_symbol("c"),
+        );
         let bc = ar.add(b, c);
         let e1 = ar.mul(a, bc);
         let ab = ar.mul(a, b);
@@ -177,7 +185,7 @@ mod tests {
     fn test_cancellation() {
         // a + b - a == b  (E + (-E) = 0)
         let mut ar = ExprArena::new();
-        let (a, b) = (ar.named("a"), ar.named("b"));
+        let (a, b) = (ar.param_symbol("a"), ar.param_symbol("b"));
         let ab = ar.add(a, b);
         let e1 = ar.sub(ab, a);
         assert!(check(&ar, e1, b));
@@ -186,7 +194,7 @@ mod tests {
     #[test]
     fn test_not_equivalent() {
         let mut ar = ExprArena::new();
-        let (a, b) = (ar.named("a"), ar.named("b"));
+        let (a, b) = (ar.param_symbol("a"), ar.param_symbol("b"));
         assert!(!check(&ar, a, b));
         let two_a = ar.add(a, a);
         assert!(!check(&ar, two_a, a));
@@ -196,7 +204,7 @@ mod tests {
     fn test_exp_fusion() {
         // e^a * e^b == e^{a+b}; and e^a * e^{-a} == 1
         let mut ar = ExprArena::new();
-        let (a, b) = (ar.named("a"), ar.named("b"));
+        let (a, b) = (ar.param_symbol("a"), ar.param_symbol("b"));
         let ea = ar.exp(a);
         let eb = ar.exp(b);
         let e1 = ar.mul(ea, eb);
@@ -215,7 +223,7 @@ mod tests {
     fn test_exact_float_coefficients() {
         // 0.125 * (a + a) == 0.25 * a, exactly.
         let mut ar = ExprArena::new();
-        let a = ar.named("a");
+        let a = ar.param_symbol("a");
         let aa = ar.add(a, a);
         let eighth = ar.float(0.125);
         let e1 = ar.mul(eighth, aa);
@@ -228,7 +236,11 @@ mod tests {
     fn test_max_rules() {
         // max(max(a,b),c) == max(a,max(b,c)); max(x,x) == x
         let mut ar = ExprArena::new();
-        let (a, b, c) = (ar.named("a"), ar.named("b"), ar.named("c"));
+        let (a, b, c) = (
+            ar.param_symbol("a"),
+            ar.param_symbol("b"),
+            ar.param_symbol("c"),
+        );
         let mab = ar.max(a, b);
         let e1 = ar.max(mab, c);
         let mbc = ar.max(b, c);
@@ -243,7 +255,7 @@ mod tests {
     fn test_fraction_normalization() {
         // a / e^m == a * e^{-m} (monomial denominators fold away)
         let mut ar = ExprArena::new();
-        let (a, m) = (ar.named("a"), ar.named("m"));
+        let (a, m) = (ar.param_symbol("a"), ar.param_symbol("m"));
         let em = ar.exp(m);
         let e1 = ar.div(a, em);
         let nm = ar.neg(m);
@@ -257,7 +269,7 @@ mod tests {
         // exp(a)/(exp(a)+exp(b)) == exp(a-M)/(exp(a-M)+exp(b-M)), M=max(a,b)
         // The monomial-quotient path: denominators differ by e^{-M}.
         let mut ar = ExprArena::new();
-        let (a, b) = (ar.named("a"), ar.named("b"));
+        let (a, b) = (ar.param_symbol("a"), ar.param_symbol("b"));
         let m = ar.max(a, b);
 
         let ea = ar.exp(a);
@@ -285,7 +297,9 @@ mod tests {
         // online (FlashAttention) formulation with running max and rescaled
         // denominator.
         let mut ar = ExprArena::new();
-        let xs: Vec<ExprId> = (0..4).map(|i| ar.named(format!("x[{}]", i))).collect();
+        let xs: Vec<ExprId> = (0..4)
+            .map(|i| ar.param_symbol(format!("x[{}]", i)))
+            .collect();
 
         // Naive: y_i = e^{x_i} / Σ e^{x_j}
         let exps: Vec<ExprId> = xs.iter().map(|&x| ar.exp(x)).collect();
@@ -327,7 +341,12 @@ mod tests {
     #[test]
     fn test_budget_error() {
         let mut ar = ExprArena::new();
-        let (a, b, c, d) = (ar.named("a"), ar.named("b"), ar.named("c"), ar.named("d"));
+        let (a, b, c, d) = (
+            ar.param_symbol("a"),
+            ar.param_symbol("b"),
+            ar.param_symbol("c"),
+            ar.param_symbol("d"),
+        );
         let ab = ar.add(a, b);
         let cd = ar.add(c, d);
         let p = ar.mul(ab, cd);
@@ -341,7 +360,7 @@ mod tests {
     #[test]
     fn test_undefined_error() {
         let mut ar = ExprArena::new();
-        let a = ar.named("a");
+        let a = ar.param_symbol("a");
         let u = ar.undefined();
         assert!(matches!(
             Session::new().check_equivalent(&ar, a, &ar, u),
@@ -362,8 +381,8 @@ mod chain_perf_tests {
         let k = 1000u32;
         let mut acc = ar.float(0.0);
         for i in 0..k {
-            let a = ar.named(format!("A[{}]", i));
-            let b = ar.named(format!("B[{}]", i));
+            let a = ar.param_symbol(format!("A[{}]", i));
+            let b = ar.param_symbol(format!("B[{}]", i));
             acc = ar.fma(a, b, acc);
         }
         let mut session = Session::new();

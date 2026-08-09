@@ -20,7 +20,7 @@ use crate::logging::{info, trace, warn};
 use crate::lowered::{
     BinOp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, Operand, UnaryOp,
 };
-use crate::symbolic::{ExprArena, ExprId};
+use crate::symbolic::{ExprArena, ExprId, StringId};
 use crate::symbols::{ParamId, RegId, SpecialRegKind};
 use crate::types::ScalarTypeExt;
 
@@ -131,6 +131,10 @@ impl<'p> Interpreter<'p> {
             });
         }
 
+        config
+            .validate()
+            .map_err(|message| EvalError::Config { message })?;
+
         let mut arena = ExprArena::new();
         let undefined = arena.undefined();
 
@@ -150,7 +154,7 @@ impl<'p> Interpreter<'p> {
             let v = match value {
                 ParamValue::Int(v) => Value::Scalar(arena.int(*v)),
                 ParamValue::Float(v) => Value::Scalar(arena.float(*v)),
-                ParamValue::SymFloat(name) => Value::Scalar(arena.named(name.clone())),
+                ParamValue::SymFloat(name) => Value::Scalar(arena.param_symbol(name.clone())),
                 ParamValue::ArrayPtr(name) => {
                     let array = config.array(name).ok_or_else(|| EvalError::Config {
                         message: format!("parameter references unknown array '{}'", name),
@@ -1096,13 +1100,15 @@ impl<'p> Interpreter<'p> {
         }
     }
 
-    /// Create the named symbols for every input-array element overlapping
-    /// `[addr, addr + width)` that is not yet present in global memory.
-    /// Returns whether any element was materialized.
+    /// Create the input-element symbols for every input-array element
+    /// overlapping `[addr, addr + width)` that is not yet present in
+    /// global memory. Returns whether any element was materialized.
     fn materialize_input(&mut self, addr: u64, width: u64) -> bool {
         // Collect missing elements first (the array list borrows the config).
-        // (addr, width, index, symbol name or None for identity indices)
-        let mut missing: Vec<(u64, u64, u64, Option<String>)> = Vec::new();
+        // (addr, width, index, interned array name or None for identity
+        // indices); the array's name is interned once and shared by all of
+        // its elements.
+        let mut missing: Vec<(u64, u64, u64, Option<StringId>)> = Vec::new();
         for array in &self.config.arrays {
             if !array.kind.is_input() {
                 continue;
@@ -1113,12 +1119,15 @@ impl<'p> Interpreter<'p> {
             }
             let first = (addr.max(array.base) - array.base) / array.elem_width;
             let last = ((addr + width - 1).min(end - 1) - array.base) / array.elem_width;
+            let mut array_sid: Option<StringId> = None;
             for i in first..=last {
                 let elem_addr = array.base + i * array.elem_width;
                 if !self.global.has_cell_at(elem_addr) {
                     let value = match array.kind {
                         crate::eval::config::ArrayKind::IndexInput => None,
-                        _ => Some(format!("{}[{}]", array.name, i)),
+                        _ => Some(
+                            *array_sid.get_or_insert_with(|| self.arena.intern_string(&array.name)),
+                        ),
                     };
                     missing.push((elem_addr, array.elem_width, i, value));
                 }
@@ -1126,9 +1135,9 @@ impl<'p> Interpreter<'p> {
         }
 
         let mut any = false;
-        for (elem_addr, elem_width, index, name) in missing {
-            let value = match name {
-                Some(name) => self.arena.named(name),
+        for (elem_addr, elem_width, index, array_sid) in missing {
+            let value = match array_sid {
+                Some(sid) => self.arena.input_element(sid, index),
                 // Identity index array: element i holds the value i.
                 None => self.arena.int(index as i64),
             };

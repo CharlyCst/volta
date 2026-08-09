@@ -17,9 +17,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use volta_analysis::driver::{
-    EquivCheckOptions, EquivOutcome, FootprintPolicy, check_output_equivalence_with,
-};
+use volta_analysis::driver::{EquivCheckOptions, EquivOutcome, check_output_equivalence_with};
 use volta_analysis::eval::AnalysisOutput;
 use volta_analysis::symbolic::ExprNode;
 use volta_z3::ExpMode;
@@ -122,31 +120,28 @@ pub fn compare_one(
         Err(e) => return empty_row(def, format!("optimized kernel: {:#}", e)),
     };
     let exec_secs = exec0.elapsed().as_secs_f64();
+    // Both backends check along the reference config's declared outputs.
+    let arrays = def.reference.config.output_array_names();
 
     let options = EquivCheckOptions {
-        footprints: FootprintPolicy::Intersect,
         sample,
         verify_numeric,
         recycle_terms,
     };
     let d0 = Instant::now();
-    let decision_status = match check_output_equivalence_with(&reference, &optimized, &options) {
-        Ok(report) => match report.outcome {
-            EquivOutcome::Equivalent => "EQUIV".to_string(),
-            EquivOutcome::NotEquivalent { mismatches } => format!("DIFF({})", mismatches.len()),
-        },
-        Err(e) => return empty_row(def, format!("decision procedure: {}", e)),
-    };
+    let decision_status =
+        match check_output_equivalence_with(&reference, &optimized, &arrays, &options) {
+            Ok(report) => match report.outcome {
+                EquivOutcome::Equivalent => "EQUIV".to_string(),
+                EquivOutcome::NotEquivalent { mismatches } => format!("DIFF({})", mismatches.len()),
+            },
+            Err(e) => return empty_row(def, format!("decision procedure: {}", e)),
+        };
     let decision_secs = d0.elapsed().as_secs_f64();
 
     let run_z3 = |mode: ExpMode| -> Result<(f64, volta_z3::Z3Counts), String> {
         volta_z3::check_output_equivalence(
-            &reference,
-            &optimized,
-            FootprintPolicy::Intersect,
-            sample,
-            z3_timeout,
-            mode,
+            &reference, &optimized, &arrays, sample, z3_timeout, mode,
         )
         .map(|report| (report.total_solve_secs(), report.counts()))
         .map_err(|e| format!("z3: {}", e))

@@ -99,4 +99,129 @@ impl AnalysisConfig {
     pub fn array(&self, name: &str) -> Option<&ArrayDef> {
         self.arrays.iter().find(|a| a.name == name)
     }
+
+    /// Names of the declared output arrays, in declaration order - the
+    /// natural "arrays to check" list for an equivalence comparison over
+    /// this config.
+    pub fn output_array_names(&self) -> Vec<String> {
+        self.arrays
+            .iter()
+            .filter(|a| a.kind.is_output())
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// Reject configs whose identities are ambiguous: array names and
+    /// `sym:` parameter names define which values correlate (see
+    /// `symbolic::SymbolRef`), so duplicate names or overlapping ranges
+    /// would silently conflate distinct values.
+    pub fn validate(&self) -> Result<(), String> {
+        for (i, a) in self.arrays.iter().enumerate() {
+            if a.elem_width == 0 || a.len == 0 {
+                return Err(format!(
+                    "array '{}' has zero element width or length",
+                    a.name
+                ));
+            }
+            for b in &self.arrays[i + 1..] {
+                if a.name == b.name {
+                    return Err(format!(
+                        "two arrays share the name '{}'; array names are identities \
+                         and must be unique",
+                        a.name
+                    ));
+                }
+                let (a_end, b_end) = (a.base + a.size_bytes(), b.base + b.size_bytes());
+                if a.base < b_end && b.base < a_end {
+                    return Err(format!(
+                        "arrays '{}' and '{}' overlap in memory \
+                         ([{:#x}, {:#x}) vs [{:#x}, {:#x}))",
+                        a.name, b.name, a.base, a_end, b.base, b_end
+                    ));
+                }
+            }
+        }
+        let mut sym_names = std::collections::BTreeSet::new();
+        for value in &self.params {
+            if let ParamValue::SymFloat(name) = value {
+                if name.is_empty() {
+                    return Err("sym: parameter name is empty".to_string());
+                }
+                if name.contains('[') || name.contains(']') {
+                    return Err(format!(
+                        "sym: parameter name '{}' contains brackets; bracketed names \
+                         are reserved for array elements",
+                        name
+                    ));
+                }
+                if !sym_names.insert(name) {
+                    return Err(format!(
+                        "two sym: parameters share the name '{}'; parameter names are \
+                         identities and must be unique (a duplicate would silently \
+                         constrain the check to inputs where both parameters are equal)",
+                        name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn array(name: &str, base: u64, len: u64) -> ArrayDef {
+        ArrayDef {
+            name: name.to_string(),
+            base,
+            elem_width: 4,
+            len,
+            kind: ArrayKind::Input,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_disjoint_arrays_and_plain_sym_names() {
+        let mut config = AnalysisConfig::new((1, 1, 1));
+        config.arrays.push(array("in", 0x1000, 16));
+        config.arrays.push(array("out", 0x2000, 16));
+        config
+            .params
+            .push(ParamValue::SymFloat("alpha".to_string()));
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    /// Identity ambiguities are rejected, not silently conflated: two
+    /// arrays sharing a name would make unrelated storage produce the
+    /// same `InputElement` symbols, and overlapping ranges would give one
+    /// address two identities.
+    #[test]
+    fn validate_rejects_ambiguous_identities() {
+        let mut dup = AnalysisConfig::new((1, 1, 1));
+        dup.arrays.push(array("x", 0x1000, 16));
+        dup.arrays.push(array("x", 0x2000, 16));
+        assert!(dup.validate().is_err());
+
+        let mut overlap = AnalysisConfig::new((1, 1, 1));
+        overlap.arrays.push(array("a", 0x1000, 16));
+        overlap.arrays.push(array("b", 0x1020, 16));
+        assert!(overlap.validate().is_err());
+
+        let mut bracketed = AnalysisConfig::new((1, 1, 1));
+        bracketed
+            .params
+            .push(ParamValue::SymFloat("x[0]".to_string()));
+        assert!(bracketed.validate().is_err());
+
+        let mut dup_sym = AnalysisConfig::new((1, 1, 1));
+        dup_sym
+            .params
+            .push(ParamValue::SymFloat("alpha".to_string()));
+        dup_sym
+            .params
+            .push(ParamValue::SymFloat("alpha".to_string()));
+        assert!(dup_sym.validate().is_err());
+    }
 }

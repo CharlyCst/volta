@@ -1,8 +1,9 @@
 //! Translates the arithmetic + Exp + Max/Min fragment of `ExprArena` into
 //! SMT-LIB2 text for Z3, mirroring `volta_analysis::canon`'s atom boundary
-//! and symbol-naming convention so the two backends are compared on equal
-//! footing (cross-arena symbol correlation: `NamedSymbol` by its string,
-//! `Symbol` by its `Display` name - the same names canon interns).
+//! and symbol-identity convention so the two backends are compared on
+//! equal footing: the rendered names are a faithful injection of the
+//! typed `SymbolRef` namespaces (params, input elements, machine
+//! symbols) that canon and the numeric oracle key by.
 //!
 //! Ops outside this fragment (`Select`, comparisons, bitwise ops, `Rem`,
 //! `Log`, `Sqrt`, `Abs`, `SymbolicRead`, ...) are refused outright
@@ -83,16 +84,16 @@
 //!
 //! # Namespaces
 //!
-//! Generated names (`|tN|` let binders, `max_N`/`min_N` atoms, `e`, `sN`
-//! machine symbols) and user-controlled names must never collide - `|t0|`
-//! and `t0` are the *same* SMT symbol, so an unprefixed user symbol named
-//! `t0` would be captured by a let binding and corrupt the query. All
-//! user symbols are therefore quoted into a reserved `u!` namespace
-//! (`|u!name|`), which no generated name inhabits. Note one deliberate
-//! divergence from `canon`: canon conflates `NamedSymbol("s5")` with
-//! `Symbol(5)` (both intern as `s5`); here the named symbol is `|u!s5|`,
-//! distinct from `s5` - the conflation would be unsound and only bites
-//! kernels whose params are adversarially named `sN`.
+//! Generated names (`|tN|` let binders, `max_N`/`min_N` atoms, `e`,
+//! `uexp`, `sN` machine symbols) and user-controlled names must never
+//! collide - `|t0|` and `t0` are the *same* SMT symbol, so an unprefixed
+//! user symbol named `t0` would be captured by a let binding and corrupt
+//! the query. The rendered names are therefore an injection of the typed
+//! `SymbolRef` namespaces: `sym:` parameters render as `|p!name|`, input
+//! elements as `|e!array[index]|`, machine symbols as `sN` - three
+//! spaces disjoint from each other and from every generated name, so a
+//! parameter literally named "s5" or "x[0]" never aliases machine
+//! `Symbol(5)` or element `x[0]` in any backend.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -484,12 +485,24 @@ impl Builder {
     }
 }
 
-/// Quote a user-controlled symbol name into the reserved `u!` namespace.
-/// The prefix keeps user names disjoint from every generated name (`tN`
-/// binders, `max_N`/`min_N` atoms, `e`, `sN`); the escaping keeps the
+fn escape(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+/// Quote a launch-config `sym:` parameter into the reserved `p!`
+/// namespace. The prefix keeps user-controlled names disjoint from every
+/// generated name (`tN` binders, `max_N`/`min_N` atoms, `e`, `uexp`,
+/// `sN`) and from the `e!` element namespace; the escaping keeps the
 /// mapping injective (z3 accepts `\|`/`\\` inside quoted symbols).
-fn quote_user(name: &str) -> String {
-    format!("|u!{}|", name.replace('\\', "\\\\").replace('|', "\\|"))
+fn quote_param(name: &str) -> String {
+    format!("|p!{}|", escape(name))
+}
+
+/// Quote a launch-config input-array element into the reserved `e!`
+/// namespace. The fixed `[index]` suffix after the escaped array name
+/// keeps the mapping injective per array.
+fn quote_element(array: &str, index: u64) -> String {
+    format!("|e!{}[{}]|", escape(array), index)
 }
 
 /// Exact decimal rendering of `m * 2^k` (little-endian digit doubling; k
@@ -772,7 +785,10 @@ fn translate_uncached(
         }
         ExprNode::BoolConst(v) => Ok(bld.atom(if *v { "1.0" } else { "0.0" }.to_string(), false)),
 
-        ExprNode::NamedSymbol(sid) => Ok(bld.atom(quote_user(arena.string(*sid)), true)),
+        ExprNode::ParamSymbol(sid) => Ok(bld.atom(quote_param(arena.string(*sid)), true)),
+        ExprNode::InputElement { array, index } => {
+            Ok(bld.atom(quote_element(arena.string(*array), *index), true))
+        }
         ExprNode::Symbol(sym) => Ok(bld.atom(sym.to_string(), true)),
 
         ExprNode::Add(..) | ExprNode::Sub(..) | ExprNode::Neg(..) | ExprNode::Fma(..) => {

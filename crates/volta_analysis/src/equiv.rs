@@ -36,23 +36,21 @@ impl std::error::Error for EquivError {}
 
 pub type EquivResult<T> = Result<T, EquivError>;
 
-/// A reusable equivalence-checking session for one kernel pair.
+/// A reusable equivalence-checking session for one kernel pair, fixed at
+/// construction: session memos key on `(Side, ExprId)`, and an `ExprId`
+/// is only meaningful within its own arena, so `check` takes element ids
+/// only and cannot be handed a different pair.
 ///
 /// Sessions self-limit their memory: when the intern tables grow past a
 /// bound (chain-heavy VCs intern millions of intermediate terms per
 /// element), the tables are dropped and rebuilt lazily from the still-live
 /// `ExprArena`s. This trades some re-canonicalization of shared structure
 /// for a hard cap on resident memory.
-pub struct EquivSession {
+pub struct EquivSession<'a> {
     session: Session,
     recycle_terms: usize,
-    /// The arena pair this session's memo entries refer to (by address).
-    /// Session memos key on `(Side, ExprId)`, and an `ExprId` is only
-    /// meaningful within its own arena - reusing one session across
-    /// different arena pairs would silently resolve ids against the wrong
-    /// arena's memo entries and can return wrong verdicts. Debug-asserted
-    /// in `check`.
-    arenas: Option<(*const ExprArena, *const ExprArena)>,
+    arena1: &'a ExprArena,
+    arena2: &'a ExprArena,
 }
 
 /// Default recycle bound. Bytes per term are workload-dependent: polynomial
@@ -60,45 +58,31 @@ pub struct EquivSession {
 /// 2-4 KB, so 4M terms retains roughly 1-16 GiB.
 pub const DEFAULT_RECYCLE_TERMS: usize = 4_000_000;
 
-impl EquivSession {
-    pub fn new() -> Self {
-        Self::with_recycle_terms(DEFAULT_RECYCLE_TERMS)
+impl<'a> EquivSession<'a> {
+    pub fn new(arena1: &'a ExprArena, arena2: &'a ExprArena) -> Self {
+        Self::with_recycle_terms(arena1, arena2, DEFAULT_RECYCLE_TERMS)
     }
 
     /// A session that recycles its intern tables once they exceed
     /// `recycle_terms` interned terms (`0` = never recycle). Lower values
     /// bound resident memory; each recycle re-canonicalizes structure that
     /// later elements would otherwise share.
-    pub fn with_recycle_terms(recycle_terms: usize) -> Self {
+    pub fn with_recycle_terms(
+        arena1: &'a ExprArena,
+        arena2: &'a ExprArena,
+        recycle_terms: usize,
+    ) -> Self {
         Self {
             session: Session::new(),
             recycle_terms,
-            arenas: None,
+            arena1,
+            arena2,
         }
     }
 
-    /// Check whether two expressions are equivalent over the reals.
-    ///
-    /// One session serves ONE arena pair: all calls must pass the same
-    /// `arena1`/`arena2` the session first saw (any elements of that
-    /// pair). Use a fresh session per kernel pair.
-    pub fn check(
-        &mut self,
-        arena1: &ExprArena,
-        e1: ExprId,
-        arena2: &ExprArena,
-        e2: ExprId,
-    ) -> EquivResult<bool> {
-        let pair = (arena1 as *const ExprArena, arena2 as *const ExprArena);
-        match self.arenas {
-            None => self.arenas = Some(pair),
-            Some(seen) => debug_assert!(
-                seen == pair,
-                "EquivSession reused across different arena pairs: session \
-                 memos key on ExprIds, which are only meaningful within one \
-                 arena"
-            ),
-        }
+    /// Check whether `e1` (in the first arena) and `e2` (in the second)
+    /// are equivalent over the reals.
+    pub fn check(&mut self, e1: ExprId, e2: ExprId) -> EquivResult<bool> {
         if self.recycle_terms != 0 && self.session.interned_terms() > self.recycle_terms {
             info!(
                 "recycling VC session at {} interned terms",
@@ -106,13 +90,9 @@ impl EquivSession {
             );
             self.session = Session::new();
         }
-        Ok(self.session.check_equivalent(arena1, e1, arena2, e2)?)
-    }
-}
-
-impl Default for EquivSession {
-    fn default() -> Self {
-        Self::new()
+        Ok(self
+            .session
+            .check_equivalent(self.arena1, e1, self.arena2, e2)?)
     }
 }
 
@@ -124,7 +104,7 @@ pub fn check_equivalent(
     arena2: &ExprArena,
     e2: ExprId,
 ) -> EquivResult<bool> {
-    EquivSession::new().check(arena1, e1, arena2, e2)
+    EquivSession::new(arena1, arena2).check(e1, e2)
 }
 
 #[cfg(test)]
@@ -135,8 +115,8 @@ mod tests {
     fn test_simple_equivalence() {
         // (a + b) == (b + a)
         let mut arena = ExprArena::new();
-        let a = arena.named("a");
-        let b = arena.named("b");
+        let a = arena.param_symbol("a");
+        let b = arena.param_symbol("b");
         let e1 = arena.add(a, b);
         let e2 = arena.add(b, a);
         assert!(check_equivalent(&arena, e1, &arena, e2).unwrap());
@@ -146,9 +126,9 @@ mod tests {
     fn test_distributivity() {
         // a * (b + c) == a*b + a*c
         let mut arena = ExprArena::new();
-        let a = arena.named("a");
-        let b = arena.named("b");
-        let c = arena.named("c");
+        let a = arena.param_symbol("a");
+        let b = arena.param_symbol("b");
+        let c = arena.param_symbol("c");
         let bc = arena.add(b, c);
         let e1 = arena.mul(a, bc);
         let ab = arena.mul(a, b);
@@ -160,18 +140,18 @@ mod tests {
     #[test]
     fn test_not_equivalent() {
         let mut arena = ExprArena::new();
-        let a = arena.named("a");
-        let b = arena.named("b");
+        let a = arena.param_symbol("a");
+        let b = arena.param_symbol("b");
         assert!(!check_equivalent(&arena, a, &arena, b).unwrap());
     }
 
     #[test]
     fn test_reduction_pattern() {
         let mut arena = ExprArena::new();
-        let i0 = arena.named("input_0");
-        let i1 = arena.named("input_1");
-        let i2 = arena.named("input_2");
-        let i3 = arena.named("input_3");
+        let i0 = arena.param_symbol("input_0");
+        let i1 = arena.param_symbol("input_1");
+        let i2 = arena.param_symbol("input_2");
+        let i3 = arena.param_symbol("input_3");
 
         let t1 = arena.add(i3, i2);
         let t2 = arena.add(i1, i0);
@@ -187,8 +167,8 @@ mod tests {
     fn test_exp_identity() {
         // exp(a) * exp(b) == exp(a + b)
         let mut arena = ExprArena::new();
-        let a = arena.named("a");
-        let b = arena.named("b");
+        let a = arena.param_symbol("a");
+        let b = arena.param_symbol("b");
         let ea = arena.exp(a);
         let eb = arena.exp(b);
         let e1 = arena.mul(ea, eb);
@@ -201,9 +181,9 @@ mod tests {
     fn test_fma_expansion() {
         // fma(a, b, c) == a*b + c
         let mut arena = ExprArena::new();
-        let a = arena.named("a");
-        let b = arena.named("b");
-        let c = arena.named("c");
+        let a = arena.param_symbol("a");
+        let b = arena.param_symbol("b");
+        let c = arena.param_symbol("c");
         let e1 = arena.fma(a, b, c);
         let ab = arena.mul(a, b);
         let e2 = arena.add(ab, c);
@@ -214,8 +194,8 @@ mod tests {
     fn test_softmax_normalization_equivalence() {
         // exp(a)/(exp(a)+exp(b)) == exp(a-M)/(exp(a-M)+exp(b-M)), M = max(a,b)
         let mut arena = ExprArena::new();
-        let a = arena.named("a");
-        let b = arena.named("b");
+        let a = arena.param_symbol("a");
+        let b = arena.param_symbol("b");
         let m = arena.max(a, b);
 
         let ea = arena.exp(a);
@@ -237,21 +217,52 @@ mod tests {
     fn test_session_reuse_across_elements() {
         // The same session checks several related identities.
         let mut arena = ExprArena::new();
-        let mut session = EquivSession::new();
-        for i in 0..4 {
-            let a = arena.named(format!("a[{}]", i));
-            let b = arena.named(format!("b[{}]", i));
-            let ab = arena.add(a, b);
-            let ba = arena.add(b, a);
-            assert!(session.check(&arena, ab, &arena, ba).unwrap());
+        let sid = arena.intern_string("a");
+        let tid = arena.intern_string("b");
+        let elements: Vec<(ExprId, ExprId)> = (0..4)
+            .map(|i| {
+                let a = arena.input_element(sid, i);
+                let b = arena.input_element(tid, i);
+                (arena.add(a, b), arena.add(b, a))
+            })
+            .collect();
+        let mut session = EquivSession::new(&arena, &arena);
+        for (ab, ba) in elements {
+            assert!(session.check(ab, ba).unwrap());
         }
     }
 
     #[test]
     fn test_undefined_error() {
         let mut arena = ExprArena::new();
-        let a = arena.named("a");
+        let a = arena.param_symbol("a");
         let u = arena.undefined();
         assert!(check_equivalent(&arena, a, &arena, u).is_err());
+    }
+
+    /// Regression: a named symbol whose string spells a machine symbol's
+    /// rendered name (`"s{N}"`) used to intern to the same canon variable
+    /// as machine `Symbol(N)` - proving two independent values
+    /// "equivalent". The typed `SymbolRef` namespaces keep them apart.
+    #[test]
+    fn named_symbol_does_not_alias_machine_symbol() {
+        use crate::symbolic::ExprNode;
+
+        let mut arena = ExprArena::new();
+        let machine = arena.symbol();
+        let ExprNode::Symbol(sym) = *arena.node(machine) else {
+            panic!("arena.symbol() must produce ExprNode::Symbol");
+        };
+        let named = arena.param_symbol(sym.to_string());
+        assert!(
+            !check_equivalent(&arena, machine, &arena, named).unwrap(),
+            "machine Symbol({}) and NamedSymbol(\"{}\") are independent values",
+            sym.0,
+            sym
+        );
+        // And a named symbol still correlates with itself across arenas.
+        let mut other = ExprArena::new();
+        let named_other = other.param_symbol(sym.to_string());
+        assert!(check_equivalent(&arena, named, &other, named_other).unwrap());
     }
 }

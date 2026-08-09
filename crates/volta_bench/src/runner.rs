@@ -6,8 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use volta_analysis::driver::{
-    AnalysisError, EquivCheckOptions, EquivOutcome, FootprintPolicy, analyze_kernel,
-    check_output_equivalence_with,
+    AnalysisError, EquivCheckOptions, EquivOutcome, analyze_kernel, check_output_equivalence_with,
 };
 use volta_analysis::eval::{AnalysisOutput, EvalError, Stats};
 use volta_frontend::ascii::AsAscii;
@@ -206,9 +205,11 @@ impl BenchmarkRunner {
         stats.optimized_op_counts = optimized.op_counts.clone();
         stats.exec_secs = exec0.elapsed().as_secs_f64();
 
-        // Check the verification conditions.
+        // Check the verification conditions along the reference config's
+        // declared output arrays.
+        let arrays = def.reference.config.output_array_names();
         let vc0 = Instant::now();
-        let outcome = self.check_equivalence(&reference, &optimized, &mut stats)?;
+        let outcome = self.check_equivalence(&reference, &optimized, &arrays, &mut stats)?;
         stats.vc_secs = vc0.elapsed().as_secs_f64();
         Ok((outcome, stats))
     }
@@ -229,23 +230,21 @@ impl BenchmarkRunner {
         }
     }
 
-    /// Compare the two output footprints on their intersection (a
-    /// grid-stride reference and a tiled kernel cover different slices of
-    /// the output; arrays present only in the optimized run are ignored).
-    /// The actual element loop lives in `volta_analysis::driver`.
+    /// Compare the two outputs element for element along the named
+    /// arrays. The actual element loop lives in `volta_analysis::driver`.
     fn check_equivalence(
         &self,
         reference: &AnalysisOutput,
         optimized: &AnalysisOutput,
+        arrays: &[String],
         stats: &mut BenchmarkStats,
     ) -> Result<ActualOutcome> {
         let options = EquivCheckOptions {
-            footprints: FootprintPolicy::Intersect,
             sample: self.config.sample,
             verify_numeric: self.config.verify_numeric,
             recycle_terms: self.config.recycle_terms,
         };
-        let report = check_output_equivalence_with(reference, optimized, &options)
+        let report = check_output_equivalence_with(reference, optimized, arrays, &options)
             .context("checking output equivalence")?;
         stats.elements_checked = report.elements_checked;
         stats.elements_total = report.elements_total;

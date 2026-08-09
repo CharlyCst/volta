@@ -11,7 +11,7 @@
 //! owned vectors and are freed by scope - without this, a K-step
 //! accumulator chain would permanently retain O(K^2) interned prefixes.
 
-use crate::symbolic::{ExprArena, ExprId, ExprNode, for_each_child};
+use crate::symbolic::{ExprArena, ExprId, ExprNode};
 
 use super::arena::{Atom, PolyId, Rat, Term, UninterpOp};
 use super::coeff::Coeff;
@@ -47,7 +47,7 @@ impl Session {
         }
         let mut fresh = vec![0u32; n];
         for i in 0..n {
-            for_each_child(arena.node(ExprId(i as u32)), |child| {
+            arena.node(ExprId(i as u32)).for_each_child(|child| {
                 fresh[child.0 as usize] = fresh[child.0 as usize].saturating_add(1);
             });
         }
@@ -105,14 +105,11 @@ impl Session {
                 let p = self.arena.const_poly(Coeff::from_int(*b as i64));
                 Ok(RatV::from_rat(self.arena.rat_poly(p)))
             }
-            ExprNode::NamedSymbol(sid) => {
-                let p = self.arena.symbol_poly(arena.string(*sid));
-                Ok(RatV::from_rat(self.arena.rat_poly(p)))
-            }
-            ExprNode::Symbol(sym) => {
-                // `SymbolId`'s `Display` is the one source of the machine
-                // name; `volta_z3` correlates the same symbols by it.
-                let p = self.arena.symbol_poly(&sym.to_string());
+            ExprNode::ParamSymbol(_) | ExprNode::InputElement { .. } | ExprNode::Symbol(_) => {
+                let sym = node
+                    .symbol_ref(arena)
+                    .expect("symbolic atom must have a symbol_ref");
+                let p = self.arena.symbol_poly(sym);
                 Ok(RatV::from_rat(self.arena.rat_poly(p)))
             }
 

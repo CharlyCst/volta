@@ -265,9 +265,9 @@ impl Z3EquivReport {
     }
 }
 
-/// Check every paired output element (per `footprints`, exactly like
-/// `volta_analysis::driver::check_output_equivalence_with`) with Z3 instead
-/// of the decision procedure. Unlike the decision procedure, this never
+/// Check every paired output element (exactly like
+/// `volta_analysis::driver::check_output_equivalence_with`, against the
+/// reference's footprint) with Z3 instead of the decision procedure. Unlike the decision procedure, this never
 /// aborts partway through a run over a single element's failure - each
 /// element's outcome (including "unsupported" or a solver error) is
 /// recorded independently, since the whole point is comparing coverage as
@@ -276,12 +276,12 @@ impl Z3EquivReport {
 pub fn check_output_equivalence(
     reference: &volta_analysis::eval::AnalysisOutput,
     optimized: &volta_analysis::eval::AnalysisOutput,
-    footprints: volta_analysis::driver::FootprintPolicy,
+    arrays: &[String],
     sample: u64,
     timeout: Option<Duration>,
     mode: ExpMode,
 ) -> Result<Z3EquivReport, EquivCheckError> {
-    let paired = volta_analysis::driver::paired_elements(reference, optimized, footprints)?;
+    let paired = volta_analysis::driver::paired_elements(reference, optimized, arrays)?;
     let mut elements = Vec::new();
     for (name, common) in paired {
         let limit = match sample {
@@ -339,7 +339,7 @@ mod tests {
         // x + 1 vs 1 + x: same arena, different tree shape. Sorted n-ary
         // interning collapses both to one term - no solver run needed.
         let mut ar = ExprArena::new();
-        let x = ar.named("x");
+        let x = ar.param_symbol("x");
         let one = ar.int(1);
         let lhs = ar.add(x, one);
         let rhs = ar.add(one, x);
@@ -351,12 +351,12 @@ mod tests {
         // Two independent arenas, each with its own "x" - correlated by
         // name, exactly like `canon`'s own convention.
         let mut ar_a = ExprArena::new();
-        let x_a = ar_a.named("x");
+        let x_a = ar_a.param_symbol("x");
         let two_a = ar_a.int(2);
         let lhs = ar_a.mul(x_a, two_a);
 
         let mut ar_b = ExprArena::new();
-        let x_b = ar_b.named("x");
+        let x_b = ar_b.param_symbol("x");
         let rhs = ar_b.add(x_b, x_b);
 
         assert_eq!(check(&ar_a, lhs, &ar_b, rhs), Z3Verdict::Equivalent);
@@ -365,8 +365,8 @@ mod tests {
     #[test]
     fn distinct_symbols_are_not_equivalent() {
         let mut ar = ExprArena::new();
-        let x = ar.named("x");
-        let y = ar.named("y");
+        let x = ar.param_symbol("x");
+        let y = ar.param_symbol("y");
         assert_eq!(check(&ar, x, &ar, y), Z3Verdict::NotEquivalent);
     }
 
@@ -376,8 +376,8 @@ mod tests {
         // (native `^`, no axiom) has no decision procedure for symbolic
         // real exponents - the paper's no-intervention baseline.
         let mut ar = ExprArena::new();
-        let a = ar.named("a");
-        let b = ar.named("b");
+        let a = ar.param_symbol("a");
+        let b = ar.param_symbol("b");
         let ea = ar.exp(a);
         let eb = ar.exp(b);
         let lhs = ar.mul(ea, eb);
@@ -401,14 +401,14 @@ mod tests {
     fn axiom_mode_softmax_rescaling_hard_times_out() {
         let n = 8;
         let mut ar = ExprArena::new();
-        let m = ar.named("m");
+        let m = ar.param_symbol("m");
         // lhs: sum_i exp(s_i - m); rhs: exp(-m) * sum_i exp(s_i). Equal
         // over the reals via the addition law, but a Sum-of-Exps vs a
         // Prod structurally - no short-circuit, the solver must run.
         let mut lhs_terms = Vec::new();
         let mut rhs_terms = Vec::new();
         for i in 0..n {
-            let s = ar.named(format!("s{}", i));
+            let s = ar.param_symbol(format!("s{}", i));
             let shifted = ar.sub(s, m);
             lhs_terms.push(ar.exp(shifted));
             rhs_terms.push(ar.exp(s));
@@ -461,7 +461,7 @@ mod tests {
         // "constructors constant-fold eagerly"), so use a symbolic
         // predicate to force an actual `Select` node.
         let mut ar = ExprArena::new();
-        let c = ar.named("cond");
+        let c = ar.param_symbol("cond");
         let t = ar.int(1);
         let f = ar.int(0);
         let id = ar.select(c, t, f);
@@ -478,9 +478,9 @@ mod tests {
     fn maxmin_compound_args_unify_across_arenas() {
         let build = |flip: bool| {
             let mut ar = ExprArena::new();
-            let x = ar.named("x");
-            let y = ar.named("y");
-            let z = ar.named("z");
+            let x = ar.param_symbol("x");
+            let y = ar.param_symbol("y");
+            let z = ar.param_symbol("z");
             let sum = if flip { ar.add(y, x) } else { ar.add(x, y) };
             let m = ar.max(sum, z);
             (ar, m)
@@ -498,9 +498,9 @@ mod tests {
     fn maxmin_key_is_traversal_order_independent() {
         let build = |outer_first: bool| {
             let mut ar = ExprArena::new();
-            let s0 = ar.named("s0");
-            let s1 = ar.named("s1");
-            let s2 = ar.named("s2");
+            let s0 = ar.param_symbol("s0");
+            let s1 = ar.param_symbol("s1");
+            let s2 = ar.param_symbol("s2");
             let m1 = ar.max(s0, s1);
             let m2 = ar.max(m1, s2);
             let root = if outer_first {
@@ -515,19 +515,35 @@ mod tests {
         assert_eq!(check(&ar_a, ra, &ar_b, rb), Z3Verdict::Equivalent);
     }
 
+    /// Named and machine symbols are disjoint namespaces (as in canon and
+    /// the numeric oracle): a symbol literally named "s{N}" is not the
+    /// machine `Symbol(N)`.
+    #[test]
+    fn named_symbol_does_not_alias_machine_symbol() {
+        use volta_analysis::symbolic::ExprNode;
+
+        let mut ar = ExprArena::new();
+        let machine = ar.symbol();
+        let ExprNode::Symbol(sym) = *ar.node(machine) else {
+            panic!("arena.symbol() must produce ExprNode::Symbol");
+        };
+        let named = ar.param_symbol(sym.to_string());
+        assert_eq!(check(&ar, machine, &ar, named), Z3Verdict::NotEquivalent);
+    }
+
     /// Regression: a user symbol literally named `t0` used to be captured
     /// by the generated `|t0|` let binding, proving `a*b` "equivalent" to
     /// an unrelated parameter - a false EQUIVALENT. User symbols now live
-    /// in the reserved `u!` namespace.
+    /// in reserved namespaces (`p!`/`e!`).
     #[test]
     fn user_symbol_named_t0_is_not_captured() {
         let mut ar_a = ExprArena::new();
-        let a = ar_a.named("a");
-        let b = ar_a.named("b");
+        let a = ar_a.param_symbol("a");
+        let b = ar_a.param_symbol("b");
         let lhs = ar_a.mul(a, b);
 
         let mut ar_b = ExprArena::new();
-        let rhs = ar_b.named("t0");
+        let rhs = ar_b.param_symbol("t0");
 
         assert_eq!(check(&ar_a, lhs, &ar_b, rhs), Z3Verdict::NotEquivalent);
     }
@@ -538,8 +554,8 @@ mod tests {
     #[test]
     fn user_symbol_named_e_is_distinct_from_exp_base() {
         let mut ar = ExprArena::new();
-        let e_sym = ar.named("e");
-        let other = ar.named("other");
+        let e_sym = ar.param_symbol("e");
+        let other = ar.param_symbol("other");
         assert_eq!(check(&ar, e_sym, &ar, e_sym), Z3Verdict::Equivalent);
         assert_eq!(check(&ar, e_sym, &ar, other), Z3Verdict::NotEquivalent);
         // And it is a free symbol, not the constant 2.718...:
@@ -560,11 +576,11 @@ mod tests {
         // 0.5f64 is a dyadic rational, exactly 1/2 in both readings:
         // x * 0.5 == x / 2 over the reals.
         let mut ar_a = ExprArena::new();
-        let x = ar_a.named("x");
+        let x = ar_a.param_symbol("x");
         let half = ar_a.float(0.5);
         let lhs = ar_a.mul(x, half);
         let mut ar_b = ExprArena::new();
-        let x = ar_b.named("x");
+        let x = ar_b.param_symbol("x");
         let two = ar_b.int(2);
         let rhs = ar_b.div(x, two);
         assert_eq!(check(&ar_a, lhs, &ar_b, rhs), Z3Verdict::Equivalent);
@@ -574,11 +590,11 @@ mod tests {
         // does the Z3 backend. The old shortest-decimal rendering read
         // 0.1f64 as exactly 1/10 and proved these "equivalent".
         let mut ar_c = ExprArena::new();
-        let x = ar_c.named("x");
+        let x = ar_c.param_symbol("x");
         let tenth = ar_c.float(0.1);
         let lhs = ar_c.mul(x, tenth);
         let mut ar_d = ExprArena::new();
-        let x = ar_d.named("x");
+        let x = ar_d.param_symbol("x");
         let ten = ar_d.int(10);
         let rhs = ar_d.div(x, ten);
         assert_eq!(check(&ar_c, lhs, &ar_d, rhs), Z3Verdict::NotEquivalent);
@@ -599,9 +615,9 @@ mod tests {
     #[test]
     fn deep_fma_chain_translates_without_stack_overflow() {
         let mut ar = ExprArena::new();
-        let a = ar.named("a");
-        let b = ar.named("b");
-        let mut acc = ar.named("acc");
+        let a = ar.param_symbol("a");
+        let b = ar.param_symbol("b");
+        let mut acc = ar.param_symbol("acc");
         for _ in 0..100_000 {
             acc = ar.fma(a, b, acc);
         }
@@ -616,7 +632,7 @@ mod tests {
     #[test]
     fn self_sharing_doubling_chain_translates_linearly() {
         let mut ar = ExprArena::new();
-        let mut x = ar.named("x");
+        let mut x = ar.param_symbol("x");
         for _ in 0..64 {
             x = ar.add(x, x);
         }
@@ -624,7 +640,7 @@ mod tests {
         assert!(translate_root(&mut bld, &ar, x).is_ok());
 
         let mut ar2 = ExprArena::new();
-        let mut y = ar2.named("y");
+        let mut y = ar2.param_symbol("y");
         for _ in 0..64 {
             y = ar2.mul(y, y);
         }
@@ -637,8 +653,8 @@ mod tests {
     #[test]
     fn identical_structure_short_circuits() {
         let mut ar = ExprArena::new();
-        let x = ar.named("x");
-        let y = ar.named("y");
+        let x = ar.param_symbol("x");
+        let y = ar.param_symbol("y");
         let sum = ar.add(x, y);
         let m = ar.max(sum, x);
         let res = check_equivalent(&ar, m, &ar, m, None, ExpMode::PowerBounded).unwrap();
@@ -669,11 +685,11 @@ mod tests {
         // Side A: `xy = x + y` is one shared node, used by the subtrahend
         // AND inside the max argument. Side B: two separate x+y nodes.
         let mut ar_a = ExprArena::new();
-        let x = ar_a.named("x");
-        let y = ar_a.named("y");
-        let w = ar_a.named("w");
-        let z = ar_a.named("z");
-        let p = ar_a.named("p");
+        let x = ar_a.param_symbol("x");
+        let y = ar_a.param_symbol("y");
+        let w = ar_a.param_symbol("w");
+        let z = ar_a.param_symbol("z");
+        let p = ar_a.param_symbol("p");
         let xy = ar_a.add(x, y);
         let sub = ar_a.sub(p, xy);
         let arg = ar_a.add(xy, w);
@@ -681,11 +697,11 @@ mod tests {
         let root_a = ar_a.add(sub, m);
 
         let mut ar_b = ExprArena::new();
-        let x = ar_b.named("x");
-        let y = ar_b.named("y");
-        let w = ar_b.named("w");
-        let z = ar_b.named("z");
-        let p = ar_b.named("p");
+        let x = ar_b.param_symbol("x");
+        let y = ar_b.param_symbol("y");
+        let w = ar_b.param_symbol("w");
+        let z = ar_b.param_symbol("z");
+        let p = ar_b.param_symbol("p");
         let xy1 = ar_b.add(x, y);
         let sub = ar_b.sub(p, xy1);
         let xy2 = ar_b.add(y, x);
@@ -704,19 +720,19 @@ mod tests {
     #[test]
     fn sub_and_add_neg_are_one_term_inside_atoms() {
         let mut ar_a = ExprArena::new();
-        let x = ar_a.named("x");
-        let y = ar_a.named("y");
-        let z = ar_a.named("z");
-        let w = ar_a.named("w");
+        let x = ar_a.param_symbol("x");
+        let y = ar_a.param_symbol("y");
+        let z = ar_a.param_symbol("z");
+        let w = ar_a.param_symbol("w");
         let m = ar_a.max(x, z);
         let diff = ar_a.sub(y, m);
         let root_a = ar_a.min(diff, w);
 
         let mut ar_b = ExprArena::new();
-        let x = ar_b.named("x");
-        let y = ar_b.named("y");
-        let z = ar_b.named("z");
-        let w = ar_b.named("w");
+        let x = ar_b.param_symbol("x");
+        let y = ar_b.param_symbol("y");
+        let z = ar_b.param_symbol("z");
+        let w = ar_b.param_symbol("w");
         let m = ar_b.max(x, z);
         let neg = ar_b.neg(m);
         let sum = ar_b.add(y, neg);
@@ -730,15 +746,15 @@ mod tests {
     #[test]
     fn fma_desugars_to_mul_add() {
         let mut ar_a = ExprArena::new();
-        let a = ar_a.named("a");
-        let b = ar_a.named("b");
-        let c = ar_a.named("c");
+        let a = ar_a.param_symbol("a");
+        let b = ar_a.param_symbol("b");
+        let c = ar_a.param_symbol("c");
         let lhs = ar_a.fma(a, b, c);
 
         let mut ar_b = ExprArena::new();
-        let a = ar_b.named("a");
-        let b = ar_b.named("b");
-        let c = ar_b.named("c");
+        let a = ar_b.param_symbol("a");
+        let b = ar_b.param_symbol("b");
+        let c = ar_b.param_symbol("c");
         let prod = ar_b.mul(a, b);
         let rhs = ar_b.add(prod, c);
 
@@ -752,7 +768,7 @@ mod tests {
     #[test]
     fn cancellation_and_involution() {
         let mut ar = ExprArena::new();
-        let x = ar.named("x");
+        let x = ar.param_symbol("x");
         let d = ar.sub(x, x);
         let mut zr = ExprArena::new();
         let zero = zr.float(0.0);
@@ -788,12 +804,12 @@ mod tests {
     #[test]
     fn negative_literals_unify_with_negated_positives() {
         let mut ar_a = ExprArena::new();
-        let x = ar_a.named("x");
+        let x = ar_a.param_symbol("x");
         let neg_tenth = ar_a.float(-0.1);
         let lhs = ar_a.add(x, neg_tenth);
 
         let mut ar_b = ExprArena::new();
-        let x = ar_b.named("x");
+        let x = ar_b.param_symbol("x");
         let tenth = ar_b.float(0.1);
         let rhs = ar_b.sub(x, tenth);
 
@@ -804,7 +820,7 @@ mod tests {
         // And exact cancellation across the two spellings: (x + -0.1) -
         // (x - 0.1) is the literal 0.
         let mut ar_c = ExprArena::new();
-        let x = ar_c.named("x");
+        let x = ar_c.param_symbol("x");
         let neg_tenth = ar_c.float(-0.1);
         let sum = ar_c.add(x, neg_tenth);
         let tenth = ar_c.float(0.1);

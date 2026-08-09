@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::symbolic::{ExprArena, ExprId, ExprNode};
+use crate::symbolic::{ExprArena, ExprId, ExprNode, SymbolRef};
 
 /// Numeric evaluation failure.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,13 +33,30 @@ impl std::fmt::Display for NumericError {
 
 impl std::error::Error for NumericError {}
 
-/// Deterministic pseudo-random value in [-1, 1) for a symbol under a seed
-/// (FNV-1a over the name mixed with the seed).
-fn symbol_value(name: &str, seed: u64) -> f64 {
+/// Deterministic pseudo-random value in [-1, 1) for a symbol under a seed:
+/// FNV-1a over the [`SymbolRef`] identity mixed with the seed, with a
+/// domain-separation tag per namespace and a fixed-width index prefix for
+/// elements (so `("x", 12)` cannot alias `("x1", 2)`).
+fn symbol_value(sym: SymbolRef<'_>, seed: u64) -> f64 {
     let mut h: u64 = 0xcbf29ce484222325 ^ seed.wrapping_mul(0x9e3779b97f4a7c15);
-    for b in name.bytes() {
+    let mut feed = |b: u8| {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
+    };
+    match sym {
+        SymbolRef::Param(name) => {
+            feed(b'p');
+            name.bytes().for_each(feed);
+        }
+        SymbolRef::Element { array, index } => {
+            feed(b'e');
+            index.to_le_bytes().into_iter().for_each(&mut feed);
+            array.bytes().for_each(&mut feed);
+        }
+        SymbolRef::Machine(id) => {
+            feed(b'm');
+            id.0.to_le_bytes().into_iter().for_each(feed);
+        }
     }
     // splitmix-style finalize for good low-bit behavior
     h ^= h >> 30;
@@ -81,8 +98,13 @@ fn eval_inner(
         ExprNode::IntConst(v) => *v as f64,
         ExprNode::FloatConst(v) => *v,
         ExprNode::BoolConst(b) => *b as i64 as f64,
-        ExprNode::NamedSymbol(s) => symbol_value(arena.string(*s), seed),
-        ExprNode::Symbol(s) => symbol_value(&format!("s{}", s.0), seed),
+        ExprNode::ParamSymbol(_) | ExprNode::InputElement { .. } | ExprNode::Symbol(_) => {
+            let sym = arena
+                .node(id)
+                .symbol_ref(arena)
+                .expect("symbolic atom must have a symbol_ref");
+            symbol_value(sym, seed)
+        }
 
         ExprNode::Add(a, b) => ev(*a, memo)? + ev(*b, memo)?,
         ExprNode::Sub(a, b) => ev(*a, memo)? - ev(*b, memo)?,
@@ -137,8 +159,18 @@ fn eval_inner(
         | ExprNode::Truncate { value, .. } => ev(*value, memo)?,
 
         ExprNode::SymbolicRead { array, index } => {
+            // Resolves to the same identity as the materialized
+            // `InputElement` (negative indices wrap into u64, matching
+            // `symbolic_read`'s eager resolution; no in-bounds element
+            // can collide).
             let i = ev(*index, memo)?;
-            symbol_value(&format!("{}[{}]", arena.string(*array), i as i64), seed)
+            symbol_value(
+                SymbolRef::Element {
+                    array: arena.string(*array),
+                    index: i as i64 as u64,
+                },
+                seed,
+            )
         }
 
         ExprNode::Discarded | ExprNode::Undefined => return Err(NumericError::Undefined),
@@ -215,7 +247,7 @@ mod tests {
     #[test]
     fn test_deterministic_and_seed_sensitive() {
         let mut ar = ExprArena::new();
-        let a = ar.named("a");
+        let a = ar.param_symbol("a");
         let v1 = eval_f64(&ar, a, 1).unwrap();
         let v2 = eval_f64(&ar, a, 1).unwrap();
         let v3 = eval_f64(&ar, a, 2).unwrap();
@@ -224,12 +256,38 @@ mod tests {
         assert!((-1.0..1.0).contains(&v1));
     }
 
+    /// Regression: the oracle used to hash machine `Symbol(N)` by the same
+    /// string as a symbol *named* `"s{N}"`, assigning both the same value -
+    /// which made it blind to canon's identical conflation. The namespaces
+    /// are domain-separated now.
+    #[test]
+    fn named_and_machine_symbols_get_independent_values() {
+        use crate::symbolic::ExprNode;
+
+        let mut ar = ExprArena::new();
+        let machine = ar.symbol();
+        let ExprNode::Symbol(sym) = *ar.node(machine) else {
+            panic!("arena.symbol() must produce ExprNode::Symbol");
+        };
+        let named = ar.param_symbol(sym.to_string());
+        for seed in 0..4 {
+            assert_ne!(
+                eval_f64(&ar, machine, seed).unwrap(),
+                eval_f64(&ar, named, seed).unwrap(),
+                "seed {}: Symbol({}) and NamedSymbol(\"{}\") must differ",
+                seed,
+                sym.0,
+                sym
+            );
+        }
+    }
+
     #[test]
     fn test_same_name_same_value_across_arenas() {
         let mut ar1 = ExprArena::new();
         let mut ar2 = ExprArena::new();
-        let a1 = ar1.named("x[3]");
-        let a2 = ar2.named("x[3]");
+        let a1 = ar1.param_symbol("x[3]");
+        let a2 = ar2.param_symbol("x[3]");
         assert_eq!(
             eval_f64(&ar1, a1, 7).unwrap(),
             eval_f64(&ar2, a2, 7).unwrap()
@@ -239,7 +297,7 @@ mod tests {
     #[test]
     fn test_verify_verdicts() {
         let mut ar = ExprArena::new();
-        let (a, b) = (ar.named("a"), ar.named("b"));
+        let (a, b) = (ar.param_symbol("a"), ar.param_symbol("b"));
         let ab = ar.add(a, b);
         let ba = ar.add(b, a);
         verify_verdict(&ar, ab, &ar, ba, true).unwrap();
@@ -252,7 +310,7 @@ mod tests {
     fn test_softmax_agreement() {
         // The softmax normalization identity agrees numerically.
         let mut ar = ExprArena::new();
-        let (a, b) = (ar.named("a"), ar.named("b"));
+        let (a, b) = (ar.param_symbol("a"), ar.param_symbol("b"));
         let m = ar.max(a, b);
         let ea = ar.exp(a);
         let eb = ar.exp(b);

@@ -223,6 +223,7 @@ checksum = "53797b5844b6b73deaf89aa1c98fe95c5ef2b4091d470c4d1d43619644f269ee"
 dependencies = [
  "id_collections_derive",
  "num-traits",
+ "serde",
 ]
 
 [[package]]
