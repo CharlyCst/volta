@@ -157,10 +157,11 @@ cargo run --release --features logging -- --log-level info analyze ...
 Checks the same verification conditions with Z3 instead of Volta's own
 decision procedure, for a timing/capability comparison. Queries are
 generated as SMT-LIB2 text (auditable: any query can be replayed against
-a standalone z3) and evaluated in-process through libz3's C API - a
-hand-written eight-function binding, no `z3-sys`/bindgen/libclang, no
-temp files, no per-element process spawns, and no `z3` binary needed at
-runtime. The one prerequisite is the Z3 shared library at build time:
+a standalone z3) and evaluated through libz3's C API - a hand-written
+eight-function binding, no `z3-sys`/bindgen/libclang, no temp files, and
+no `z3` binary needed at runtime (each query runs in a worker subprocess,
+but that worker is this same binary re-invoked - see the timeout note
+below). The one prerequisite is the Z3 shared library at build time:
 
 ```bash
 sudo apt-get install -y libz3-dev
@@ -190,6 +191,13 @@ evaluates in a worker subprocess (the binary re-invoking itself; no
 separate executable) that is killed on expiry. `timeout` in the
 element counts means the budget expired; `unknown` means z3 itself gave
 up with budget to spare.
+
+Because the translation deliberately does no reasoning, *every* element
+costs a genuine spawn+solve - trivially identical sides included, at
+tens of milliseconds each. A full-footprint run over a large output
+(tens of thousands of elements) therefore takes hours where the decision
+procedure takes seconds; that gap is a result, not an inefficiency. Use
+`--sample` to bound the element count (Table 8 uses `--sample 1`).
 
 Covers the arithmetic + `Exp` + `Max`/`Min` fragment as a **direct
 semantic image**: every expression node maps to its defining SMT term

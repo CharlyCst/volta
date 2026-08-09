@@ -5,9 +5,9 @@
 //! timing/capability comparison point against `volta_analysis::canon`'s
 //! own decision procedure - not a replacement for it. See the `translate`
 //! module for exactly which fragment of `ExprNode` this backend covers,
-//! why, and how DAG sharing is preserved (structural interning into
-//! SMT-LIB2 `let` bindings), plus the two exponential encodings
-//! ([`ExpMode`]) that reproduce the paper's section 6.5 baselines.
+//! why, and how DAG sharing is preserved (per-node memoized SMT-LIB2
+//! `let` bindings), plus the two exponential encodings ([`ExpMode`])
+//! that reproduce the paper's section 6.5 baselines.
 //!
 //! The query still goes through SMT-LIB2 *text* even though the solver is
 //! linked: the textual form is what keeps the translation auditable (any
@@ -569,19 +569,45 @@ mod tests {
     }
 
     /// Regression: a user symbol named `e` used to collide with the
-    /// `(define-fun e ...)` exp-base constant, making z3 error out on the
-    /// duplicate declaration.
+    /// exp-base constant, making z3 error out on the duplicate
+    /// declaration. The `Exp` node is what makes this test real: only a
+    /// query that uses `Exp` declares the base, so only there can the
+    /// collision occur.
     #[test]
     fn user_symbol_named_e_is_distinct_from_exp_base() {
         let mut ar = ExprArena::new();
         let e_sym = ar.param_symbol("e");
-        let other = ar.param_symbol("other");
-        assert_eq!(check(&ar, e_sym, &ar, e_sym), Z3Verdict::Equivalent);
-        assert_eq!(check(&ar, e_sym, &ar, other), Z3Verdict::NotEquivalent);
-        // And it is a free symbol, not the constant 2.718...:
+        let x = ar.param_symbol("x");
+        let ex = ar.exp(x);
+        let lhs = ar.mul(e_sym, ex);
+        let rhs = ar.mul(ex, e_sym);
+        // Capture would be a duplicate declaration of `e` (a z3 error,
+        // not Equivalent).
+        assert_eq!(check(&ar, lhs, &ar, rhs), Z3Verdict::Equivalent);
+        // Freeness must be probed in an exp-free query: a sat check needs
+        // a model, and this z3 cannot build one for any query containing
+        // `^` with a free exponent (the same limitation behind the
+        // paper's plain-mode `unknown`s), so a NotEquivalent assert with
+        // the base declared would only ever see Unknown.
         let mut ar_b = ExprArena::new();
         let approx = ar_b.float(2.718281828459045);
         assert_eq!(check(&ar, e_sym, &ar_b, approx), Z3Verdict::NotEquivalent);
+    }
+
+    /// The same guard for the axiom encoding: a user symbol named `uexp`
+    /// must coexist with the declared `uexp` function.
+    #[test]
+    fn user_symbol_named_uexp_is_distinct_from_uexp_function() {
+        let mut ar = ExprArena::new();
+        let u_sym = ar.param_symbol("uexp");
+        let x = ar.param_symbol("x");
+        let ex = ar.exp(x);
+        let lhs = ar.mul(u_sym, ex);
+        let rhs = ar.mul(ex, u_sym);
+        assert_eq!(
+            check_mode(&ar, lhs, &ar, rhs, ExpMode::AdditionAxiom),
+            Z3Verdict::Equivalent
+        );
     }
 
     /// Regression: float constants used to be rendered as their shortest

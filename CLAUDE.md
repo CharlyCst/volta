@@ -247,12 +247,15 @@ budget kills them, reported `Timeout` - Table 8's "with axiom" column,
   Inherited SMT semantic: division is underspecified at zero, so
   `x/x = 1` is falsifiable - unlike canon's field model (moot on the
   corpus: division only occurs inside exp-laden VCs).
-- `ffi.rs` - `eval_smtlib2` (fresh context per query, no-op error
-  handler so z3 API errors surface as `(error ...)` text instead of
-  aborting, soft timeout via the process-global `timeout` param) and
-  `z3_version`.
-- `lib.rs` - per-element querying (`check_equivalent`; identical interned
-  terms short-circuit to Equivalent without a solver run), verdict
+- `ffi.rs` - `init_worker` (the host-binary hook that turns the
+  re-invoked process into a solver worker), `eval_smtlib2` (spawns the
+  worker, writes the query to its stdin, enforces the hard deadline via
+  kill; inside the worker: fresh context per query, no-op error handler
+  so z3 API errors surface as `(error ...)` text instead of aborting,
+  soft timeout via the process-global `timeout` param) and `z3_version`.
+- `lib.rs` - per-element querying (`check_equivalent`; every element is
+  a genuine solver query - no structural short-circuit, so identical
+  sides cost a full spawn+solve, which is the point), verdict
   parsing, `Z3Counts`, `check_output_equivalence` over
   `driver::paired_elements` (the same element pairing as the decision
   procedure), and the regression tests for every invariant above.
