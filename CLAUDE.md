@@ -211,13 +211,16 @@ escalation (debug). `cargo run -p volta_cli --features logging --
 Z3 comparison backend for the same verification conditions: generates
 SMT-LIB2 text and evaluates it through libz3's C API (`ffi.rs`, a
 hand-written eight-function binding - no `z3-sys`/bindgen; building
-requires `libz3-dev`). Each query runs in a **forked worker** killed on
-timeout expiry: z3 4.8.12 does not reliably honor its soft timeout or
-`Z3_interrupt` in the quantifier loop the exp-axiom mode provokes
-(measured), so a hard kill is the only real bound - which also gives
-per-element crash containment. Fork requires the process to be
-effectively single-threaded at query time (the volta binaries are).
-A capability/timing comparison point against `canon`, not a replacement.
+requires `libz3-dev`). Each query runs in a **worker subprocess** (the
+binary re-invokes itself via `std::process::Command`; thread-safe, no
+separate executable) killed on timeout expiry: z3 4.8.12 does not
+reliably honor its soft timeout or `Z3_interrupt` in the quantifier
+loop the exp-axiom mode provokes (measured), so a hard kill is the only
+real bound - which also gives per-element crash containment. Contract:
+any binary that evaluates queries through this crate calls
+`volta_z3::init_worker()` as the first statement of `main` (loudly
+checked via a handshake). A capability/timing comparison point against
+`canon`, not a replacement.
 
 Two `ExpMode`s reproduce the paper's section 6.5 baselines: the default
 `PowerBounded` (`(^ e a)`, bounded free `e`; attention VCs come back

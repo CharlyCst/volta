@@ -186,7 +186,8 @@ two documented baselines, and the backend implements both:
 `--z3-timeout` is a *hard* per-query bound: z3 4.8.12 does not reliably
 honor its own soft timeout in the axiom-induced loop (measured: a
 3-second soft timeout still running after 90 seconds), so each query
-evaluates in a forked worker that is killed on expiry. `timeout` in the
+evaluates in a worker subprocess (the binary re-invoking itself; no
+separate executable) that is killed on expiry. `timeout` in the
 element counts means the budget expired; `unknown` means z3 itself gave
 up with budget to spare.
 

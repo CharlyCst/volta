@@ -237,6 +237,10 @@ struct CompareArgs {
 }
 
 fn main() -> ExitCode {
+    // Must precede everything: if this process was spawned as a z3
+    // solver worker, this runs the query and exits (see volta_z3::ffi).
+    volta_z3::init_worker();
+
     let cli = Cli::parse();
 
     let command_name = match &cli.command {

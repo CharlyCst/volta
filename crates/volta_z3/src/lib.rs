@@ -1,6 +1,7 @@
 //! Z3 backend: translate a verification-condition pair to SMT-LIB2,
-//! evaluate it through the linked libz3 (in a forked, killable worker -
-//! see `ffi`), and interpret unsat/sat/unknown/timeout. This is a
+//! evaluate it through the linked libz3 (in a killable worker
+//! subprocess - see `ffi`, including the host-binary [`init_worker`]
+//! contract), and interpret unsat/sat/unknown/timeout. This is a
 //! timing/capability comparison point against `volta_analysis::canon`'s
 //! own decision procedure - not a replacement for it. See the `translate`
 //! module for exactly which fragment of `ExprNode` this backend covers,
@@ -18,7 +19,7 @@
 mod ffi;
 mod translate;
 
-pub use ffi::z3_version;
+pub use ffi::{init_worker, z3_version};
 pub use translate::{Builder, ExpMode, Unsupported, translate_root};
 
 use std::fmt;
@@ -305,6 +306,38 @@ pub fn check_output_equivalence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wire the worker entry for this crate's own test binary (real
+    /// binaries call `volta_z3::init_worker()` at the top of `main`;
+    /// libtest owns this binary's `main`, so the hook runs pre-main).
+    #[ctor::ctor]
+    fn worker_hook() {
+        crate::init_worker();
+    }
+
+    /// The whole point of the subprocess design: evaluation is
+    /// thread-safe (the old fork-based worker silently required a
+    /// single-threaded process).
+    #[test]
+    fn parallel_checks_are_thread_safe() {
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let mut ar = ExprArena::new();
+                    let x = ar.param_symbol(format!("x{}", i));
+                    let y = ar.param_symbol(format!("y{}", i));
+                    let lhs = ar.add(x, y);
+                    let rhs = ar.add(y, x);
+                    check_equivalent(&ar, lhs, &ar, rhs, None, ExpMode::PowerBounded)
+                        .unwrap()
+                        .verdict
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), Z3Verdict::Equivalent);
+        }
+    }
 
     fn check(arena_a: &ExprArena, a: ExprId, arena_b: &ExprArena, b: ExprId) -> Z3Verdict {
         check_mode(arena_a, a, arena_b, b, ExpMode::PowerBounded)

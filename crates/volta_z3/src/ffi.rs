@@ -1,5 +1,5 @@
-//! Minimal hand-written FFI over libz3's stable C API, plus fork-based
-//! isolation for each query.
+//! Minimal hand-written FFI over libz3's stable C API, plus worker-
+//! subprocess isolation for each query.
 //!
 //! Deliberately NOT `z3-sys`/`z3` crates: those regenerate bindings with
 //! bindgen at build time (libclang dependency) for hundreds of entry
@@ -7,28 +7,43 @@
 //! stable for a decade. Linking is plain `-lz3`; building requires
 //! `libz3-dev` (only the shared library is needed).
 //!
-//! # Why fork
+//! # Why a subprocess
 //!
 //! z3's soft timeout and even an explicit `Z3_interrupt` from another
 //! thread are advisory - measured on 4.8.12, the E-matching loop that the
 //! exp-axiom mode provokes never polls cancellation (a 3-second soft
 //! timeout still hadn't fired 90 seconds in). The only reliable bound is
 //! a hard kill, and in-process there is nothing safe to kill. Each query
-//! therefore evaluates in a forked child: the child inherits the query
-//! string and the linked libz3 by copy-on-write (no binary to exec, no
-//! query serialization), writes the solver's small textual output to a
-//! pipe, and `_exit`s; the parent reads with a deadline and SIGKILLs on
-//! expiry. This also restores per-element crash containment - a z3
-//! internal abort takes down one child, not the run.
+//! therefore evaluates in a worker process the parent can SIGKILL on
+//! deadline expiry - which also gives per-element crash containment (a
+//! z3 internal abort takes down one worker, not the run).
 //!
-//! Fork safety: the process must effectively be single-threaded when a
-//! query runs (a child forked from a multithreaded process may inherit a
-//! held malloc lock and deadlock - which the deadline then converts into
-//! a spurious timeout). The volta binaries are single-threaded; callers
-//! embedding this crate from worker threads should serialize their calls.
+//! The worker is this same executable re-invoked (spawn + exec via
+//! `std::process::Command`, which is thread-safe - an earlier design
+//! used `fork()` without `exec`, whose safety silently depended on the
+//! process being single-threaded, an unacceptable hidden precondition
+//! for a safe function). Re-invoking self means the linked libz3 is
+//! already present and no separate worker binary needs to exist on disk.
+//! The one visible contract: **a binary that (transitively) evaluates
+//! queries through this crate must call [`init_worker`] as the first
+//! statement of `main`**, so the re-invoked process becomes a solver
+//! worker instead of running the host program. The contract is loudly
+//! checked: the worker announces itself with a handshake line, and a
+//! spawn that comes back without it fails with an error naming
+//! `init_worker` - never silent misbehavior. (This crate's own test
+//! binary wires the hook via a `ctor` constructor.)
+//!
+//! Protocol: the parent sets `VOLTA_Z3_WORKER=1` (and the soft-timeout
+//! millisecond budget in `VOLTA_Z3_TIMEOUT_MS`) in the child's
+//! environment and writes the SMT-LIB2 script to its stdin; the worker
+//! reads stdin to EOF, evaluates it in-process with a fresh Z3 context,
+//! and writes the handshake line followed by the solver's textual output
+//! to stdout.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
-use std::time::{Duration, Instant};
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 type Z3Config = *mut c_void;
 type Z3Context = *mut c_void;
@@ -59,22 +74,49 @@ pub fn z3_version() -> String {
     format!("{}.{}.{}", major, minor, build)
 }
 
-/// One query's fate, as observed by the parent.
-pub enum EvalOutcome {
-    /// The child finished and this is the solver's textual output.
-    Output(String),
-    /// The deadline expired and the child was killed - the definitive
-    /// timeout signal (z3's own soft timeout is unreliable, see module
-    /// docs).
-    HardTimeout,
-    /// The child died without producing output (z3 crash/abort); the
-    /// payload describes how.
-    ChildDied(String),
+const WORKER_ENV: &str = "VOLTA_Z3_WORKER";
+const TIMEOUT_ENV: &str = "VOLTA_Z3_TIMEOUT_MS";
+/// First line a worker writes; its absence means the spawned binary ran
+/// its normal `main` instead - i.e. the host forgot `init_worker`.
+const HANDSHAKE: &str = "volta-z3-worker-1";
+
+/// If this process was spawned as a solver worker, run the query and
+/// exit; otherwise return immediately. Must be the FIRST statement of
+/// `main` in every binary that (transitively) evaluates queries through
+/// this crate - see the module docs for the contract and how violations
+/// are surfaced.
+pub fn init_worker() {
+    if std::env::var_os(WORKER_ENV).is_none() {
+        return;
+    }
+    if let Ok(ms) = std::env::var(TIMEOUT_ENV) {
+        let param = CString::new("timeout").unwrap();
+        let value = CString::new(ms).expect("timeout env var contained NUL");
+        unsafe { Z3_global_param_set(param.as_ptr(), value.as_ptr()) };
+    }
+    let mut query = String::new();
+    if std::io::stdin().read_to_string(&mut query).is_err() {
+        std::process::exit(2);
+    }
+    let result = eval_in_process(&query);
+    // Handshake only after stdin was fully consumed: the parent writes
+    // the whole query before reading, so neither side blocks on a full
+    // pipe while the other isn't draining it.
+    let mut stdout = std::io::stdout();
+    let ok = writeln!(stdout, "{}", HANDSHAKE)
+        .and_then(|_| stdout.write_all(result.as_bytes()))
+        .and_then(|_| stdout.flush())
+        .is_ok();
+    std::process::exit(if ok { 0 } else { 2 });
 }
 
-/// In-process evaluation - runs inside the forked child. Kept as its own
-/// function so the child does the minimum: eval, hand the bytes back.
-fn eval_in_process(c_query: &CStr) -> String {
+/// In-process evaluation with a fresh context - runs inside the worker,
+/// where the process is ours alone.
+fn eval_in_process(query: &str) -> String {
+    let c_query = match CString::new(query) {
+        Ok(c) => c,
+        Err(_) => return "(error \"query contained a NUL byte\")".to_string(),
+    };
     unsafe {
         let cfg = Z3_mk_config();
         let ctx = Z3_mk_context(cfg);
@@ -91,150 +133,104 @@ fn eval_in_process(c_query: &CStr) -> String {
     }
 }
 
-/// Evaluate one self-contained SMT-LIB2 script in a forked child,
+/// One query's fate, as observed by the parent.
+pub enum EvalOutcome {
+    /// The worker finished and this is the solver's textual output.
+    Output(String),
+    /// The deadline expired and the worker was killed - the definitive
+    /// timeout signal (z3's own soft timeout is unreliable, see module
+    /// docs).
+    HardTimeout,
+    /// The worker died without completing the protocol (z3 crash, spawn
+    /// failure, or a host binary missing `init_worker`); the payload
+    /// describes how.
+    ChildDied(String),
+}
+
+/// Evaluate one self-contained SMT-LIB2 script in a worker subprocess,
 /// enforcing `timeout` (`None` = no limit) with SIGKILL. z3's soft
-/// timeout is also set (belt and suspenders: when it does fire, the
-/// output carries a `canceled` reason a little before the hard deadline).
+/// timeout is also set inside the worker (belt and suspenders: when it
+/// does fire, the output carries a `canceled` reason a little before the
+/// hard deadline). Thread-safe: spawning goes through
+/// `std::process::Command`.
 pub fn eval_smtlib2(query: &str, timeout: Option<Duration>) -> EvalOutcome {
-    // The query text is generated by `translate` and never contains NUL.
-    let c_query = CString::new(query).expect("SMT query contained a NUL byte");
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return EvalOutcome::ChildDied(format!("current_exe() failed: {}", e)),
+    };
     let timeout_ms = match timeout {
         // Millisecond granularity, minimum 1ms; u32::MAX is z3's default
         // "effectively unlimited" value.
         Some(t) => (t.as_millis().min(u64::from(u32::MAX - 1) as u128) as u32).max(1),
         None => u32::MAX,
     };
-    // Set in the parent: the global parameter table is inherited by the
-    // child along with everything else.
-    let param = CString::new("timeout").unwrap();
-    let value = CString::new(timeout_ms.to_string()).unwrap();
-    unsafe { Z3_global_param_set(param.as_ptr(), value.as_ptr()) };
 
-    let mut fds = [0 as c_int; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return EvalOutcome::ChildDied("pipe() failed".to_string());
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let mut child = match Command::new(exe)
+        .env(WORKER_ENV, "1")
+        .env(TIMEOUT_ENV, timeout_ms.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return EvalOutcome::ChildDied(format!("failed to spawn worker: {}", e)),
+    };
 
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
+    // Write the query, then drop stdin so the worker sees EOF. The
+    // worker does not write until it has read everything, so this cannot
+    // deadlock on pipe capacity.
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(query.as_bytes()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return EvalOutcome::ChildDied("failed to write query to worker".to_string());
         }
-        return EvalOutcome::ChildDied("fork() failed".to_string());
     }
 
-    if pid == 0 {
-        // Child: evaluate and stream the (small) output back. Nothing
-        // here returns; on any failure the exit status tells the parent.
-        unsafe { libc::close(read_fd) };
-        let out = eval_in_process(&c_query);
-        let bytes = out.as_bytes();
-        let mut written = 0;
-        while written < bytes.len() {
-            let n = unsafe {
-                libc::write(
-                    write_fd,
-                    bytes[written..].as_ptr() as *const c_void,
-                    bytes.len() - written,
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            written += n as usize;
-        }
-        unsafe { libc::_exit(0) };
-    }
+    // Read the worker's output on a helper thread so the parent can
+    // enforce the hard deadline; on expiry the worker is killed and the
+    // reader unblocks at EOF.
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
 
-    // Parent.
-    unsafe { libc::close(write_fd) };
     let deadline = timeout.map(|t| {
         // Grace on top of z3's soft timeout so a clean in-band `canceled`
         // result wins when the solver does honor cancellation.
-        Instant::now() + t + Duration::from_millis(500).max(t / 10)
+        t + Duration::from_millis(500).max(t / 10)
     });
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let outcome = loop {
-        let remaining_ms: c_int = match deadline {
-            None => -1,
-            Some(d) => {
-                let now = Instant::now();
-                if now >= d {
-                    break None;
-                }
-                (d - now).as_millis().min(60_000) as c_int
-            }
-        };
-        let mut pfd = libc::pollfd {
-            fd: read_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let pr = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
-        if pr < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break Some(EvalOutcome::ChildDied("poll() failed".to_string()));
-        }
-        if pr == 0 {
-            continue; // re-check deadline
-        }
-        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break Some(EvalOutcome::ChildDied("read() failed".to_string()));
-        }
-        if n == 0 {
-            // EOF: child closed the pipe (finished or died).
-            break Some(EvalOutcome::Output(
-                String::from_utf8_lossy(&out).into_owned(),
-            ));
-        }
-        out.extend_from_slice(&buf[..n as usize]);
+    let received = match deadline {
+        None => rx.recv().ok(),
+        Some(d) => match rx.recv_timeout(d) {
+            Ok(out) => Some(out),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(String::new()),
+        },
     };
-    unsafe { libc::close(read_fd) };
-
-    match outcome {
+    let outcome = match received {
         None => {
-            // Deadline expired: hard-kill and reap.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                let mut status: c_int = 0;
-                libc::waitpid(pid, &mut status, 0);
-            }
+            let _ = child.kill();
+            let _ = child.wait();
             EvalOutcome::HardTimeout
         }
-        Some(EvalOutcome::Output(text)) => {
-            let mut status: c_int = 0;
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-            let exited_cleanly = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
-            if exited_cleanly {
-                EvalOutcome::Output(text)
-            } else if libc::WIFSIGNALED(status) {
-                EvalOutcome::ChildDied(format!(
-                    "z3 worker killed by signal {}",
-                    libc::WTERMSIG(status)
-                ))
-            } else {
-                EvalOutcome::ChildDied(format!(
-                    "z3 worker exited with status {}",
-                    libc::WEXITSTATUS(status)
-                ))
-            }
-        }
-        Some(other) => {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                let mut status: c_int = 0;
-                libc::waitpid(pid, &mut status, 0);
-            }
-            other
-        }
-    }
+        Some(text) => match child.wait() {
+            Ok(status) if status.success() => match text.strip_prefix(HANDSHAKE) {
+                Some(rest) => EvalOutcome::Output(rest.trim_start_matches('\n').to_string()),
+                None => EvalOutcome::ChildDied(
+                    "worker handshake missing - the host binary must call \
+                     volta_z3::init_worker() as the first statement of main()"
+                        .to_string(),
+                ),
+            },
+            Ok(status) => EvalOutcome::ChildDied(format!("worker exited with {}", status)),
+            Err(e) => EvalOutcome::ChildDied(format!("failed to reap worker: {}", e)),
+        },
+    };
+    let _ = reader.join();
+    outcome
 }

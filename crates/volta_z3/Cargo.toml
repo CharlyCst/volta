@@ -6,6 +6,8 @@ description = "Z3 backend for verification-condition equivalence checking, for t
 
 [dependencies]
 volta_analysis.workspace = true
-libc.workspace = true
 stacker.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+ctor = "0.2"
