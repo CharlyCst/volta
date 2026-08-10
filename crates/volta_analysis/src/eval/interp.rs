@@ -654,7 +654,17 @@ impl<'p> Interpreter<'p> {
                 let product = match mode {
                     crate::lowered::MulMode::Lo => self.eval_binop(t, pc, BinOp::Mul, *ty, a, b)?,
                     crate::lowered::MulMode::Wide => self.mul_wide(*ty, a, b),
-                    crate::lowered::MulMode::Hi => self.mul_hi(*ty, a, b),
+                    crate::lowered::MulMode::Hi => {
+                        // Same guard as MulHi: mul_hi composes `(a*b) >> bits`,
+                        // which cannot represent the high half above 32 bits.
+                        if ty.bits() > 32 {
+                            return Err(EvalError::Unsupported {
+                                pc,
+                                what: format!("mad.hi at width {}", ty.bits()),
+                            });
+                        }
+                        self.mul_hi(*ty, a, b)
+                    }
                 };
                 let r = match mode {
                     crate::lowered::MulMode::Lo => {

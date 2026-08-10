@@ -15,10 +15,11 @@ use volta_common::Span;
 use volta_frontend::ascii::AsciiSliceExt;
 use volta_frontend::ast::{
     self, AbsInstr, AddInstr, Address, AddressBase, BarInstr, BarMode, BraInstr, CallInstr,
-    CmpOp as AstCmpOp, CvtInstr, DivInstr, FmaInstr, FromAscii, Function, FunctionBody,
-    Instruction, InstructionOp, LdInstr, MadInstr, MaxInstr, MinInstr, MulInstr, MulMode, NegInstr,
-    Operand as AstOperand, ParsedInstruction, ScalarType, SetpInstr, ShflMode as AstShflMode,
-    ShflSyncInstr, StInstr, StateSpace, Statement, SubInstr, VarDecl,
+    CmpOp as AstCmpOp, CvtInstr, CvtRounding, DivInstr, FmaInstr, FromAscii, Function,
+    FunctionBody, Instruction, InstructionOp, LdInstr, MadInstr, MaxInstr, MemSemantics, MinInstr,
+    MulInstr, MulMode, NegInstr, Operand as AstOperand, ParsedInstruction, ScalarType, SetpInstr,
+    ShflMode as AstShflMode, ShflSyncInstr, StInstr, StateSpace, Statement, SubInstr, VarDecl,
+    VecWidth,
 };
 use volta_frontend::instr::InstrKind;
 use volta_frontend::instr_parse::parse_instruction;
@@ -35,6 +36,38 @@ use crate::source_map::SourceMapBuilder;
 use crate::symbols::{RegId, SpecialRegKind, SymbolTable};
 use crate::tensor_core::{MmaLayout, MmaOperand, MmaShape};
 use crate::types::{ScalarTypeExt, TypeCompatibility, check_type_compatibility};
+
+// =============================================================================
+// Loud Rejection Helpers
+// =============================================================================
+
+/// Build the loud rejection for a modifier or instruction form the model
+/// does not implement. Policy: lowering must never drop a semantic modifier
+/// silently; anything unmodeled errors here, naming the modifier.
+fn unsupported(instruction: impl Into<String>, reason: impl Into<String>) -> LowerError {
+    LowerError::UnsupportedInstruction {
+        instruction: instruction.into(),
+        reason: Some(reason.into()),
+    }
+}
+
+/// Reject packed-SIMD (multi-lane) types in scalar arithmetic lowering.
+/// `BinOp`/`UnaryOp`/`Fma` evaluate one lane, so lowering a packed type
+/// through them would compute a single 32/64-bit lane (or integer-add float
+/// bit patterns) silently.
+fn check_not_packed(ty: ScalarType, instruction: &str) -> LowerResult<()> {
+    match ty {
+        ScalarType::U16x2
+        | ScalarType::S16x2
+        | ScalarType::F16x2
+        | ScalarType::Bf16x2
+        | ScalarType::F32x2 => Err(unsupported(
+            instruction,
+            format!("packed SIMD arithmetic on {:?}", ty),
+        )),
+        _ => Ok(()),
+    }
+}
 
 // =============================================================================
 // Type-Aware Operand Resolution
@@ -585,15 +618,25 @@ impl LoweringContext {
         })
     }
 
-    /// Convert AST memory space to lowered memory space
-    fn convert_space(&self, space: Option<StateSpace>) -> MemSpace {
+    /// Convert AST memory space to lowered memory space. Generic (spaceless)
+    /// accesses and unmodeled spaces are rejected: memory spaces have
+    /// separate address spaces here, so silently defaulting to global would
+    /// read/write the wrong memory.
+    fn convert_space(&self, space: Option<StateSpace>, instruction: &str) -> LowerResult<MemSpace> {
         match space {
-            Some(StateSpace::Global) => MemSpace::Global,
-            Some(StateSpace::Shared) => MemSpace::Shared,
-            Some(StateSpace::Local) => MemSpace::Local,
-            Some(StateSpace::Param) => MemSpace::Param,
-            Some(StateSpace::Const) => MemSpace::Const,
-            _ => MemSpace::Global, // Default to global
+            Some(StateSpace::Global) => Ok(MemSpace::Global),
+            Some(StateSpace::Shared) => Ok(MemSpace::Shared),
+            Some(StateSpace::Local) => Ok(MemSpace::Local),
+            Some(StateSpace::Param) => Ok(MemSpace::Param),
+            Some(StateSpace::Const) => Ok(MemSpace::Const),
+            Some(other) => Err(unsupported(
+                instruction,
+                format!("state space {:?} is not modeled", other),
+            )),
+            None => Err(unsupported(
+                instruction,
+                "generic (spaceless) memory access - the state space must be explicit",
+            )),
         }
     }
 
@@ -1110,29 +1153,53 @@ fn lower_parsed_instruction(
         // Float unary - Rcp / Sqrt / Rsqrt
         // =========================================================================
         ParsedInstruction::Rcp(rcp) => {
+            // rnd/ftz/approx are precision controls: floats are reals here,
+            // so every reciprocal is exact and they change nothing.
             let (ty, dst, src) = match rcp {
-                ast::RcpInstr::Approx { ty, dst, src, .. } => (*ty, dst, src),
-                ast::RcpInstr::Ieee { ty, dst, src, .. } => (*ty, dst, src),
+                ast::RcpInstr::Approx {
+                    ftz: _ftz,
+                    ty,
+                    dst,
+                    src,
+                } => (*ty, dst, src),
+                ast::RcpInstr::Ieee {
+                    rnd: _rnd,
+                    ftz: _ftz,
+                    ty,
+                    dst,
+                    src,
+                } => (*ty, dst, src),
             };
             lower_float_unary(ctx, UnaryOp::Rcp, "rcp", ty, dst, src, predicate)?;
         }
         ParsedInstruction::Sqrt(sqrt) => {
+            // rnd/ftz/approx are precision controls: no effect over the reals.
             let (ty, dst, src) = match sqrt {
-                ast::SqrtInstr::Approx { dst, src, .. } => (ScalarType::F32, dst, src),
-                ast::SqrtInstr::Ieee { ty, dst, src, .. } => (*ty, dst, src),
+                ast::SqrtInstr::Approx {
+                    ftz: _ftz,
+                    dst,
+                    src,
+                } => (ScalarType::F32, dst, src),
+                ast::SqrtInstr::Ieee {
+                    rnd: _rnd,
+                    ftz: _ftz,
+                    ty,
+                    dst,
+                    src,
+                } => (*ty, dst, src),
             };
             lower_float_unary(ctx, UnaryOp::Sqrt, "sqrt", ty, dst, src, predicate)?;
         }
         ParsedInstruction::Rsqrt(rsqrt) => {
-            lower_float_unary(
-                ctx,
-                UnaryOp::Rsqrt,
-                "rsqrt",
-                rsqrt.ty,
-                &rsqrt.dst,
-                &rsqrt.src,
-                predicate,
-            )?;
+            // approx/ftz are precision controls: no effect over the reals.
+            let ast::RsqrtInstr {
+                approx: _approx,
+                ftz: _ftz,
+                ty,
+                dst,
+                src,
+            } = rsqrt;
+            lower_float_unary(ctx, UnaryOp::Rsqrt, "rsqrt", *ty, dst, src, predicate)?;
         }
 
         // =========================================================================
@@ -1393,9 +1460,19 @@ fn lower_parsed_instruction(
         // Data Movement - Cvta (address conversion)
         // =========================================================================
         ParsedInstruction::Cvta(cvta) => {
-            let dst = ctx.resolve_dst(&cvta.dst)?;
-            let src = ctx.resolve_operand(&cvta.src)?;
-            let space = ctx.convert_space(Some(cvta.space));
+            // to_generic and ty are ignorable: addresses here are absolute
+            // u64 offsets in per-space address spaces, so the conversion is
+            // the identity in both directions and at either pointer width.
+            let ast::CvtaInstr {
+                to_generic: _to_generic,
+                space,
+                ty: _ty,
+                dst,
+                src,
+            } = cvta;
+            let dst = ctx.resolve_dst(dst)?;
+            let src = ctx.resolve_operand(src)?;
+            let space = ctx.convert_space(Some(*space), "cvta")?;
             ctx.emit(LoweredInstr::Cvta { dst, src, space }, predicate)?;
         }
 
@@ -1416,7 +1493,10 @@ fn lower_parsed_instruction(
         // =========================================================================
         // Control Flow - Return/Exit
         // =========================================================================
-        ParsedInstruction::Ret(_) => {
+        ParsedInstruction::Ret(ast::RetInstr {
+            // .uni is a divergence hint; it does not change what ret does.
+            uniform: _uniform,
+        }) => {
             ctx.emit(LoweredInstr::Ret, predicate)?;
         }
         ParsedInstruction::Exit => {
@@ -1566,6 +1646,8 @@ fn lower_add(
             src_a,
             src_b,
         } => {
+            check_not_packed(*ty, "add")?;
+
             // Resolve with type information
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -1588,11 +1670,14 @@ fn lower_add(
             )?;
         }
         AddInstr::IntegerSat {
-            sat: _,
+            sat,
             dst,
             src_a,
             src_b,
         } => {
+            if *sat {
+                return Err(unsupported("add.sat.s32", ".sat (saturating integer add)"));
+            }
             let ty = ScalarType::S32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -1614,8 +1699,18 @@ fn lower_add(
             )?;
         }
         AddInstr::Float32 {
-            dst, src_a, src_b, ..
+            // Rounding mode and subnormal flushing don't apply: floats are
+            // reals here, so every add is exact.
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
+            dst,
+            src_a,
+            src_b,
         } => {
+            if *sat {
+                return Err(unsupported("add.f32", ".sat modifier"));
+            }
             let ty = ScalarType::F32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -1636,31 +1731,15 @@ fn lower_add(
                 predicate,
             )?;
         }
-        AddInstr::Float32x2 {
-            dst, src_a, src_b, ..
-        } => {
-            let ty = ScalarType::F32x2;
-            let dst_typed = ctx.resolve_dst_typed(dst)?;
-            let src_a_typed = ctx.resolve_operand_typed(src_a)?;
-            let src_b_typed = ctx.resolve_operand_typed(src_b)?;
-
-            ctx.check_dst_type(&dst_typed, ty, "add.f32x2")?;
-            ctx.check_operand_type(&src_a_typed, ty, "add.f32x2")?;
-            ctx.check_operand_type(&src_b_typed, ty, "add.f32x2")?;
-
-            ctx.emit(
-                LoweredInstr::BinOp {
-                    op: BinOp::Add,
-                    dst: dst_typed.reg,
-                    src_a: src_a_typed.operand,
-                    src_b: src_b_typed.operand,
-                    ty,
-                },
-                predicate,
-            )?;
+        AddInstr::Float32x2 { .. } => {
+            return Err(unsupported("add.f32x2", "packed SIMD arithmetic on F32x2"));
         }
         AddInstr::Float64 {
-            dst, src_a, src_b, ..
+            // Rounding mode doesn't apply over the reals.
+            rnd: _rnd,
+            dst,
+            src_a,
+            src_b,
         } => {
             let ty = ScalarType::F64;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
@@ -1683,54 +1762,74 @@ fn lower_add(
             )?;
         }
         AddInstr::HalfF16 {
+            // Rounding mode and subnormal flushing don't apply over the reals.
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        }
-        | AddInstr::HalfBf16 {
-            ty,
-            dst,
-            src_a,
-            src_b,
-            ..
         } => {
-            let dst_typed = ctx.resolve_dst_typed(dst)?;
-            let src_a_typed = ctx.resolve_operand_typed(src_a)?;
-            let src_b_typed = ctx.resolve_operand_typed(src_b)?;
-
-            ctx.check_dst_type(&dst_typed, *ty, "add.f16/bf16")?;
-            ctx.check_operand_type(&src_a_typed, *ty, "add.f16/bf16")?;
-            ctx.check_operand_type(&src_b_typed, *ty, "add.f16/bf16")?;
-
-            ctx.emit(
-                LoweredInstr::BinOp {
-                    op: BinOp::Add,
-                    dst: dst_typed.reg,
-                    src_a: src_a_typed.operand,
-                    src_b: src_b_typed.operand,
-                    ty: *ty,
-                },
+            if *sat {
+                return Err(unsupported("add.f16", ".sat modifier"));
+            }
+            check_not_packed(*ty, "add")?;
+            lower_half_binop(
+                ctx,
+                BinOp::Add,
+                "add.f16",
+                *ty,
+                dst,
+                src_a,
+                src_b,
+                predicate,
+            )?;
+        }
+        AddInstr::HalfBf16 {
+            // Rounding mode doesn't apply over the reals.
+            rnd: _rnd,
+            ty,
+            dst,
+            src_a,
+            src_b,
+        } => {
+            check_not_packed(*ty, "add")?;
+            lower_half_binop(
+                ctx,
+                BinOp::Add,
+                "add.bf16",
+                *ty,
+                dst,
+                src_a,
+                src_b,
                 predicate,
             )?;
         }
         AddInstr::MixedPrecision {
-            dst, src_a, src_b, ..
+            // Rounding mode doesn't apply over the reals.
+            rnd: _rnd,
+            sat,
+            src_type,
+            dst,
+            src_a,
+            src_b,
         } => {
-            // Mixed precision add: f32 result from half inputs
-            // Source types are f16, destination is f32
+            if *sat {
+                return Err(unsupported("add.f32 (mixed)", ".sat modifier"));
+            }
+            check_not_packed(*src_type, "add (mixed)")?;
+
+            // Mixed precision add: f32 result from half (f16/bf16) inputs
             let dst_ty = ScalarType::F32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
             let src_b_typed = ctx.resolve_operand_typed(src_b)?;
 
-            // Destination must be f32-compatible
+            // Destination must be f32-compatible; sources match the half type
             ctx.check_dst_type(&dst_typed, dst_ty, "add.f32 (mixed)")?;
-            // Sources are f16 - check they're float-compatible (relaxed for mixed precision)
-            // Note: We allow f16 sources for this instruction
-            ctx.check_operand_type(&src_a_typed, ScalarType::F16, "add.f32 (mixed)")?;
-            ctx.check_operand_type(&src_b_typed, ScalarType::F16, "add.f32 (mixed)")?;
+            ctx.check_operand_type(&src_a_typed, *src_type, "add.f32 (mixed)")?;
+            ctx.check_operand_type(&src_b_typed, *src_type, "add.f32 (mixed)")?;
 
             ctx.emit(
                 LoweredInstr::BinOp {
@@ -1747,6 +1846,39 @@ fn lower_add(
     Ok(())
 }
 
+/// Shared lowering for scalar half-precision (f16/bf16) binops.
+#[allow(clippy::too_many_arguments)] // thin emission helper; mirrors the instruction shape
+fn lower_half_binop(
+    ctx: &mut LoweringContext,
+    op: BinOp,
+    instr_name: &str,
+    ty: ScalarType,
+    dst: &AstOperand,
+    src_a: &AstOperand,
+    src_b: &AstOperand,
+    predicate: Option<Predicate>,
+) -> LowerResult<()> {
+    let dst_typed = ctx.resolve_dst_typed(dst)?;
+    let src_a_typed = ctx.resolve_operand_typed(src_a)?;
+    let src_b_typed = ctx.resolve_operand_typed(src_b)?;
+
+    ctx.check_dst_type(&dst_typed, ty, instr_name)?;
+    ctx.check_operand_type(&src_a_typed, ty, instr_name)?;
+    ctx.check_operand_type(&src_b_typed, ty, instr_name)?;
+
+    ctx.emit(
+        LoweredInstr::BinOp {
+            op,
+            dst: dst_typed.reg,
+            src_a: src_a_typed.operand,
+            src_b: src_b_typed.operand,
+            ty,
+        },
+        predicate,
+    )?;
+    Ok(())
+}
+
 fn lower_sub(
     ctx: &mut LoweringContext,
     sub: &SubInstr,
@@ -1759,6 +1891,8 @@ fn lower_sub(
             src_a,
             src_b,
         } => {
+            check_not_packed(*ty, "sub")?;
+
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
             let src_b_typed = ctx.resolve_operand_typed(src_b)?;
@@ -1779,11 +1913,14 @@ fn lower_sub(
             )?;
         }
         SubInstr::IntegerSat {
-            sat: _,
+            sat,
             dst,
             src_a,
             src_b,
         } => {
+            if *sat {
+                return Err(unsupported("sub.sat.s32", ".sat (saturating integer sub)"));
+            }
             let ty = ScalarType::S32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -1805,8 +1942,17 @@ fn lower_sub(
             )?;
         }
         SubInstr::Float32 {
-            dst, src_a, src_b, ..
+            // Rounding mode and subnormal flushing don't apply over the reals.
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
+            dst,
+            src_a,
+            src_b,
         } => {
+            if *sat {
+                return Err(unsupported("sub.f32", ".sat modifier"));
+            }
             let ty = ScalarType::F32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -1827,31 +1973,15 @@ fn lower_sub(
                 predicate,
             )?;
         }
-        SubInstr::Float32x2 {
-            dst, src_a, src_b, ..
-        } => {
-            let ty = ScalarType::F32x2;
-            let dst_typed = ctx.resolve_dst_typed(dst)?;
-            let src_a_typed = ctx.resolve_operand_typed(src_a)?;
-            let src_b_typed = ctx.resolve_operand_typed(src_b)?;
-
-            ctx.check_dst_type(&dst_typed, ty, "sub.f32x2")?;
-            ctx.check_operand_type(&src_a_typed, ty, "sub.f32x2")?;
-            ctx.check_operand_type(&src_b_typed, ty, "sub.f32x2")?;
-
-            ctx.emit(
-                LoweredInstr::BinOp {
-                    op: BinOp::Sub,
-                    dst: dst_typed.reg,
-                    src_a: src_a_typed.operand,
-                    src_b: src_b_typed.operand,
-                    ty,
-                },
-                predicate,
-            )?;
+        SubInstr::Float32x2 { .. } => {
+            return Err(unsupported("sub.f32x2", "packed SIMD arithmetic on F32x2"));
         }
         SubInstr::Float64 {
-            dst, src_a, src_b, ..
+            // Rounding mode doesn't apply over the reals.
+            rnd: _rnd,
+            dst,
+            src_a,
+            src_b,
         } => {
             let ty = ScalarType::F64;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
@@ -1874,50 +2004,73 @@ fn lower_sub(
             )?;
         }
         SubInstr::HalfF16 {
+            // Rounding mode and subnormal flushing don't apply over the reals.
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        }
-        | SubInstr::HalfBf16 {
-            ty,
-            dst,
-            src_a,
-            src_b,
-            ..
         } => {
-            let dst_typed = ctx.resolve_dst_typed(dst)?;
-            let src_a_typed = ctx.resolve_operand_typed(src_a)?;
-            let src_b_typed = ctx.resolve_operand_typed(src_b)?;
-
-            ctx.check_dst_type(&dst_typed, *ty, "sub.f16/bf16")?;
-            ctx.check_operand_type(&src_a_typed, *ty, "sub.f16/bf16")?;
-            ctx.check_operand_type(&src_b_typed, *ty, "sub.f16/bf16")?;
-
-            ctx.emit(
-                LoweredInstr::BinOp {
-                    op: BinOp::Sub,
-                    dst: dst_typed.reg,
-                    src_a: src_a_typed.operand,
-                    src_b: src_b_typed.operand,
-                    ty: *ty,
-                },
+            if *sat {
+                return Err(unsupported("sub.f16", ".sat modifier"));
+            }
+            check_not_packed(*ty, "sub")?;
+            lower_half_binop(
+                ctx,
+                BinOp::Sub,
+                "sub.f16",
+                *ty,
+                dst,
+                src_a,
+                src_b,
+                predicate,
+            )?;
+        }
+        SubInstr::HalfBf16 {
+            // Rounding mode doesn't apply over the reals.
+            rnd: _rnd,
+            ty,
+            dst,
+            src_a,
+            src_b,
+        } => {
+            check_not_packed(*ty, "sub")?;
+            lower_half_binop(
+                ctx,
+                BinOp::Sub,
+                "sub.bf16",
+                *ty,
+                dst,
+                src_a,
+                src_b,
                 predicate,
             )?;
         }
         SubInstr::MixedPrecision {
-            dst, src_a, src_b, ..
+            // Rounding mode doesn't apply over the reals.
+            rnd: _rnd,
+            sat,
+            src_type,
+            dst,
+            src_a,
+            src_b,
         } => {
-            // Mixed precision sub: f32 result from half inputs
+            if *sat {
+                return Err(unsupported("sub.f32 (mixed)", ".sat modifier"));
+            }
+            check_not_packed(*src_type, "sub (mixed)")?;
+
+            // Mixed precision sub: f32 result from half (f16/bf16) inputs
             let dst_ty = ScalarType::F32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
             let src_b_typed = ctx.resolve_operand_typed(src_b)?;
 
             ctx.check_dst_type(&dst_typed, dst_ty, "sub.f32 (mixed)")?;
-            ctx.check_operand_type(&src_a_typed, ScalarType::F16, "sub.f32 (mixed)")?;
-            ctx.check_operand_type(&src_b_typed, ScalarType::F16, "sub.f32 (mixed)")?;
+            ctx.check_operand_type(&src_a_typed, *src_type, "sub.f32 (mixed)")?;
+            ctx.check_operand_type(&src_b_typed, *src_type, "sub.f32 (mixed)")?;
 
             ctx.emit(
                 LoweredInstr::BinOp {
@@ -1947,6 +2100,8 @@ fn lower_mul(
             src_a,
             src_b,
         } => {
+            check_not_packed(*ty, "mul")?;
+
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
             let src_b_typed = ctx.resolve_operand_typed(src_b)?;
@@ -2004,12 +2159,20 @@ fn lower_mul(
             }
         }
         MulInstr::Float {
+            // Rounding mode and subnormal flushing don't apply over the reals.
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
             ty,
             dst,
             src_a,
             src_b,
-            ..
         } => {
+            if *sat {
+                return Err(unsupported("mul.f", ".sat modifier"));
+            }
+            check_not_packed(*ty, "mul")?;
+
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
             let src_b_typed = ctx.resolve_operand_typed(src_b)?;
@@ -2041,13 +2204,21 @@ fn lower_mad(
     match mad {
         MadInstr::Integer {
             mode,
-            sat: _,
+            sat,
             ty,
             dst,
             src_a,
             src_b,
             src_c,
         } => {
+            if *sat {
+                return Err(unsupported(
+                    "mad.hi.sat.s32",
+                    ".sat (saturating integer mad)",
+                ));
+            }
+            check_not_packed(*ty, "mad")?;
+
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
             let src_b_typed = ctx.resolve_operand_typed(src_b)?;
@@ -2085,13 +2256,21 @@ fn lower_mad(
             )?;
         }
         MadInstr::Float {
+            // Rounding mode and subnormal flushing don't apply over the reals.
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
             ty,
             dst,
             src_a,
             src_b,
             src_c,
-            ..
         } => {
+            if *sat {
+                return Err(unsupported("mad.f", ".sat modifier"));
+            }
+            check_not_packed(*ty, "mad")?;
+
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
             let src_b_typed = ctx.resolve_operand_typed(src_b)?;
@@ -2122,74 +2301,101 @@ fn lower_fma(
     fma: &FmaInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
-    let (ty, instr_name, dst, src_a, src_b, src_c) = match fma {
+    // In every accepted arm the rounding mode (and ftz, where present) is
+    // ignorable: floats are reals here, so the fused multiply-add is exact.
+    let (ty, src_ty, instr_name, dst, src_a, src_b, src_c) = match fma {
         FmaInstr::Float32 {
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
             dst,
             src_a,
             src_b,
             src_c,
-            ..
-        } => (ScalarType::F32, "fma.rn.f32", dst, src_a, src_b, src_c),
-        FmaInstr::Float32x2 {
-            dst,
-            src_a,
-            src_b,
-            src_c,
-            ..
-        } => (ScalarType::F32x2, "fma.rn.f32x2", dst, src_a, src_b, src_c),
+        } => {
+            if *sat {
+                return Err(unsupported("fma.rn.f32", ".sat modifier"));
+            }
+            let ty = ScalarType::F32;
+            (ty, ty, "fma.rn.f32", dst, src_a, src_b, src_c)
+        }
+        FmaInstr::Float32x2 { .. } => {
+            return Err(unsupported(
+                "fma.rn.f32x2",
+                "packed SIMD arithmetic on F32x2",
+            ));
+        }
         FmaInstr::Float64 {
+            rnd: _rnd,
             dst,
             src_a,
             src_b,
             src_c,
-            ..
-        } => (ScalarType::F64, "fma.rn.f64", dst, src_a, src_b, src_c),
+        } => {
+            let ty = ScalarType::F64;
+            (ty, ty, "fma.rn.f64", dst, src_a, src_b, src_c)
+        }
         FmaInstr::HalfF16Sat {
+            rnd: _rnd,
+            ftz: _ftz,
+            sat,
             ty,
             dst,
             src_a,
             src_b,
             src_c,
-            ..
-        } => (*ty, "fma.rn.sat.f16", dst, src_a, src_b, src_c),
-        FmaInstr::HalfF16Relu {
-            ty,
-            dst,
-            src_a,
-            src_b,
-            src_c,
-            ..
-        } => (*ty, "fma.rn.relu.f16", dst, src_a, src_b, src_c),
+        } => {
+            // sat==false is the plain scalar f16 fma; only .sat is rejected.
+            if *sat {
+                return Err(unsupported("fma.rn.f16", ".sat modifier"));
+            }
+            check_not_packed(*ty, "fma")?;
+            (*ty, *ty, "fma.rn.f16", dst, src_a, src_b, src_c)
+        }
+        FmaInstr::HalfF16Relu { .. } => {
+            return Err(unsupported("fma.rn.f16", ".relu modifier"));
+        }
         FmaInstr::HalfBf16 {
+            rnd: _rnd,
+            relu,
             ty,
             dst,
             src_a,
             src_b,
             src_c,
-            ..
-        } => (*ty, "fma.rn.bf16", dst, src_a, src_b, src_c),
-        FmaInstr::Oob {
-            ty,
-            dst,
-            src_a,
-            src_b,
-            src_c,
-            ..
-        } => (*ty, "fma.rn.oob", dst, src_a, src_b, src_c),
+        } => {
+            if *relu {
+                return Err(unsupported("fma.rn.bf16", ".relu modifier"));
+            }
+            check_not_packed(*ty, "fma")?;
+            (*ty, *ty, "fma.rn.bf16", dst, src_a, src_b, src_c)
+        }
+        FmaInstr::Oob { .. } => {
+            return Err(unsupported("fma.rn.oob", ".oob modifier"));
+        }
         FmaInstr::MixedPrecision {
+            rnd: _rnd,
+            sat,
+            src_type,
             dst,
             src_a,
             src_b,
             src_c,
-            ..
-        } => (
-            ScalarType::F32,
-            "fma.rn.f32 (mixed)",
-            dst,
-            src_a,
-            src_b,
-            src_c,
-        ),
+        } => {
+            if *sat {
+                return Err(unsupported("fma.rn.f32 (mixed)", ".sat modifier"));
+            }
+            check_not_packed(*src_type, "fma (mixed)")?;
+            (
+                ScalarType::F32,
+                *src_type,
+                "fma.rn.f32 (mixed)",
+                dst,
+                src_a,
+                src_b,
+                src_c,
+            )
+        }
     };
 
     let dst_typed = ctx.resolve_dst_typed(dst)?;
@@ -2197,18 +2403,12 @@ fn lower_fma(
     let src_b_typed = ctx.resolve_operand_typed(src_b)?;
     let src_c_typed = ctx.resolve_operand_typed(src_c)?;
 
-    // For mixed precision FMA, sources are f16, destination is f32
-    if matches!(fma, FmaInstr::MixedPrecision { .. }) {
-        ctx.check_dst_type(&dst_typed, ScalarType::F32, instr_name)?;
-        ctx.check_operand_type(&src_a_typed, ScalarType::F16, instr_name)?;
-        ctx.check_operand_type(&src_b_typed, ScalarType::F16, instr_name)?;
-        ctx.check_operand_type(&src_c_typed, ScalarType::F32, instr_name)?;
-    } else {
-        ctx.check_dst_type(&dst_typed, ty, instr_name)?;
-        ctx.check_operand_type(&src_a_typed, ty, instr_name)?;
-        ctx.check_operand_type(&src_b_typed, ty, instr_name)?;
-        ctx.check_operand_type(&src_c_typed, ty, instr_name)?;
-    }
+    // For mixed precision FMA, the multiplicands are half precision while
+    // the accumulator and destination are f32; otherwise all agree with ty.
+    ctx.check_dst_type(&dst_typed, ty, instr_name)?;
+    ctx.check_operand_type(&src_a_typed, src_ty, instr_name)?;
+    ctx.check_operand_type(&src_b_typed, src_ty, instr_name)?;
+    ctx.check_operand_type(&src_c_typed, ty, instr_name)?;
 
     ctx.emit(
         LoweredInstr::Fma {
@@ -2228,6 +2428,8 @@ fn lower_div(
     div: &DivInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
+    // rnd/ftz and the approx/full/ieee precision split are ignorable: floats
+    // are reals here, so every division is exact.
     let (ty, instr_name, dst, src_a, src_b) = match div {
         DivInstr::Integer {
             ty,
@@ -2236,17 +2438,24 @@ fn lower_div(
             src_b,
         } => (*ty, "div", dst, src_a, src_b),
         DivInstr::Approx {
-            dst, src_a, src_b, ..
+            ftz: _ftz,
+            dst,
+            src_a,
+            src_b,
         } => (ScalarType::F32, "div.approx.f32", dst, src_a, src_b),
         DivInstr::Full {
-            dst, src_a, src_b, ..
+            ftz: _ftz,
+            dst,
+            src_a,
+            src_b,
         } => (ScalarType::F32, "div.full.f32", dst, src_a, src_b),
         DivInstr::Ieee {
+            rnd: _rnd,
+            ftz: _ftz,
             ty,
             dst,
             src_a,
             src_b,
-            ..
         } => (*ty, "div.rn", dst, src_a, src_b),
     };
 
@@ -2276,13 +2485,24 @@ fn lower_neg(
     neg: &NegInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
+    // ftz is ignorable: subnormal flushing doesn't apply over the reals.
     let (ty, instr_name, dst, src) = match neg {
         NegInstr::Integer { ty, dst, src } => (*ty, "neg", dst, src),
-        NegInstr::Float32 { dst, src, .. } => (ScalarType::F32, "neg.f32", dst, src),
+        NegInstr::Float32 {
+            ftz: _ftz,
+            dst,
+            src,
+        } => (ScalarType::F32, "neg.f32", dst, src),
         NegInstr::Float64 { dst, src } => (ScalarType::F64, "neg.f64", dst, src),
-        NegInstr::HalfF16 { ty, dst, src, .. } => (*ty, "neg.f16", dst, src),
+        NegInstr::HalfF16 {
+            ftz: _ftz,
+            ty,
+            dst,
+            src,
+        } => (*ty, "neg.f16", dst, src),
         NegInstr::HalfBf16 { ty, dst, src } => (*ty, "neg.bf16", dst, src),
     };
+    check_not_packed(ty, instr_name)?;
 
     let dst_typed = ctx.resolve_dst_typed(dst)?;
     let src_typed = ctx.resolve_operand_typed(src)?;
@@ -2307,13 +2527,24 @@ fn lower_abs(
     abs: &AbsInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
+    // ftz is ignorable: subnormal flushing doesn't apply over the reals.
     let (ty, instr_name, dst, src) = match abs {
         AbsInstr::Integer { ty, dst, src } => (*ty, "abs", dst, src),
-        AbsInstr::Float32 { dst, src, .. } => (ScalarType::F32, "abs.f32", dst, src),
+        AbsInstr::Float32 {
+            ftz: _ftz,
+            dst,
+            src,
+        } => (ScalarType::F32, "abs.f32", dst, src),
         AbsInstr::Float64 { dst, src } => (ScalarType::F64, "abs.f64", dst, src),
-        AbsInstr::HalfF16 { ty, dst, src, .. } => (*ty, "abs.f16", dst, src),
+        AbsInstr::HalfF16 {
+            ftz: _ftz,
+            ty,
+            dst,
+            src,
+        } => (*ty, "abs.f16", dst, src),
         AbsInstr::HalfBf16 { ty, dst, src } => (*ty, "abs.bf16", dst, src),
     };
+    check_not_packed(ty, instr_name)?;
 
     let dst_typed = ctx.resolve_dst_typed(dst)?;
     let src_typed = ctx.resolve_operand_typed(src)?;
@@ -2361,6 +2592,27 @@ fn lower_float_unary(
     Ok(())
 }
 
+/// Reject the float min/max modifiers we do not model. `.NaN` changes the
+/// NaN-propagation contract (meaningless over the reals but a semantic claim
+/// nonetheless), `.xorsign.abs`/`.abs` change the computed value outright.
+fn reject_minmax_modifiers(
+    instruction: &str,
+    nan: bool,
+    xorsign_abs: bool,
+    abs: bool,
+) -> LowerResult<()> {
+    if nan {
+        return Err(unsupported(instruction, ".NaN modifier"));
+    }
+    if xorsign_abs {
+        return Err(unsupported(instruction, ".xorsign.abs modifier"));
+    }
+    if abs {
+        return Err(unsupported(instruction, ".abs modifier"));
+    }
+    Ok(())
+}
+
 fn lower_min(
     ctx: &mut LoweringContext,
     min: &MinInstr,
@@ -2374,34 +2626,62 @@ fn lower_min(
             src_b,
         } => (*ty, "min", dst, src_a, src_b),
         MinInstr::IntegerRelu {
+            relu,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        } => (*ty, "min.relu", dst, src_a, src_b),
+        } => {
+            if *relu {
+                return Err(unsupported("min", ".relu modifier"));
+            }
+            (*ty, "min", dst, src_a, src_b)
+        }
         MinInstr::Float32 {
-            dst, src_a, src_b, ..
-        } => (ScalarType::F32, "min.f32", dst, src_a, src_b),
-        MinInstr::Float32Acc {
-            dst, src_a, src_b, ..
-        } => (ScalarType::F32, "min.f32", dst, src_a, src_b),
+            // ftz is ignorable: subnormal flushing doesn't apply over the reals.
+            ftz: _ftz,
+            nan,
+            xorsign_abs,
+            abs,
+            dst,
+            src_a,
+            src_b,
+        } => {
+            reject_minmax_modifiers("min.f32", *nan, *xorsign_abs, *abs)?;
+            (ScalarType::F32, "min.f32", dst, src_a, src_b)
+        }
+        MinInstr::Float32Acc { .. } => {
+            return Err(unsupported("min.f32", "3-input min"));
+        }
         MinInstr::Float64 { dst, src_a, src_b } => (ScalarType::F64, "min.f64", dst, src_a, src_b),
         MinInstr::HalfF16 {
+            // ftz is ignorable: subnormal flushing doesn't apply over the reals.
+            ftz: _ftz,
+            nan,
+            xorsign_abs,
+            abs,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        } => (*ty, "min.f16", dst, src_a, src_b),
+        } => {
+            reject_minmax_modifiers("min.f16", *nan, *xorsign_abs, *abs)?;
+            (*ty, "min.f16", dst, src_a, src_b)
+        }
         MinInstr::HalfBf16 {
+            nan,
+            xorsign_abs,
+            abs,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        } => (*ty, "min.bf16", dst, src_a, src_b),
+        } => {
+            reject_minmax_modifiers("min.bf16", *nan, *xorsign_abs, *abs)?;
+            (*ty, "min.bf16", dst, src_a, src_b)
+        }
     };
+    check_not_packed(ty, instr_name)?;
 
     let dst_typed = ctx.resolve_dst_typed(dst)?;
     let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -2437,34 +2717,62 @@ fn lower_max(
             src_b,
         } => (*ty, "max", dst, src_a, src_b),
         MaxInstr::IntegerRelu {
+            relu,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        } => (*ty, "max.relu", dst, src_a, src_b),
+        } => {
+            if *relu {
+                return Err(unsupported("max", ".relu modifier"));
+            }
+            (*ty, "max", dst, src_a, src_b)
+        }
         MaxInstr::Float32 {
-            dst, src_a, src_b, ..
-        } => (ScalarType::F32, "max.f32", dst, src_a, src_b),
-        MaxInstr::Float32Acc {
-            dst, src_a, src_b, ..
-        } => (ScalarType::F32, "max.f32", dst, src_a, src_b),
+            // ftz is ignorable: subnormal flushing doesn't apply over the reals.
+            ftz: _ftz,
+            nan,
+            xorsign_abs,
+            abs,
+            dst,
+            src_a,
+            src_b,
+        } => {
+            reject_minmax_modifiers("max.f32", *nan, *xorsign_abs, *abs)?;
+            (ScalarType::F32, "max.f32", dst, src_a, src_b)
+        }
+        MaxInstr::Float32Acc { .. } => {
+            return Err(unsupported("max.f32", "3-input max"));
+        }
         MaxInstr::Float64 { dst, src_a, src_b } => (ScalarType::F64, "max.f64", dst, src_a, src_b),
         MaxInstr::HalfF16 {
+            // ftz is ignorable: subnormal flushing doesn't apply over the reals.
+            ftz: _ftz,
+            nan,
+            xorsign_abs,
+            abs,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        } => (*ty, "max.f16", dst, src_a, src_b),
+        } => {
+            reject_minmax_modifiers("max.f16", *nan, *xorsign_abs, *abs)?;
+            (*ty, "max.f16", dst, src_a, src_b)
+        }
         MaxInstr::HalfBf16 {
+            nan,
+            xorsign_abs,
+            abs,
             ty,
             dst,
             src_a,
             src_b,
-            ..
-        } => (*ty, "max.bf16", dst, src_a, src_b),
+        } => {
+            reject_minmax_modifiers("max.bf16", *nan, *xorsign_abs, *abs)?;
+            (*ty, "max.bf16", dst, src_a, src_b)
+        }
     };
+    check_not_packed(ty, instr_name)?;
 
     let dst_typed = ctx.resolve_dst_typed(dst)?;
     let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -2495,13 +2803,18 @@ fn lower_setp(
     match setp {
         SetpInstr::Simple {
             cmp_op,
+            // ftz is ignorable: subnormal flushing doesn't apply over the reals.
+            ftz: _ftz,
             ty,
             dst_p,
-            dst_q: _, // Second predicate destination ignored for now
+            dst_q,
             src_a,
             src_b,
-            ..
         } => {
+            if dst_q.is_some() {
+                return Err(unsupported("setp", "dual predicate destination p|q"));
+            }
+
             // Destination is a predicate register
             let dst_typed = ctx.resolve_dst_typed(dst_p)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -2524,37 +2837,80 @@ fn lower_setp(
                 predicate,
             )?;
         }
-        SetpInstr::WithBoolOp {
-            cmp_op,
-            ty,
-            dst_p,
-            dst_q: _, // Second predicate destination ignored for now
-            src_a,
-            src_b,
-            ..
-        } => {
-            // Boolean combination not yet implemented
-            let dst_typed = ctx.resolve_dst_typed(dst_p)?;
-            let src_a_typed = ctx.resolve_operand_typed(src_a)?;
-            let src_b_typed = ctx.resolve_operand_typed(src_b)?;
-
-            ctx.check_dst_type(&dst_typed, ScalarType::Pred, "setp")?;
-            ctx.check_operand_type(&src_a_typed, *ty, "setp")?;
-            ctx.check_operand_type(&src_b_typed, *ty, "setp")?;
-
-            ctx.emit(
-                LoweredInstr::Setp {
-                    cmp: ctx.convert_cmp_op(*cmp_op),
-                    dst: dst_typed.reg,
-                    src_a: src_a_typed.operand,
-                    src_b: src_b_typed.operand,
-                    ty: *ty,
-                },
-                predicate,
-            )?;
+        SetpInstr::WithBoolOp { .. } => {
+            return Err(unsupported(
+                "setp",
+                "boolean-combine modifier (.and/.or/.xor)",
+            ));
         }
     }
     Ok(())
+}
+
+/// Check the ordering/system qualifiers shared by `ld` and `st`. `.weak` is
+/// the default and `.volatile` only forbids caching/reordering optimizations,
+/// neither of which the interpreter performs, so both are sound to accept;
+/// everything else is an unmodeled synchronization/system semantic.
+fn check_mem_access_qualifiers(
+    instruction: &str,
+    semantics: MemSemantics,
+    scope: Option<ast::MemScope>,
+    space_qualifier: Option<ast::StateSpaceQualifier>,
+    mmio: bool,
+) -> LowerResult<()> {
+    match semantics {
+        MemSemantics::Weak | MemSemantics::Volatile => {}
+        MemSemantics::Relaxed | MemSemantics::Acquire | MemSemantics::Release => {
+            return Err(unsupported(
+                instruction,
+                format!(
+                    "memory-ordering qualifier {:?} (atomic protocols are not modeled)",
+                    semantics
+                ),
+            ));
+        }
+    }
+    if let Some(scope) = scope {
+        return Err(unsupported(
+            instruction,
+            format!("memory scope qualifier {:?}", scope),
+        ));
+    }
+    if let Some(q) = space_qualifier {
+        return Err(unsupported(
+            instruction,
+            format!("::-qualified state space ({:?})", q),
+        ));
+    }
+    if mmio {
+        return Err(unsupported(instruction, ".mmio modifier"));
+    }
+    Ok(())
+}
+
+/// Check that the `.vN` width modifier and the operand shape agree; the
+/// emitted access width is taken from the operand's register list, so a
+/// mismatch would silently access the wrong number of elements.
+fn check_vec_arity(
+    instruction: &str,
+    vec: Option<VecWidth>,
+    operand: &AstOperand,
+) -> LowerResult<()> {
+    let ok = match (vec, operand) {
+        (Some(v), AstOperand::Vector(elements)) => v.count() as usize == elements.len(),
+        (Some(_), _) => false,
+        (None, AstOperand::Vector(_)) => false,
+        (None, _) => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(LowerError::InvalidOperand {
+            instruction: instruction.to_string(),
+            operand: format!("{:?}", operand),
+            reason: "the .vN width modifier must match the vector operand's register count",
+        })
+    }
 }
 
 fn lower_load(
@@ -2562,42 +2918,67 @@ fn lower_load(
     ld: &LdInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
+    // Destructure exhaustively so a new field cannot be dropped silently.
+    let LdInstr {
+        semantics,
+        scope,
+        space,
+        space_qualifier,
+        // Cache-behavior hints only; the loaded value is unaffected.
+        cache_op: _cache_op,
+        vec,
+        l1_eviction: _l1_eviction,
+        l2_eviction: _l2_eviction,
+        // Non-coherent load: a cache-coherence hint, same loaded value.
+        nc: _nc,
+        mmio,
+        unified,
+        ty,
+        dst,
+        addr,
+    } = ld;
+    check_mem_access_qualifiers("ld", *semantics, *scope, *space_qualifier, *mmio)?;
+    if *unified {
+        return Err(unsupported("ld", ".unified modifier"));
+    }
+
     // Param-space loads read either a kernel parameter or a block-scope
     // `.param` slot (the callseq idiom); both are handled symbolically
     // rather than as memory accesses.
-    if ld.space == Some(StateSpace::Param) {
+    if *space == Some(StateSpace::Param) {
         return lower_param_load(ctx, ld, predicate);
     }
 
     // Resolve the address operand
-    let (base, offset) = match &ld.addr {
+    let (base, offset) = match addr {
         AstOperand::Address(addr) => {
             let base = ctx.resolve_address(addr)?;
             let offset = ctx.get_address_offset(addr);
             (base, offset)
         }
         _ => {
-            let base = ctx.resolve_operand(&ld.addr)?;
+            let base = ctx.resolve_operand(addr)?;
             (base, 0)
         }
     };
 
-    let space = ctx.convert_space(ld.space);
-    let instr_name = format!("ld.{:?}", ld.ty);
+    let space = ctx.convert_space(*space, "ld")?;
+    let instr_name = format!("ld.{:?}", ty);
+    check_vec_arity("ld", *vec, dst)?;
 
     // Check if destination is a vector (e.g., {%f1, %f2, %f3, %f4})
-    match &ld.dst {
+    match dst {
         AstOperand::Vector(_) => {
             // Vector load - emit LoadVec
             // For vectors, we'd need to check each element, but for now just resolve
-            let dst_regs = ctx.resolve_dst_vector(&ld.dst)?;
+            let dst_regs = ctx.resolve_dst_vector(dst)?;
             ctx.emit(
                 LoweredInstr::LoadVec {
                     dst: dst_regs,
                     space,
                     base,
                     offset,
-                    ty: ld.ty,
+                    ty: *ty,
                 },
                 predicate,
             )?;
@@ -2605,8 +2986,8 @@ fn lower_load(
         _ => {
             // Single register load - use relaxed type checking (PTX 9.4.1)
             // Destination can be wider than instruction type (value is extended)
-            let dst_typed = ctx.resolve_dst_typed(&ld.dst)?;
-            ctx.check_dst_type_relaxed(&dst_typed, ld.ty, &instr_name)?;
+            let dst_typed = ctx.resolve_dst_typed(dst)?;
+            ctx.check_dst_type_relaxed(&dst_typed, *ty, &instr_name)?;
 
             ctx.emit(
                 LoweredInstr::Load {
@@ -2614,7 +2995,7 @@ fn lower_load(
                     space,
                     base,
                     offset,
-                    ty: ld.ty,
+                    ty: *ty,
                 },
                 predicate,
             )?;
@@ -2628,39 +3009,58 @@ fn lower_store(
     st: &StInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
+    // Destructure exhaustively so a new field cannot be dropped silently.
+    let StInstr {
+        semantics,
+        scope,
+        space,
+        space_qualifier,
+        // Cache-behavior hints only; the stored value is unaffected.
+        cache_op: _cache_op,
+        vec,
+        l1_eviction: _l1_eviction,
+        l2_eviction: _l2_eviction,
+        mmio,
+        ty,
+        addr,
+        src,
+    } = st;
+    check_mem_access_qualifiers("st", *semantics, *scope, *space_qualifier, *mmio)?;
+
     // Param-space stores write a block-scope `.param` slot (callseq idiom)
-    if st.space == Some(StateSpace::Param) {
+    if *space == Some(StateSpace::Param) {
         return lower_param_store(ctx, st, predicate);
     }
 
     // Resolve the address operand
-    let (base, offset) = match &st.addr {
+    let (base, offset) = match addr {
         AstOperand::Address(addr) => {
             let base = ctx.resolve_address(addr)?;
             let offset = ctx.get_address_offset(addr);
             (base, offset)
         }
         _ => {
-            let base = ctx.resolve_operand(&st.addr)?;
+            let base = ctx.resolve_operand(addr)?;
             (base, 0)
         }
     };
 
-    let space = ctx.convert_space(st.space);
-    let instr_name = format!("st.{:?}", st.ty);
+    let space = ctx.convert_space(*space, "st")?;
+    let instr_name = format!("st.{:?}", ty);
+    check_vec_arity("st", *vec, src)?;
 
     // Check if source is a vector (e.g., {%f1, %f2, %f3, %f4})
-    if let AstOperand::Vector(_) = &st.src {
+    if let AstOperand::Vector(_) = src {
         // Vector store - emit StoreVec
         // For vectors, we'd need to check each element, but for now just resolve
-        let src_regs = ctx.resolve_dst_vector(&st.src)?;
+        let src_regs = ctx.resolve_dst_vector(src)?;
         ctx.emit(
             LoweredInstr::StoreVec {
                 space,
                 base,
                 offset,
                 src: src_regs,
-                ty: st.ty,
+                ty: *ty,
             },
             predicate,
         )?;
@@ -2669,8 +3069,8 @@ fn lower_store(
 
     // Single register store - use relaxed type checking (PTX 9.4.1)
     // Source can be wider than instruction type (value is truncated)
-    let src_typed = ctx.resolve_operand_typed(&st.src)?;
-    ctx.check_operand_type_relaxed(&src_typed, st.ty, &instr_name)?;
+    let src_typed = ctx.resolve_operand_typed(src)?;
+    ctx.check_operand_type_relaxed(&src_typed, *ty, &instr_name)?;
 
     ctx.emit(
         LoweredInstr::Store {
@@ -2678,7 +3078,7 @@ fn lower_store(
             base,
             offset,
             src: src_typed.operand,
-            ty: st.ty,
+            ty: *ty,
         },
         predicate,
     )?;
@@ -2797,7 +3197,14 @@ fn lower_call(
     call: &CallInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
-    let target_name = match &call.target {
+    // .uni is a divergence hint; it does not change what the call does.
+    let CallInstr {
+        uniform: _uniform,
+        return_operands,
+        target,
+        arguments,
+    } = call;
+    let target_name = match target {
         AstOperand::Ident(name) => name.to_string(),
         other => {
             return Err(LowerError::UnsupportedInstruction {
@@ -2819,13 +3226,13 @@ fn lower_call(
         });
     }
 
-    let [arg] = call.arguments.as_slice() else {
+    let [arg] = arguments.as_slice() else {
         return Err(LowerError::UnsupportedInstruction {
             instruction: format!("call {}", target_name),
             reason: Some("__symexpf takes exactly one argument".to_string()),
         });
     };
-    let [ret] = call.return_operands.as_slice() else {
+    let [ret] = return_operands.as_slice() else {
         return Err(LowerError::UnsupportedInstruction {
             instruction: format!("call {}", target_name),
             reason: Some("__symexpf returns exactly one value".to_string()),
@@ -2869,12 +3276,45 @@ fn lower_cvt(
 ) -> LowerResult<()> {
     match cvt {
         CvtInstr::Standard {
+            rnd,
+            // ftz is ignorable: subnormal flushing doesn't apply over the reals.
+            ftz: _ftz,
+            sat,
+            relu,
+            satfinite,
             dst_type,
             src_type,
             dst,
             src,
-            ..
         } => {
+            if *sat {
+                return Err(unsupported("cvt", ".sat modifier"));
+            }
+            if *relu {
+                return Err(unsupported("cvt", ".relu modifier"));
+            }
+            if *satfinite {
+                return Err(unsupported("cvt", ".satfinite modifier"));
+            }
+            match rnd {
+                // Float rounding modes are ignorable: floats are reals here,
+                // and float<->float conversion is the identity (the paper's
+                // documented abstraction).
+                None | Some(CvtRounding::Float(_)) => {}
+                Some(CvtRounding::Integer(_)) => {
+                    return Err(unsupported(
+                        "cvt",
+                        "integer-rounding modifier (floor/ceil/trunc/rint not modeled)",
+                    ));
+                }
+                Some(CvtRounding::Stochastic) => {
+                    return Err(unsupported("cvt", ".rs stochastic-rounding modifier"));
+                }
+                Some(CvtRounding::Rna) => {
+                    return Err(unsupported("cvt", ".rna rounding modifier"));
+                }
+            }
+
             let dst = ctx.resolve_dst(dst)?;
             let src = ctx.resolve_operand(src)?;
             ctx.emit(
@@ -2887,26 +3327,11 @@ fn lower_cvt(
                 predicate,
             )?;
         }
-        CvtInstr::Pack {
-            dst_type,
-            src_type,
-            dst,
-            src_a,
-            src_b: _, // Second source operand ignored for simplified version
-            ..
-        } => {
-            // Pack conversion - emit simplified version
-            let dst = ctx.resolve_dst(dst)?;
-            let src = ctx.resolve_operand(src_a)?;
-            ctx.emit(
-                LoweredInstr::Cvt {
-                    dst,
-                    src,
-                    dst_ty: *dst_type,
-                    src_ty: *src_type,
-                },
-                predicate,
-            )?;
+        CvtInstr::Pack { .. } => {
+            return Err(unsupported(
+                "cvt.pack",
+                "pack conversion (two-source packing)",
+            ));
         }
     }
     Ok(())
@@ -2961,13 +3386,19 @@ fn lower_branch(
     bra: &BraInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
+    // .uni is a divergence hint; it does not change where the branch goes.
+    let BraInstr {
+        uniform: _uniform,
+        target,
+    } = bra;
+
     // Get target label
-    let target_name = match &bra.target {
+    let target_name = match target {
         AstOperand::Symbol(name) => name.to_string(),
         AstOperand::Ident(name) => name.to_string(), // Labels are parsed as identifiers
         _ => {
             return Err(LowerError::InvalidBranchTarget {
-                target: format!("{:?}", bra.target),
+                target: format!("{:?}", target),
             });
         }
     };
@@ -2991,36 +3422,61 @@ fn lower_bar(
     bar: &BarInstr,
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
-    // Get barrier ID from first operand
-    let barrier_id = match bar.operands.first() {
-        Some(AstOperand::ImmInt(v)) => *v as u32,
-        Some(AstOperand::ImmUInt(v)) => *v as u32,
-        _ => 0, // Default barrier
+    let BarInstr { mode, operands } = bar;
+    match mode {
+        BarMode::Sync => {}
+        // bar.arrive does not block the arriving thread; emitting a blocking
+        // sync in its place would invent synchronization that isn't there.
+        BarMode::Arrive => return Err(unsupported("bar.arrive", "non-blocking barrier arrival")),
+        // bar.red also produces a reduction value in its destination.
+        BarMode::Red => return Err(unsupported("bar.red", "reduction barrier")),
+    }
+
+    // The barrier id must be a concrete immediate: barriers are identified
+    // per-id at evaluation time, so a register id cannot be resolved here.
+    let barrier_id = match operands.as_slice() {
+        [] => {
+            return Err(unsupported(
+                "bar.sync",
+                "missing barrier id operand (an immediate 0-15 is required)",
+            ));
+        }
+        [id, ..] => match id {
+            AstOperand::ImmInt(v) if (0..=15).contains(v) => *v as u32,
+            AstOperand::ImmUInt(v) if *v <= 15 => *v as u32,
+            AstOperand::ImmInt(_) | AstOperand::ImmUInt(_) => {
+                return Err(LowerError::InvalidOperand {
+                    instruction: "bar.sync".to_string(),
+                    operand: format!("{:?}", id),
+                    reason: "barrier id must be in 0-15",
+                });
+            }
+            other => {
+                return Err(unsupported(
+                    "bar.sync",
+                    format!("register barrier id ({:?})", other),
+                ));
+            }
+        },
     };
 
-    match bar.mode {
-        BarMode::Sync => {
-            if bar.operands.len() > 1 {
-                // bar.sync with thread count
-                let thread_count = ctx.resolve_operand(&bar.operands[1])?;
-                ctx.emit(
-                    LoweredInstr::BarSyncCount {
-                        barrier_id,
-                        thread_count,
-                    },
-                    predicate,
-                )?;
-            } else {
-                ctx.emit(LoweredInstr::BarSync { barrier_id }, predicate)?;
-            }
+    match operands.len() {
+        1 => ctx.emit(LoweredInstr::BarSync { barrier_id }, predicate)?,
+        // The partial-CTA counted form synchronizes only `b` threads; the
+        // evaluator's barrier rule is full-CTA, so lowering it as a plain
+        // sync would be wrong. Rejected here rather than at evaluation.
+        2 => {
+            return Err(unsupported(
+                "bar.sync",
+                "thread-count operand (bar.sync a, b)",
+            ));
         }
-        BarMode::Arrive => {
-            // bar.arrive - just emit sync for now
-            ctx.emit(LoweredInstr::BarSync { barrier_id }, predicate)?;
-        }
-        BarMode::Red => {
-            // bar.red - reduction barrier, emit sync
-            ctx.emit(LoweredInstr::BarSync { barrier_id }, predicate)?;
+        _ => {
+            return Err(LowerError::InvalidOperand {
+                instruction: "bar.sync".to_string(),
+                operand: format!("{:?}", operands),
+                reason: "bar.sync takes one barrier-id operand",
+            });
         }
     }
     Ok(())
@@ -3034,23 +3490,46 @@ fn lower_ld_global_nc(
     operands: &[AstOperand],
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
-    // Parse modifiers to get type
-    // Modifiers are like ["v4", "u32"] or just ["u32"]
-    // Vector width is inferred from the destination operand
-    let mut elem_type = ScalarType::U32; // default
+    // Exhaustive modifier handling: anything we don't recognize is rejected
+    // by name rather than skipped.
+    let mut elem_type: Option<ScalarType> = None;
+    let mut vec: Option<VecWidth> = None;
 
     for modifier in modifiers {
+        if let DottedIdent::Qualified(parts) = modifier {
+            // L1::/L2:: eviction-priority hints: cache behavior only.
+            if matches!(parts.first(), Some(p) if p.as_bytes() == b"L1" || p.as_bytes() == b"L2") {
+                continue;
+            }
+            return Err(unsupported(
+                "ld.global.nc",
+                format!("modifier .{}", modifier),
+            ));
+        }
         let mod_ascii = modifier.to_ascii_string();
-        // Skip vector modifier (v2, v4) - we determine vector from operand
-        if !mod_ascii.as_bytes().starts_with(b"v")
-            && let Some(ty) = ScalarType::from_ascii(&mod_ascii)
-        {
-            elem_type = ty;
+        match mod_ascii.as_bytes() {
+            // Cache-operation hints: cache behavior only.
+            b"ca" | b"cg" | b"cs" | b"lu" | b"cv" => {}
+            _ => {
+                if let Some(v) = VecWidth::from_ascii(&mod_ascii) {
+                    vec = Some(v);
+                } else if let Some(ty) = ScalarType::from_ascii(&mod_ascii) {
+                    elem_type = Some(ty);
+                } else {
+                    return Err(unsupported(
+                        "ld.global.nc",
+                        format!("modifier .{}", modifier),
+                    ));
+                }
+            }
         }
     }
 
+    let elem_type =
+        elem_type.ok_or_else(|| unsupported("ld.global.nc", "missing type modifier"))?;
+
     // Operands: [destination, address]
-    if operands.len() < 2 {
+    if operands.len() != 2 {
         return Err(LowerError::InvalidOperand {
             instruction: "ld.global.nc".to_string(),
             operand: format!("{:?}", operands),
@@ -3060,6 +3539,7 @@ fn lower_ld_global_nc(
 
     let dst_operand = &operands[0];
     let addr_operand = &operands[1];
+    check_vec_arity("ld.global.nc", vec, dst_operand)?;
 
     // Resolve address
     let (base, offset) = match addr_operand {
@@ -3132,11 +3612,17 @@ fn lower_ldmatrix(
     for modifier in modifiers {
         let s = modifier.to_string();
         match s.as_str() {
+            // The modeled form: ldmatrix.sync.aligned.x{1,2,4}[.trans].m8n8.shared.b16
+            "sync" | "aligned" | "shared" | "m8n8" | "b16" => {}
             "trans" => trans = true,
             "x1" => num = Some(1),
             "x2" => num = Some(2),
             "x4" => num = Some(4),
-            _ => {}
+            // Everything else (m8n16, m16n16, b8, shared::cta, dst/src
+            // format types, ...) selects an unmodeled fragment layout.
+            other => {
+                return Err(unsupported("ldmatrix", format!("modifier .{}", other)));
+            }
         }
     }
 
@@ -3181,12 +3667,18 @@ fn lower_mma(
 
     for modifier in modifiers {
         let s = modifier.to_string();
-        if let Some(sh) = MmaShape::parse(&s) {
+        if s == "sync" || s == "aligned" {
+            // The modeled execution mode.
+        } else if let Some(sh) = MmaShape::parse(&s) {
             shape = Some(sh);
         } else if let Some(layout) = MmaLayout::parse(&s) {
             layouts.push(layout);
         } else if let Some(ty) = parse_scalar_type_modifier(modifier) {
             types.push(ty);
+        } else {
+            // Everything else (.sp sparsity, .satfinite, b1 ops, ...) is an
+            // unmodeled variant.
+            return Err(unsupported("mma", format!("modifier .{}", s)));
         }
     }
 
@@ -3195,7 +3687,7 @@ fn lower_mma(
         reason: Some("missing shape modifier (e.g., m16n8k16)".to_string()),
     })?;
 
-    if layouts.len() < 2 {
+    if layouts.len() != 2 {
         return Err(LowerError::UnsupportedInstruction {
             instruction: "mma".to_string(),
             reason: Some(format!(
@@ -3205,7 +3697,7 @@ fn lower_mma(
         });
     }
 
-    if types.len() < 4 {
+    if types.len() != 4 {
         return Err(LowerError::UnsupportedInstruction {
             instruction: "mma".to_string(),
             reason: Some(format!(
@@ -3213,6 +3705,25 @@ fn lower_mma(
                 types.len()
             )),
         });
+    }
+
+    // The evaluator gathers f16 multiplicand fragments and f32 accumulators;
+    // any other type combination would be executed with the wrong layout.
+    if types
+        != [
+            ScalarType::F32,
+            ScalarType::F16,
+            ScalarType::F16,
+            ScalarType::F32,
+        ]
+    {
+        return Err(unsupported(
+            "mma",
+            format!(
+                "type combination {:?} (only .f32.f16.f16.f32 is modeled)",
+                types
+            ),
+        ));
     }
 
     if operands.len() < 4 {
@@ -3266,12 +3777,16 @@ fn lower_wmma_load(
     let mut layout: Option<MmaLayout> = None;
     let mut shape: Option<MmaShape> = None;
     let mut elem_type: Option<ScalarType> = None;
-    let mut space = MemSpace::Global; // PTX default: generic (we treat as global)
+    let mut space: Option<MemSpace> = None;
 
     for modifier in modifiers {
         let s = modifier.to_string();
-        if s == "shared" {
-            space = MemSpace::Shared;
+        if s == "sync" || s == "aligned" {
+            // The modeled execution mode.
+        } else if s == "shared" {
+            space = Some(MemSpace::Shared);
+        } else if s == "global" {
+            space = Some(MemSpace::Global);
         } else if let Some(op) = MmaOperand::parse(&s) {
             operand_kind = Some(op);
         } else if let Some(l) = MmaLayout::parse(&s) {
@@ -3280,8 +3795,19 @@ fn lower_wmma_load(
             shape = Some(sh);
         } else if let Some(ty) = parse_scalar_type_modifier(modifier) {
             elem_type = Some(ty);
+        } else {
+            return Err(unsupported("wmma.load", format!("modifier .{}", s)));
         }
     }
+
+    // Memory spaces have separate address spaces here, so a generic
+    // (spaceless) wmma access cannot be resolved to the right memory.
+    let space = space.ok_or_else(|| {
+        unsupported(
+            "wmma.load",
+            "no explicit state space (generic addressing is not modeled)",
+        )
+    })?;
 
     let operand_kind = operand_kind.ok_or_else(|| LowerError::UnsupportedInstruction {
         instruction: "wmma.load".to_string(),
@@ -3302,6 +3828,37 @@ fn lower_wmma_load(
         instruction: "wmma.load".to_string(),
         reason: Some("missing element type modifier (e.g., f16)".to_string()),
     })?;
+
+    // The evaluator's fragment tables are fixed: f16 multiplicands (b16 raw
+    // bits allowed) and f32 accumulators. Anything else would be read with
+    // the wrong per-lane layout.
+    match operand_kind {
+        MmaOperand::A | MmaOperand::B => {
+            if !matches!(elem_type, ScalarType::F16 | ScalarType::B16) {
+                return Err(unsupported(
+                    "wmma.load",
+                    format!(
+                        "a/b fragment element type {:?} (only f16 is modeled)",
+                        elem_type
+                    ),
+                ));
+            }
+        }
+        MmaOperand::C => {
+            if elem_type != ScalarType::F32 {
+                return Err(unsupported(
+                    "wmma.load",
+                    format!(
+                        "accumulator element type {:?} (only .f32 accumulators are modeled)",
+                        elem_type
+                    ),
+                ));
+            }
+        }
+        MmaOperand::D => {
+            return Err(unsupported("wmma.load", "operand .d (loads are a/b/c)"));
+        }
+    }
 
     if operands.len() < 3 {
         return Err(LowerError::InvalidOperand {
@@ -3341,20 +3898,35 @@ fn lower_wmma_store(
     let mut layout: Option<MmaLayout> = None;
     let mut shape: Option<MmaShape> = None;
     let mut elem_type: Option<ScalarType> = None;
-    let mut space = MemSpace::Global; // PTX default: generic (we treat as global)
+    let mut space: Option<MemSpace> = None;
 
     for modifier in modifiers {
         let s = modifier.to_string();
-        if s == "shared" {
-            space = MemSpace::Shared;
+        if s == "sync" || s == "aligned" || s == "d" {
+            // The modeled execution mode; stores always write the d fragment.
+        } else if s == "shared" {
+            space = Some(MemSpace::Shared);
+        } else if s == "global" {
+            space = Some(MemSpace::Global);
         } else if let Some(l) = MmaLayout::parse(&s) {
             layout = Some(l);
         } else if let Some(sh) = MmaShape::parse(&s) {
             shape = Some(sh);
         } else if let Some(ty) = parse_scalar_type_modifier(modifier) {
             elem_type = Some(ty);
+        } else {
+            return Err(unsupported("wmma.store", format!("modifier .{}", s)));
         }
     }
+
+    // Memory spaces have separate address spaces here, so a generic
+    // (spaceless) wmma access cannot be resolved to the right memory.
+    let space = space.ok_or_else(|| {
+        unsupported(
+            "wmma.store",
+            "no explicit state space (generic addressing is not modeled)",
+        )
+    })?;
 
     let layout = layout.ok_or_else(|| LowerError::UnsupportedInstruction {
         instruction: "wmma.store".to_string(),
@@ -3370,6 +3942,18 @@ fn lower_wmma_store(
         instruction: "wmma.store".to_string(),
         reason: Some("missing element type modifier (e.g., f32)".to_string()),
     })?;
+
+    // The evaluator's d-fragment layout is the fixed f32 accumulator table;
+    // an .f16 accumulator has a different (packed) layout.
+    if elem_type != ScalarType::F32 {
+        return Err(unsupported(
+            "wmma.store",
+            format!(
+                "accumulator element type {:?} (only .f32 accumulators are modeled)",
+                elem_type
+            ),
+        ));
+    }
 
     if operands.len() < 3 {
         return Err(LowerError::InvalidOperand {
@@ -3411,12 +3995,16 @@ fn lower_wmma_mma(
 
     for modifier in modifiers {
         let s = modifier.to_string();
-        if let Some(layout) = MmaLayout::parse(&s) {
+        if s == "sync" || s == "aligned" {
+            // The modeled execution mode.
+        } else if let Some(layout) = MmaLayout::parse(&s) {
             layouts.push(layout);
         } else if let Some(sh) = MmaShape::parse(&s) {
             shape = Some(sh);
         } else if let Some(ty) = parse_scalar_type_modifier(modifier) {
             types.push(ty);
+        } else {
+            return Err(unsupported("wmma.mma", format!("modifier .{}", s)));
         }
     }
 
@@ -3425,7 +4013,7 @@ fn lower_wmma_mma(
         reason: Some("missing shape modifier (e.g., m16n16k16)".to_string()),
     })?;
 
-    if layouts.len() < 2 {
+    if layouts.len() != 2 {
         return Err(LowerError::UnsupportedInstruction {
             instruction: "wmma.mma".to_string(),
             reason: Some(format!(
@@ -3435,7 +4023,7 @@ fn lower_wmma_mma(
         });
     }
 
-    if types.len() < 2 {
+    if types.len() != 2 {
         return Err(LowerError::UnsupportedInstruction {
             instruction: "wmma.mma".to_string(),
             reason: Some(format!(
@@ -3443,6 +4031,15 @@ fn lower_wmma_mma(
                 types.len()
             )),
         });
+    }
+
+    // The evaluator computes f16 multiplicands into f32 accumulators; the
+    // alternate-float forms carry more/other type modifiers.
+    if types != [ScalarType::F32, ScalarType::F32] {
+        return Err(unsupported(
+            "wmma.mma",
+            format!("type combination {:?} (only .f32.f32 is modeled)", types),
+        ));
     }
 
     if operands.len() < 4 {
@@ -3786,5 +4383,278 @@ mod tests {
             hint.contains("bits") || hint.contains("size"),
             "Hint should mention size mismatch"
         );
+    }
+
+    // =========================================================================
+    // Exhaustive-lowering policy tests: unmodeled modifiers/forms error
+    // loudly (naming the modifier), and the modeled forms still lower.
+    // =========================================================================
+
+    /// Parse and lower a kernel whose body is `body`, with a standard set of
+    /// registers declared.
+    fn lower_body(body: &str) -> LowerResult<LoweredProgram> {
+        use volta_frontend::ascii::AsAscii;
+        use volta_frontend::parse::Parser;
+
+        let src = format!(
+            ".version 8.0\n.target sm_80\n.address_size 64\n\n\
+             .visible .entry k()\n{{\n\
+             .reg .pred %p<4>;\n\
+             .reg .b16 %rs<8>;\n\
+             .reg .f32 %f<8>;\n\
+             .reg .b32 %r<8>;\n\
+             .reg .f64 %fd<4>;\n\
+             .reg .b64 %rd<8>;\n\
+             .shared .align 4 .b8 smem[64];\n\
+             {}\n\
+             ret;\n}}\n",
+            body
+        );
+        let ascii = src.as_bytes().as_ascii_slice().expect("ascii source");
+        let module = Parser::new(ascii)
+            .parse_module()
+            .unwrap_or_else(|e| panic!("parse error: {:?}", e.error));
+        let func = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ast::TopLevelItem::Entry(f) => Some(f),
+                _ => None,
+            })
+            .expect("kernel not found");
+        lower_function(func, &[])
+    }
+
+    /// Assert that `body` is rejected with an UnsupportedInstruction whose
+    /// reason mentions `needle`.
+    fn assert_rejected(body: &str, needle: &str) {
+        match lower_body(body) {
+            Err(LowerError::UnsupportedInstruction {
+                instruction,
+                reason,
+            }) => {
+                let text = format!("{} {}", instruction, reason.unwrap_or_default());
+                assert!(
+                    text.contains(needle),
+                    "expected rejection of {:?} to mention {:?}, got {:?}",
+                    body,
+                    needle,
+                    text
+                );
+            }
+            Err(other) => panic!(
+                "expected UnsupportedInstruction for {:?}, got {:?}",
+                body, other
+            ),
+            Ok(_) => panic!("expected {:?} to be rejected, but it lowered", body),
+        }
+    }
+
+    fn assert_lowers(body: &str) {
+        if let Err(e) = lower_body(body) {
+            panic!("expected {:?} to lower, got {:?}", body, e);
+        }
+    }
+
+    #[test]
+    fn test_reject_setp_bool_combine_and_dual_dest() {
+        assert_rejected("setp.lt.and.s32 %p1, %r1, %r2, %p2;", "boolean-combine");
+        assert_rejected("setp.lt.s32 %p1|%p2, %r1, %r2;", "dual predicate");
+        assert_lowers("setp.lt.s32 %p1, %r1, %r2;");
+        assert_lowers("setp.leu.f32 %p1, %f1, %f2;");
+    }
+
+    #[test]
+    fn test_reject_integer_sat() {
+        assert_rejected("add.sat.s32 %r1, %r2, %r3;", ".sat");
+        assert_rejected("sub.sat.s32 %r1, %r2, %r3;", ".sat");
+        assert_rejected("mad.hi.sat.s32 %r1, %r2, %r3, %r4;", ".sat");
+        assert_lowers("add.s32 %r1, %r2, %r3;");
+        assert_lowers("mad.lo.s32 %r1, %r2, %r3, %r4;");
+    }
+
+    #[test]
+    fn test_reject_float_sat_and_accept_rnd_ftz() {
+        assert_rejected("add.sat.f32 %f1, %f2, %f3;", ".sat");
+        assert_rejected("sub.rn.ftz.sat.f32 %f1, %f2, %f3;", ".sat");
+        assert_rejected("mul.sat.f32 %f1, %f2, %f3;", ".sat");
+        assert_rejected("fma.rn.sat.f32 %f1, %f2, %f3, %f4;", ".sat");
+        // Rounding modes and ftz alone are ignorable under the reals model.
+        assert_lowers("add.rn.ftz.f32 %f1, %f2, %f3;");
+        assert_lowers("mul.rn.f32 %f1, %f2, %f3;");
+        assert_lowers("fma.rn.ftz.f32 %f1, %f2, %f3, %f4;");
+        assert_lowers("mul.f16 %rs1, %rs2, %rs3;");
+    }
+
+    #[test]
+    fn test_reject_fma_half_relu_and_oob() {
+        assert_rejected("fma.rn.relu.f16 %rs1, %rs2, %rs3, %rs4;", ".relu");
+        assert_rejected("fma.rn.oob.f16 %rs1, %rs2, %rs3, %rs4;", ".oob");
+        assert_lowers("fma.rn.f16 %rs1, %rs2, %rs3, %rs4;");
+    }
+
+    #[test]
+    fn test_reject_mad_hi_wide_widths_still_lower() {
+        // mad.hi at 64 bits lowers but is rejected at evaluation (interp.rs);
+        // mad.hi at 32 bits is fully supported.
+        assert_lowers("mad.hi.u32 %r1, %r2, %r3, %r4;");
+    }
+
+    #[test]
+    fn test_reject_minmax_modifiers() {
+        assert_rejected("min.NaN.f32 %f1, %f2, %f3;", ".NaN");
+        assert_rejected("max.NaN.f32 %f1, %f2, %f3;", ".NaN");
+        assert_rejected("max.xorsign.abs.f32 %f1, %f2, %f3;", ".xorsign.abs");
+        assert_rejected("min.abs.f32 %f1, %f2, %f3;", ".abs");
+        assert_rejected("max.ftz.f32 %f1, %f2, %f3, %f4;", "3-input");
+        assert_rejected("min.relu.s32 %r1, %r2, %r3;", ".relu");
+        assert_lowers("min.f32 %f1, %f2, %f3;");
+        assert_lowers("max.s32 %r1, %r2, %r3;");
+        assert_lowers("min.ftz.f32 %f1, %f2, %f3;");
+    }
+
+    #[test]
+    fn test_reject_cvt_modifiers_keep_plain_conversions() {
+        assert_rejected("cvt.sat.u32.f32 %r1, %f1;", ".sat");
+        assert_rejected("cvt.rn.relu.f16.f32 %rs1, %f1;", ".relu");
+        assert_rejected("cvt.rmi.f32.f32 %f1, %f2;", "integer-rounding");
+        assert_rejected("cvt.rzi.s32.f32 %r1, %f1;", "integer-rounding");
+        // cvt.pack has its own InstrKind (CvtPack) with no lowering: it hits
+        // the already-loud whole-instruction catch-all. The CvtInstr::Pack
+        // rejection in lower_cvt is fail-closed insurance behind it.
+        assert_rejected("cvt.pack.sat.u16.s32 %r1, %r2, %r3;", "CvtPack");
+        // The corpus-hot conversions must keep lowering.
+        assert_lowers("cvt.rn.f16.f32 %rs1, %f1;");
+        assert_lowers("cvt.f32.f16 %f1, %rs1;");
+        assert_lowers("cvt.u64.u32 %rd1, %r1;");
+        assert_lowers("cvt.s64.s32 %rd1, %r1;");
+        assert_lowers("cvt.u32.u64 %r1, %rd1;");
+    }
+
+    #[test]
+    fn test_reject_packed_simd_arithmetic() {
+        assert_rejected("add.u16x2 %r1, %r2, %r3;", "packed SIMD");
+        assert_rejected("add.rn.f16x2 %r1, %r2, %r3;", "packed SIMD");
+        assert_rejected("sub.rn.bf16x2 %r1, %r2, %r3;", "packed SIMD");
+        assert_rejected("mul.rn.f16x2 %r1, %r2, %r3;", "packed SIMD");
+        assert_rejected("min.s16x2 %r1, %r2, %r3;", "packed SIMD");
+        assert_rejected("max.u16x2 %r1, %r2, %r3;", "packed SIMD");
+        assert_rejected("neg.ftz.f16x2 %r1, %r2;", "packed SIMD");
+        assert_rejected("fma.rn.f16x2 %r1, %r2, %r3, %r4;", "packed SIMD");
+    }
+
+    #[test]
+    fn test_bar_rejections() {
+        assert_rejected("bar.arrive 0, 64;", "bar.arrive");
+        assert_rejected("bar.red 0;", "bar.red");
+        // The full bar.red form fails earlier, at instruction parsing (the
+        // .popc reduction op modifier is not parsed) - also loud.
+        assert_rejected("bar.red.popc.u32 %r1, 0, %p1;", "parsing failed");
+        assert_rejected("bar.sync %r1;", "register barrier id");
+        assert_rejected("bar.sync;", "missing barrier id");
+        assert_rejected("bar.sync 0, 64;", "thread-count");
+        match lower_body("bar.sync 16;") {
+            Err(LowerError::InvalidOperand { .. }) => {}
+            other => panic!(
+                "expected InvalidOperand for out-of-range id, got {:?}",
+                other
+            ),
+        }
+        assert_lowers("bar.sync 0;");
+        assert_lowers("bar.sync 1;");
+    }
+
+    #[test]
+    fn test_reject_generic_ld_st() {
+        assert_rejected("ld.u32 %r1, [%rd1];", "generic");
+        assert_rejected("st.u32 [%rd1], %r1;", "generic");
+        assert_lowers("ld.global.u32 %r1, [%rd1];");
+        assert_lowers("ld.volatile.shared.f32 %f1, [%r1];");
+        assert_lowers("st.volatile.shared.u32 [%r1], %r2;");
+        assert_lowers("ld.global.nc.f32 %f1, [%rd1];");
+        assert_lowers("ld.global.nc.v4.u32 {%r1, %r2, %r3, %r4}, [%rd1];");
+    }
+
+    #[test]
+    fn test_reject_ld_ordering_qualifiers() {
+        assert_rejected("ld.acquire.gpu.global.u32 %r1, [%rd1];", "memory-ordering");
+        assert_rejected("st.release.gpu.global.u32 [%rd1], %r1;", "memory-ordering");
+    }
+
+    #[test]
+    fn test_ldmatrix_modifier_whitelist() {
+        assert_rejected(
+            "ldmatrix.sync.aligned.x4.m8n16.shared.b16 {%r1, %r2, %r3, %r4}, [%r5];",
+            "m8n16",
+        );
+        assert_rejected(
+            "ldmatrix.sync.aligned.x4.m8n8.shared.b8 {%r1, %r2, %r3, %r4}, [%r5];",
+            "b8",
+        );
+        assert_lowers("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%r1, %r2, %r3, %r4}, [%r5];");
+        assert_lowers("ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {%r1, %r2}, [%r5];");
+    }
+
+    #[test]
+    fn test_wmma_requires_space_and_f32_accumulators() {
+        // No state space modifier -> generic addressing, rejected.
+        assert_rejected(
+            "wmma.load.a.sync.aligned.row.m16n16k16.f16 \
+             {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7}, [%r1], %r2;",
+            "state space",
+        );
+        // .f16 accumulator fragments have a different layout.
+        assert_rejected(
+            "wmma.load.c.sync.aligned.row.m16n16k16.shared.f16 \
+             {%r0, %r1, %r2, %r3}, [%r1], %r2;",
+            "accumulator",
+        );
+        assert_rejected(
+            "wmma.store.d.sync.aligned.row.m16n16k16.shared.f16 \
+             [%r1], {%r0, %r1, %r2, %r3}, %r2;",
+            "accumulator",
+        );
+        // The corpus forms still lower.
+        assert_lowers(
+            "wmma.load.a.sync.aligned.row.m16n16k16.shared.f16 \
+             {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7}, [%r1], %r2;",
+        );
+        assert_lowers(
+            "wmma.store.d.sync.aligned.row.m16n16k16.shared.f32 \
+             [%r1], {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, %r2;",
+        );
+        assert_lowers(
+            "wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 \
+             {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, \
+             {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7}, \
+             {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7}, \
+             {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7};",
+        );
+    }
+
+    #[test]
+    fn test_mma_type_combination_checked() {
+        assert_rejected(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 \
+             {%f0, %f1, %f2, %f3}, {%r0, %r1, %r2, %r3}, {%r0, %r1}, {%f0, %f1, %f2, %f3};",
+            "f32.f16.f16.f32",
+        );
+        assert_lowers(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 \
+             {%f0, %f1, %f2, %f3}, {%r0, %r1, %r2, %r3}, {%r0, %r1}, {%f0, %f1, %f2, %f3};",
+        );
+    }
+
+    #[test]
+    fn test_vector_arity_must_match_modifier() {
+        match lower_body("ld.global.v4.u32 {%r1, %r2}, [%rd1];") {
+            Err(LowerError::InvalidOperand { .. }) => {}
+            other => panic!(
+                "expected InvalidOperand for v4/2-reg mismatch, got {:?}",
+                other
+            ),
+        }
+        assert_lowers("ld.global.v2.u32 {%r1, %r2}, [%rd1];");
+        assert_lowers("st.shared.v4.u32 [%r1], {%r2, %r3, %r4, %r5};");
     }
 }

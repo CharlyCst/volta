@@ -34,6 +34,10 @@ pub enum InstrParseError {
         got: usize,
     },
     UnexpectedModifier(AsciiString),
+    /// A `::`-qualified modifier (e.g. `shared::cta`, `L2::cache_hint`) that
+    /// the parser does not understand. These used to be skipped silently,
+    /// which could drop an explicit state space.
+    QualifiedModifier(AsciiString),
     InvalidModifierForType {
         modifier: &'static str,
         ty: ScalarType,
@@ -54,6 +58,7 @@ impl InstrParseError {
             InstrParseError::InvalidTypeForInstruction(_) => "Invalid Type for Instruction",
             InstrParseError::WrongOperandCount { .. } => "Wrong Operand Count",
             InstrParseError::UnexpectedModifier(_) => "Unexpected Modifier",
+            InstrParseError::QualifiedModifier(_) => "Unsupported Qualified Modifier",
             InstrParseError::InvalidModifierForType { .. } => "Invalid Modifier for Type",
             InstrParseError::ModifierRequiresModifier { .. } => "Missing Required Modifier",
         }
@@ -77,6 +82,9 @@ impl InstrParseError {
                 )
             }
             InstrParseError::UnexpectedModifier(name) => format!("Unexpected modifier: .{}", name),
+            InstrParseError::QualifiedModifier(name) => {
+                format!("::-qualified modifier not supported: .{}", name)
+            }
             InstrParseError::InvalidModifierForType { modifier, ty } => {
                 format!("Modifier '.{}' not valid for type .{:?}", modifier, ty)
             }
@@ -237,11 +245,18 @@ impl ModifierParser {
         None
     }
 
-    /// Skip any qualified modifiers that we don't understand (like L2::cache_hint, L2::64B, etc.)
-    pub fn skip_qualified(&mut self) {
-        while let Some(DottedIdent::Qualified(_)) = self.peek() {
-            self.pos += 1;
+    /// Reject any `::`-qualified modifier at the current position (like
+    /// `shared::cta` or `L2::cache_hint`). These were once skipped silently,
+    /// which could drop an explicit state space and misdirect the access;
+    /// unmodeled semantics must error loudly instead.
+    pub fn reject_qualified(&self) -> Result<(), InstrParseError> {
+        if let Some(DottedIdent::Qualified(parts)) = self.peek() {
+            return Err(InstrParseError::QualifiedModifier(crate::ascii::join(
+                parts,
+                ascii("::"),
+            )));
         }
+        Ok(())
     }
 
     /// Check if all modifiers have been consumed
@@ -1171,10 +1186,11 @@ fn parse_min(
 
     let relu = relu || mp.try_consume(ascii("relu"));
 
-    if operands.len() < 3 {
+    let operand_count = operands.len();
+    if operand_count < 3 {
         return Err(InstrParseError::WrongOperandCount {
             expected: 3,
-            got: operands.len(),
+            got: operand_count,
         });
     }
 
@@ -1183,6 +1199,21 @@ fn parse_min(
     let src_a = ops.next().unwrap();
     let src_b = ops.next().unwrap();
     let src_c = ops.next();
+
+    if ops.next().is_some() {
+        return Err(InstrParseError::WrongOperandCount {
+            expected: 4,
+            got: operand_count,
+        });
+    }
+    // Only the f32 form has a 3-input (accumulate) variant; for any other
+    // type a 4th operand would previously be dropped silently.
+    if src_c.is_some() && ty != ScalarType::F32 {
+        return Err(InstrParseError::WrongOperandCount {
+            expected: 3,
+            got: operand_count,
+        });
+    }
 
     let instr = match ty {
         // Integer types that don't support relu (Block 12, atype) - NO modifiers
@@ -1317,10 +1348,11 @@ fn parse_max(
 
     let relu = relu || mp.try_consume(ascii("relu"));
 
-    if operands.len() < 3 {
+    let operand_count = operands.len();
+    if operand_count < 3 {
         return Err(InstrParseError::WrongOperandCount {
             expected: 3,
-            got: operands.len(),
+            got: operand_count,
         });
     }
 
@@ -1329,6 +1361,21 @@ fn parse_max(
     let src_a = ops.next().unwrap();
     let src_b = ops.next().unwrap();
     let src_c = ops.next();
+
+    if ops.next().is_some() {
+        return Err(InstrParseError::WrongOperandCount {
+            expected: 4,
+            got: operand_count,
+        });
+    }
+    // Only the f32 form has a 3-input (accumulate) variant; for any other
+    // type a 4th operand would previously be dropped silently.
+    if src_c.is_some() && ty != ScalarType::F32 {
+        return Err(InstrParseError::WrongOperandCount {
+            expected: 3,
+            got: operand_count,
+        });
+    }
 
     let instr = match ty {
         // Integer types that don't support relu (Block 13, atype) - NO modifiers
@@ -2291,10 +2338,11 @@ fn parse_setp(
         }
     }
 
-    if operands.len() < 3 {
+    let operand_count = operands.len();
+    if operand_count < 3 {
         return Err(InstrParseError::WrongOperandCount {
             expected: 3,
-            got: operands.len(),
+            got: operand_count,
         });
     }
 
@@ -2313,7 +2361,16 @@ fn parse_setp(
     let src_b = ops.next().unwrap();
     let src_c = ops.next();
 
-    // bool_op and src_c are coupled: both present or both absent
+    if ops.next().is_some() {
+        return Err(InstrParseError::WrongOperandCount {
+            expected: 4,
+            got: operand_count,
+        });
+    }
+
+    // bool_op and src_c are coupled: both present or both absent. A mismatch
+    // used to fall back to the Simple form, silently dropping the boolean
+    // combination (or the extra operand); reject it instead.
     let instr = match (bool_op, src_c) {
         (Some(bool_op), Some(src_c)) => SetpInstr::WithBoolOp {
             cmp_op,
@@ -2335,26 +2392,18 @@ fn parse_setp(
             src_a,
             src_b,
         },
-        // Mismatch: bool_op without src_c or src_c without bool_op
-        // For now, use Simple form and ignore the extra
-        (Some(_), None) => SetpInstr::Simple {
-            cmp_op,
-            ftz,
-            ty,
-            dst_p,
-            dst_q,
-            src_a,
-            src_b,
-        },
-        (None, Some(_src_c)) => SetpInstr::Simple {
-            cmp_op,
-            ftz,
-            ty,
-            dst_p,
-            dst_q,
-            src_a,
-            src_b,
-        },
+        (Some(_), None) => {
+            return Err(InstrParseError::WrongOperandCount {
+                expected: 4,
+                got: operand_count,
+            });
+        }
+        (None, Some(_)) => {
+            return Err(InstrParseError::WrongOperandCount {
+                expected: 3,
+                got: operand_count,
+            });
+        }
     };
 
     mp.finish()?;
@@ -2585,7 +2634,8 @@ fn parse_shfl(
         .ok_or(InstrParseError::MissingModifier(ascii("mode")))?;
     mp.try_consume_or_err(ascii("b32"))?; // shfl.mode.b32 - type is required
 
-    if operands.len() < 4 {
+    // Exact arity: extra operands would be dropped silently.
+    if operands.len() != 4 {
         return Err(InstrParseError::WrongOperandCount {
             expected: 4,
             got: operands.len(),
@@ -2614,7 +2664,8 @@ fn parse_shfl_sync(
         .ok_or(InstrParseError::MissingModifier(ascii("mode")))?;
     mp.try_consume_or_err(ascii("b32"))?; // shfl.sync.mode.b32 - type is required
 
-    if operands.len() < 5 {
+    // Exact arity: extra operands would be dropped silently.
+    if operands.len() != 5 {
         return Err(InstrParseError::WrongOperandCount {
             expected: 5,
             got: operands.len(),
@@ -2675,8 +2726,9 @@ fn parse_ld(
     // Block 87: Eviction priority modifiers (L1::evict_*, L2::evict_*)
     let l1_eviction = mp.try_l1_eviction_priority();
     let l2_eviction = mp.try_l2_eviction_priority();
-    // Skip other qualified modifiers we don't parse (L2::cache_hint, L2::64B, etc.)
-    mp.skip_qualified();
+    // Any other qualified modifier (a ::-qualified state space we did not
+    // parse above, L2::cache_hint, ...) is unsupported; error loudly.
+    mp.reject_qualified()?;
     let nc = mp.try_consume(ascii("nc"));
     let vec = mp.try_parse::<VecWidth>();
     let unified = mp.try_consume(ascii("unified"));
@@ -2737,8 +2789,9 @@ fn parse_st(
     // Block 89: Eviction priority modifiers (L1::evict_*, L2::evict_*)
     let l1_eviction = mp.try_l1_eviction_priority();
     let l2_eviction = mp.try_l2_eviction_priority();
-    // Skip other qualified modifiers we don't parse (L2::cache_hint, etc.)
-    mp.skip_qualified();
+    // Any other qualified modifier (a ::-qualified state space we did not
+    // parse above, L2::cache_hint, ...) is unsupported; error loudly.
+    mp.reject_qualified()?;
     let vec = mp.try_parse::<VecWidth>();
     let ty = mp.require_scalar_type()?;
 
@@ -2779,12 +2832,18 @@ fn parse_cvt(
     let stochastic_rnd = mp.try_consume(ascii("rs"));
     // Block 99: round to nearest away (cvt.rna for tf32)
     let rna = mp.try_consume(ascii("rna"));
-    // Consume optional scaled modifier for advanced conversions (e.g., .scaled::n2::ue8m0)
-    let _ = mp.try_consume(ascii("scaled"));
-    mp.skip_qualified(); // skip qualified modifiers like scaled::n2::ue8m0
+    // Block-scaled conversions (.scaled{::...}) are not modeled; reject
+    // loudly rather than silently dropping the modifier.
+    if let Some(m) = mp.peek_simple()
+        && m.as_slice() == ascii("scaled")
+    {
+        return Err(InstrParseError::UnexpectedModifier(m.clone()));
+    }
+    mp.reject_qualified()?;
     let dst_type = mp.require_scalar_type()?;
     let src_type = mp.try_parse::<ScalarType>().unwrap_or(dst_type);
 
+    let operand_count = operands.len();
     let mut ops = operands.into_iter();
     let dst = ops.next().ok_or(InstrParseError::WrongOperandCount {
         expected: 2,
@@ -2841,6 +2900,15 @@ fn parse_cvt(
             src,
         }
     };
+
+    // Leftover operands (e.g. `cvt.rn.f16x2.f32 d, a, b`) would otherwise be
+    // dropped silently.
+    if ops.next().is_some() {
+        return Err(InstrParseError::WrongOperandCount {
+            expected: if pack { 3 } else { 2 },
+            got: operand_count,
+        });
+    }
 
     mp.finish()?;
     Ok(ParsedInstruction::Cvt(instr))
