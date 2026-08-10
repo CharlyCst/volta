@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use crate::symbolic::Real;
+use crate::symbolic::{Real, RealRepr};
 
 /// A reduced rational: `num / den` with `den > 0`, gcd(num, den) = 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,14 +74,14 @@ impl Coeff {
     /// a positive denominator - rug's canonical form); an infinity is the
     /// same loud non-finite error a non-finite f64 used to be.
     pub fn from_real(v: &Real) -> Result<Coeff, CoeffError> {
-        match v {
-            Real::Rational(q) => {
+        match v.repr() {
+            RealRepr::Rational(q) => {
                 let num = q.numer().to_i128().ok_or(CoeffError::Overflow)?;
                 let den = q.denom().to_i128().ok_or(CoeffError::Overflow)?;
                 debug_assert!(den > 0);
                 Ok(Coeff { num, den })
             }
-            Real::NegInf | Real::PosInf => Err(CoeffError::NonFinite(v.to_f64())),
+            RealRepr::NegInf | RealRepr::PosInf => Err(CoeffError::NonFinite(v.to_f64())),
         }
     }
 
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn test_overflow_from_wide_rational() {
         let huge = rug::Rational::from(rug::Integer::from(1) << 200u32);
-        let r = Real::Rational(Box::new(huge));
+        let r = Real::from_rational(huge);
         assert_eq!(Coeff::from_real(&r), Err(CoeffError::Overflow));
     }
 

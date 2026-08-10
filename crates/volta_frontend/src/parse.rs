@@ -40,6 +40,7 @@ pub enum ParseErrorKind {
     ExpectedIdentifier(Option<Token>),
     ExpectedInteger(Option<Token>),
     ExpectedPositiveInteger(i64),
+    InvalidAlignment(u64),
     ExpectedOperand(Option<Token>),
     ExpectedInstruction(Option<Token>),
     ExpectedVersion(Option<Token>),
@@ -75,6 +76,7 @@ impl ParseErrorKind {
             ParseErrorKind::ExpectedIdentifier(_) => "Expected Identifier",
             ParseErrorKind::ExpectedInteger(_) => "Expected Integer",
             ParseErrorKind::ExpectedPositiveInteger(_) => "Expected Positive Integer",
+            ParseErrorKind::InvalidAlignment(_) => "Invalid Alignment",
             ParseErrorKind::ExpectedOperand(_) => "Expected Operand",
             ParseErrorKind::ExpectedInstruction(_) => "Expected Instruction",
             ParseErrorKind::ExpectedVersion(_) => "Expected Version",
@@ -137,6 +139,9 @@ impl ParseErrorKind {
             },
             ParseErrorKind::ExpectedPositiveInteger(val) => {
                 format!("Expected positive integer, got {}", val)
+            }
+            ParseErrorKind::InvalidAlignment(val) => {
+                format!(".align requires a power of two, got {}", val)
             }
             ParseErrorKind::ExpectedOperand(found) => match found {
                 Some(tok) => format!("Expected operand, found {}", tok),
@@ -823,10 +828,25 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse optional `.align N`
+    /// Parse optional `.align N`. PTX requires the value to be a power of
+    /// two, and the byte-layout code (`align_up` in `volta_analysis`)
+    /// relies on it with only a debug assert - inert in release - so a
+    /// zero or non-power-of-two value is rejected loudly here, at the one
+    /// place every `.align` first lands, with the literal's span.
+    /// (Values above `u32::MAX` are rejected by the same error rather
+    /// than silently truncated by the cast.)
     fn parse_align(&mut self) -> Result<Option<u32>, ParseError> {
         if self.try_directive(ascii("align"))? {
-            Ok(Some(self.parse_int_literal()? as u32))
+            let span = self.peek()?.map(|(s, _)| s);
+            let n = self.parse_int_literal()?;
+            if !n.is_power_of_two() || n > u64::from(u32::MAX) {
+                return Err(Locate {
+                    path: None,
+                    span,
+                    error: ParseErrorKind::InvalidAlignment(n),
+                });
+            }
+            Ok(Some(n as u32))
         } else {
             Ok(None)
         }
@@ -2399,6 +2419,39 @@ mod tests {
         let src = b".version 7.0\n.target sm_70\n.address_size 64";
         let module = parse_module(src).unwrap();
         assert_eq!(module.address_size, Some(AddressSize::Bits64));
+    }
+
+    #[test]
+    fn test_align_accepts_power_of_two() {
+        let src = b".version 7.0\n.target sm_80\n.shared .align 16 .b8 buf[32];";
+        let module = parse_module(src).unwrap();
+        let Some(TopLevelItem::Variable(var)) = module.items.first() else {
+            panic!("expected a module-scope variable declaration");
+        };
+        assert_eq!(var.align, Some(16));
+    }
+
+    /// Zero and non-power-of-two `.align` values are rejected at parse
+    /// time with a located error. The byte-layout code (`align_up`)
+    /// guards the power-of-two requirement only with a `debug_assert`,
+    /// inert in release builds, so the parser is the loud guard - for
+    /// variable declarations and parameters alike.
+    #[test]
+    fn test_align_rejects_zero_and_non_power_of_two() {
+        let cases: &[(&[u8], u64)] = &[
+            (b".version 7.0\n.target sm_80\n.shared .align 0 .b8 buf[32];", 0),
+            (b".version 7.0\n.target sm_80\n.shared .align 3 .b8 buf[32];", 3),
+            // A parameter's `.align` goes through the same chokepoint.
+            (
+                b".version 7.0\n.target sm_80\n.visible .entry k(.param .align 12 .b8 p[16]) { ret; }",
+                12,
+            ),
+        ];
+        for (src, bad) in cases {
+            let err = parse_module(src).unwrap_err();
+            assert_eq!(err.error, ParseErrorKind::InvalidAlignment(*bad));
+            assert!(err.span.is_some(), "alignment error must carry a span");
+        }
     }
 
     // =========================================================================

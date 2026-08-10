@@ -31,7 +31,7 @@ Equivalence checking treats floating-point values as reals. Within that model:
   with symmetric CTAs (only CTA 0 is checked, but note that the grid size still
   matters for index computations).
 
-- `sqrt`, `log`, `abs`, `rem`, floor, bitwise ops, shifts, comparisons, boolean
+- `sqrt`, `log`, `abs`, `rem`, bitwise ops, shifts, comparisons, boolean
   ops, `select`, and data-dependent array reads are carried as uninterpreted
   atoms, equal only when syntactically identical after canonicalizing their
   arguments. We lose completeness but not soundness.
@@ -214,7 +214,7 @@ and all algebraic reasoning (commutativity, cancellation, distribution,
 max/min case analysis - `max`/`min` render as `ite` over real
 comparisons) is left to the solver, so the timings measure Z3, not the
 translator. What the translation owns is fidelity and transport: float
-constants as their exact binary values (the same reading as the decision
+constants as exact rationals (the same reading as the decision
 procedure and the numeric oracle), user symbol names in reserved
 namespaces so they cannot collide with generated solver names, and
 `let`-bound DAG sharing so query text stays linear in the expression

@@ -59,7 +59,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use volta_analysis::symbolic::{ExprArena, ExprId, ExprNode, Real};
+use volta_analysis::symbolic::{ExprArena, ExprId, ExprNode, Real, RealRepr};
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("unsupported by the Z3 backend: {0}")]
@@ -199,14 +199,14 @@ fn escape(name: &str) -> String {
 /// for why not the shortest decimal). The infinities have no real image
 /// and are refused loudly, exactly as non-finite f64 constants were.
 fn real_literal(v: &Real) -> Result<String, Unsupported> {
-    let q = match v {
-        Real::NegInf | Real::PosInf => {
+    let q = match v.repr() {
+        RealRepr::NegInf | RealRepr::PosInf => {
             return Err(Unsupported(format!(
                 "non-finite float constant {}",
                 v.to_f64()
             )));
         }
-        Real::Rational(q) => q,
+        RealRepr::Rational(q) => q,
     };
     // rug's canonical form: reduced, denominator positive, sign on the
     // numerator. Render the magnitude and put the negation outside.

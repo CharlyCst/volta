@@ -972,6 +972,71 @@ fn test_mov_neg1_equivalent_to_not_zero() {
     assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
 }
 
+/// Value-boundary canonicalization at setp and selp: comparing a
+/// symbolic value against the immediate -1 at s32 and against a
+/// not.b32-computed 4294967295 must build identical comparison nodes
+/// (the computed operand is reinterpreted at the instruction type), and
+/// likewise the selp arms `-1` and the computed 4294967295 at b32.
+/// Previously both instructions used raw operands, so this pair was a
+/// false DIFF: one side's expressions carried -1 where the other's
+/// carried 4294967295.
+#[test]
+fn test_setp_selp_canonicalize_operands() {
+    let literal = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.u32 %r1, [%rd1];
+    setp.eq.s32 %p1, %r1, -1;
+    selp.b32 %r2, -1, 0, %p1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+",
+    );
+    let computed = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.u32 %r1, [%rd1];
+    not.b32 %r3, 0;
+    setp.eq.s32 %p1, %r1, %r3;
+    selp.b32 %r2, %r3, 0, %p1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+",
+    );
+    let a = analyze_kernel(&parse(&literal), None, in_out_config(1, 1)).unwrap();
+    let b = analyze_kernel(&parse(&computed), None, in_out_config(1, 1)).unwrap();
+    let da = display_output(&a, "out", 0);
+    let db = display_output(&b, "out", 0);
+    assert_eq!(da, db);
+    assert!(da.contains("== -1"), "compare canonicalized at s32: {}", da);
+    assert!(
+        da.contains("? 4294967295"),
+        "select arm canonicalized at b32: {}",
+        da
+    );
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
 /// `st.u8` keeps only the low byte of the stored value (hardware chops
 /// 300 to 44); `ld.u8` zero-extends it back.
 #[test]
@@ -1148,6 +1213,46 @@ fn test_symbolic_sub_register_load_rejected() {
                 if what.contains("symbolic value loaded")
         ),
         "expected symbolic sub-register load rejection, got: {}",
+        err
+    );
+}
+
+/// A packed f16x2 pair fills a 32-bit register; storing it at a
+/// sub-4-byte width would stuff the whole two-half value into a 2-byte
+/// granule (a shape the memory model never anticipates): loud error,
+/// not silent nonsense. The pair is built through the sanctioned path
+/// (two adjacent 2-byte stores read back at 4 bytes).
+#[test]
+fn test_pair_sub_width_store_rejected() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b16 %rs<3>;
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    mov.u16 %rs1, 1;
+    mov.u16 %rs2, 2;
+    st.global.u16 [%rd1], %rs1;
+    st.global.u16 [%rd1+2], %rs2;
+    ld.global.u32 %r1, [%rd1];
+    st.global.u16 [%rd1+4], %r1;
+    ret;
+}
+",
+    );
+    let err = analyze_kernel(&parse(&src), None, u8_scratch_config()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AnalysisError::Eval(EvalError::Unsupported { what, .. })
+                if what.contains("pair stored")
+        ),
+        "expected pair sub-width store rejection, got: {}",
         err
     );
 }

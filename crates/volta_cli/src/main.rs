@@ -987,34 +987,72 @@ mod tests {
 
     /// A dump written by `write_dump` reloads to an identical structure via
     /// `load_dump` - the fixint round-trip and the magic header together.
+    /// The arena deliberately contains the `Real` constants most at risk
+    /// on the wire: a fold-produced non-dyadic rational (1/3 - no f64
+    /// denotes it), both infinities, the smallest positive subnormal, and
+    /// a -0.0 ingestion (which normalizes to the rational zero). The
+    /// round-trip must be byte-exact - re-serializing the loaded dump
+    /// reproduces the original file bit for bit, so any verdict computed
+    /// from the reloaded VCs equals the original's.
     #[test]
     fn dump_round_trips() {
         let mut arena = ExprArena::new();
         let x = arena.param_symbol("x");
         let one = arena.int(1);
         let sum = arena.add(x, one);
+        let one_f = arena.float_from_f64(1.0).unwrap();
+        let three_f = arena.float_from_f64(3.0).unwrap();
+        let third = arena.div(one_f, three_f);
+        let pos_inf = arena.float_from_f64(f64::INFINITY).unwrap();
+        let neg_inf = arena.float_from_f64(f64::NEG_INFINITY).unwrap();
+        let subnormal = arena.float_from_f64(f64::from_bits(1)).unwrap();
+        let neg_zero = arena.float_from_f64(-0.0).unwrap();
+        let specials = [third, pos_inf, neg_inf, subnormal, neg_zero];
+        let outputs: Vec<(String, Vec<(u64, volta_analysis::symbolic::ExprId)>)> = vec![(
+            "out".to_string(),
+            [(0, sum), (1, x)]
+                .into_iter()
+                .chain(specials.iter().enumerate().map(|(i, &e)| (2 + i as u64, e)))
+                .collect(),
+        )];
         let dump = VcDump {
             reference: VcSnapshot {
                 arena: arena.clone(),
-                outputs: vec![("out".to_string(), vec![(0, sum), (1, x)])],
+                outputs: outputs.clone(),
             },
-            optimized: VcSnapshot {
-                arena,
-                outputs: vec![("out".to_string(), vec![(0, sum), (1, x)])],
-            },
+            optimized: VcSnapshot { arena, outputs },
         };
 
         let dir = std::env::temp_dir();
         let path = dir.join(format!("volta_cli_dump_test_{}.vcdump", std::process::id()));
+        let path2 = dir.join(format!(
+            "volta_cli_dump_test_rt_{}.vcdump",
+            std::process::id()
+        ));
         write_dump(&dump, &path).expect("write_dump");
         let loaded = load_dump(&path).expect("load_dump");
+        write_dump(&loaded, &path2).expect("write_dump (reloaded)");
+        let original_bytes = std::fs::read(&path).expect("read original dump");
+        let rewritten_bytes = std::fs::read(&path2).expect("read rewritten dump");
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
 
+        assert_eq!(
+            original_bytes, rewritten_bytes,
+            "round-trip must be byte-exact"
+        );
         assert_eq!(
             loaded.reference.outputs, dump.reference.outputs,
             "reference footprint survived the round-trip"
         );
         assert_eq!(loaded.optimized.outputs, dump.optimized.outputs);
+        for &e in &specials {
+            assert_eq!(
+                loaded.reference.arena.node(e),
+                dump.reference.arena.node(e),
+                "special constant survived the round-trip"
+            );
+        }
     }
 
     /// `load_dump` on a corrupt file yields the given `InvalidData` error

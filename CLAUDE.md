@@ -98,10 +98,12 @@ are `Real`s (arbitrary-precision rationals via `rug`, boxed, plus
 `Real::from_f64`/`arena.float_from_f64` are fallible, NaN literals are a
 lowering error, NaN params a config validation error), so the fold algebra
 and canon's rational algebra coincide by construction. Folds are exact on
-ℚ (div/rcp only for nonzero divisors - `x/0` stays unfolded and canon
-errors loudly); ±inf folds only the unambiguous extended-real forms
-(max/min absorption, neg, inf±finite, inf·nonzero), undefined forms
-(inf−inf, 0·inf, anything/0) build unfolded nodes.
+ℚ (div/rcp fold only fully-concrete quotients with a nonzero divisor -
+`x/0` and `0/symbolic` both stay unfolded, so a formally-zero
+denominator always reaches canon's loud division error); ±inf folds
+only the unambiguous extended-real forms (max/min absorption, neg,
+inf±finite, inf·nonzero), undefined forms (inf−inf, 0·inf - integer or
+real zero alike - anything/0) build unfolded nodes.
 
 - **Atoms**: `IntConst`, `RealConst(Real)`, `BoolConst`, `Symbol(SymbolId)`, `ParamSymbol(StringId)`, `InputElement { array, index }`, `Undefined`
 - Symbol identity is typed (`SymbolRef`: `Param`/`Element`/`Machine`,

@@ -795,10 +795,16 @@ impl<'p> Interpreter<'p> {
                 src_a,
                 src_b,
                 pred,
-                ..
+                ty,
             } => {
                 let a = self.scalar_operand(t, pc, src_a)?;
                 let b = self.scalar_operand(t, pc, src_b)?;
+                // Reinterpret concrete arms at the instruction type
+                // before building the select: `selp.b32 %r, -1, 0, %p`
+                // must export the same canonical 4294967295 a computed
+                // operand would (see [`Self::canon_operand`]).
+                let a = self.canon_operand(*ty, a);
+                let b = self.canon_operand(*ty, b);
                 let cond = self.scalar_operand(t, pc, pred)?;
                 let r = self.arena.select(cond, a, b);
                 self.threads[t].regs.write(*dst, Value::Scalar(r));
@@ -1547,15 +1553,19 @@ impl<'p> Interpreter<'p> {
     /// Canonicalize a value crossing a store boundary. Memory holds bit
     /// patterns: a concrete integer is reduced to the unsigned low bits of
     /// the store type (`st.u8` of 300 stores 44); sign/zero extension is
-    /// the *load*'s job (see [`Self::canon_loaded`]). Floats, packed
-    /// pairs, and `Undefined` pass through unchanged.
+    /// the *load*'s job (see [`Self::canon_loaded`]). Floats, `Undefined`,
+    /// and packed pairs at their full 4-byte width pass through unchanged.
     ///
     /// A *symbolic* integer stored below its source register's width would
     /// need a truncation node we deliberately do not model, so that store
     /// is a loud error rather than a silently unsound pass-through.
     /// Equal-width symbolic stores are exact and pass through (an f16 half
     /// stored from a 16-bit register via `st.u16` - the corpus's only
-    /// symbolic sub-word stores).
+    /// symbolic sub-word stores). Likewise a packed f16x2 pair stored
+    /// below 4 bytes would stuff the whole two-half value into a narrower
+    /// granule - a shape the memory model never anticipates - so it too
+    /// is a loud error (its truncation would be a half extraction we do
+    /// not model at store boundaries).
     fn canon_stored(
         &mut self,
         t: ThreadId,
@@ -1564,11 +1574,21 @@ impl<'p> Interpreter<'p> {
         src_reg_bits: Option<u32>,
         v: Value,
     ) -> EvalResult<Value> {
+        if matches!(v, Value::Pair(..)) && ty.size_bytes() < 4 {
+            return Err(EvalError::Unsupported {
+                pc,
+                what: format!(
+                    "packed f16x2 pair stored at {}-bit width (thread {})",
+                    ty.bits(),
+                    t
+                ),
+            });
+        }
         if ty.is_float() || ty.is_predicate() {
             return Ok(v);
         }
         let Value::Scalar(e) = v else {
-            return Ok(v); // packed f16 pairs
+            return Ok(v); // packed f16 pairs at full width
         };
         if let Some(c) = self.arena.as_int_const(e) {
             let canon = canon_int(c, ty.bits().min(64), false);
@@ -1717,8 +1737,14 @@ impl<'p> Interpreter<'p> {
             return Ok(self.arena.bool_val(r));
         }
 
-        // Symbolic: over the reals there are no NaNs, so unordered
-        // comparisons coincide with their ordered counterparts.
+        // Symbolic: reinterpret a concrete side at the instruction type
+        // first, exactly like eval_binop's fallback, so
+        // `setp.eq.s32 %p, %sym, -1` and a compare against a
+        // chain-computed 4294967295 build identical nodes. Over the
+        // reals there are no NaNs, so unordered comparisons coincide
+        // with their ordered counterparts.
+        let a = self.canon_operand(ty, a);
+        let b = self.canon_operand(ty, b);
         Ok(match cmp {
             CmpOp::Eq | CmpOp::Equ => self.arena.eq(a, b),
             CmpOp::Ne | CmpOp::Neu => self.arena.ne(a, b),
