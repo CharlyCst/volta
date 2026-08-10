@@ -116,11 +116,29 @@ impl AnalysisConfig {
     /// `symbolic::SymbolRef`), so duplicate names or overlapping ranges
     /// would silently conflate distinct values.
     pub fn validate(&self) -> Result<(), String> {
-        for (i, a) in self.arrays.iter().enumerate() {
+        // Per-array checks first, so the pairwise pass below may safely
+        // form `base + size_bytes()` for every array.
+        for a in &self.arrays {
             if a.elem_width == 0 || a.len == 0 {
                 return Err(format!(
                     "array '{}' has zero element width or length",
                     a.name
+                ));
+            }
+            // The array's byte range must fit in the u64 address space
+            // (checked arithmetic, release-active): every later
+            // computation over `[base, base + size_bytes())` - regions,
+            // output extraction, input materialization - relies on the
+            // end being representable.
+            let end = a
+                .elem_width
+                .checked_mul(a.len)
+                .and_then(|size| a.base.checked_add(size));
+            if end.is_none() {
+                return Err(format!(
+                    "array '{}' (base {:#x}, {} elements of {} bytes) overflows the \
+                     address space",
+                    a.name, a.base, a.len, a.elem_width
                 ));
             }
             // PTX requires every access to be naturally aligned (ISA
@@ -135,6 +153,8 @@ impl AnalysisConfig {
                     a.name, a.base, a.elem_width
                 ));
             }
+        }
+        for (i, a) in self.arrays.iter().enumerate() {
             for b in &self.arrays[i + 1..] {
                 if a.name == b.name {
                     return Err(format!(

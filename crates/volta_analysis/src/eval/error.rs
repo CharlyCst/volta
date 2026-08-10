@@ -69,6 +69,16 @@ pub enum EvalError {
         addr: u64,
         width: u64,
     },
+    /// The `[reg + imm]` effective-address sum overflowed. A wrapped sum
+    /// would reach the bounds machinery as an unrelated address, so it is
+    /// rejected loudly instead (no real launch places data within an
+    /// immediate's reach of the address-space edge).
+    AddressOverflow {
+        thread: ThreadId,
+        pc: InstrId,
+        base: i64,
+        offset: i64,
+    },
     /// A memory access whose address is not a multiple of its required
     /// alignment. PTX ISA 6.4.2: "The address must be naturally aligned to
     /// a multiple of the access size. If an address is not properly
@@ -177,6 +187,16 @@ impl fmt::Display for EvalError {
                 f,
                 "{}: out-of-bounds {:?} access at {:#x} (width {}) at {}",
                 thread, space, addr, width, pc
+            ),
+            Self::AddressOverflow {
+                thread,
+                pc,
+                base,
+                offset,
+            } => write!(
+                f,
+                "{}: effective address {:#x} + {} overflows at {}",
+                thread, base, offset, pc
             ),
             Self::Misaligned {
                 thread,

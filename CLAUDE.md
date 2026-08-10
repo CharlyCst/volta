@@ -139,11 +139,11 @@ Converts AST to linear instruction format:
 
 The interpreter from the paper (per-thread round-robin symbolic execution):
 
-- `eval/interp.rs` - `Interpreter`: scheduler (run a thread until it blocks or exits), instruction evaluation into the arena, barrier firing per the paper's Sync rule (exited threads count as arrived), deadlock detection, structured-CTA concreteness checks
+- `eval/interp.rs` - `Interpreter`: scheduler (run a thread until it blocks or exits), instruction evaluation into the arena, barrier firing per the paper's Sync rule, deadlock detection, structured-CTA concreteness checks. Every sync (CTA barrier and warp group alike) deliberately uses the paper's Sync'/syncMem semantics: exited threads count as arrived *and* are included in the χ-clear over the whole sync set I - stronger than the ISA's participating-threads-only memory ordering, so a spec-level race pairing a pre-sync exit with a post-sync access is intentionally not reported
 - `eval/value.rs` - `Value::{Scalar, Pair}` (`Pair` = packed f16 halves in a 32-bit register) and per-thread `RegFile`
 - `eval/memory.rs` - byte-addressed granule memory; 4-byte reads combine two 2-byte granules into a `Pair`, 2-byte accesses split `Pair` granules; program writes are `dirty` (the output footprint)
 - `eval/race.rs` - χ-context race detection per byte (paper Section 3.2); full-CTA barrier sync is a wholesale clear
-- `eval/warp.rs` - warp-cooperative ops (`shfl.sync`, `ldmatrix`, `mma.sync`, `wmma.*`): block until all mask lanes converge at the pc, sync χ, execute via the `tensor_core.rs` fragment tables with exact per-lane access attribution
+- `eval/warp.rs` - warp-cooperative ops (`bar.warp.sync`, `shfl.sync`, `ldmatrix`, `mma.sync`, `wmma.*`): block until all *live* mask lanes converge at the pc (exited lanes count as arrived), sync χ over the full mask (exited lanes included), execute via the `tensor_core.rs` fragment tables with exact per-lane access attribution; a shfl source lane that exited yields `Undefined` data, while the tensor-core ops reject exited lanes loudly (the ISA defines them as UB "if any thread in the warp has exited")
 - `eval/config.rs` - `AnalysisConfig`: launch dims, positional `ParamValue`s (int/float/symbolic-float/array-pointer), `ArrayDef`s (`Input`/`Output`/`InputOutput`/`IndexInput`), module-global values, dynamic shared size
 - `eval/error.rs` - `EvalError`: `DataRace`, `Deadlock`, `NotConcrete`, `OutOfBounds`, `UndefinedOutput`, `TrapReached`, etc.
 

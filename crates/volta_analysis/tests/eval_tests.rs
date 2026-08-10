@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
-use volta_analysis::AnalysisError;
 use volta_analysis::driver::{EquivOutcome, analyze_kernel, check_output_equivalence};
+use volta_analysis::{AnalysisError, LowerError};
 
 /// Check equivalence along the reference run's output arrays.
 fn check_equiv(a: &AnalysisOutput, b: &AnalysisOutput) -> EquivOutcome {
@@ -1965,4 +1965,558 @@ fn test_zero_over_zero_is_a_loud_equivalence_error() {
         "expected a division-by-zero equivalence error, got: {}",
         err
     );
+}
+
+// =========================================================================
+// The paper's Sync semantics at warp level: exited lanes arrive at every
+// warp op and are included in the chi-clear (Sync'/syncMem over the full
+// mask set I, return-threads included).
+// =========================================================================
+
+/// Tail-exit warp reduction: threads 16..31 exit immediately, and the 16
+/// survivors run a full-mask `shfl.sync.down` tree reduction. The groups
+/// fire because exited lanes count as arrived (paper's Sync rule; the ISA
+/// says the same for shfl.sync: "wait until all non-exited threads
+/// corresponding to membermask"); previously data ops required every mask
+/// lane live and this idiom was a false Deadlock. The guarded adds discard
+/// the Undefined values sourced from exited lanes 16..23, exactly as real
+/// kernels discard the out-of-range contributions, so the result equals a
+/// sequential sum of in[0..16].
+#[test]
+fn test_tail_exit_warp_shfl_reduction() {
+    let mut body = String::from(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .pred %p<7>;
+    .reg .f32 %f<7>;
+    .reg .b32 %r<13>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r1, %tid.x;
+    setp.gt.u32 %p1, %r1, 15;
+@%p1 ret;
+    shl.b32 %r2, %r1, 2;
+    cvt.u64.u32 %rd3, %r2;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    mov.u32 %r3, 31;
+    mov.u32 %r4, -1;
+",
+    );
+    for (round, offset) in [8u32, 4, 2, 1].into_iter().enumerate() {
+        let (w, p, r) = (round + 2, round + 2, round + 5);
+        body.push_str(&format!(
+            "    mov.u32 %r{r}, {offset};
+    shfl.sync.down.b32 %f{w}, %f1, %r{r}, %r3, %r4;
+    add.u32 %r{r2}, %r1, {offset};
+    setp.lt.u32 %p{p}, %r{r2}, 16;
+@%p{p} add.f32 %f1, %f1, %f{w};
+",
+            r2 = round + 9,
+        ));
+    }
+    body.push_str(
+        "    setp.ne.u32 %p6, %r1, 0;
+@%p6 ret;
+    st.global.f32 [%rd2], %f1;
+    ret;
+}
+",
+    );
+    let module = parse(&wrap(&body));
+    let a = analyze_kernel(&module, None, in_out_config(32, 16)).unwrap();
+    assert_eq!(a.stats.warp_syncs, 4);
+
+    // Reference: one thread sums in[0..16] sequentially.
+    let mut ref_body = String::from(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<3>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.f32 %f1, [%rd1];
+",
+    );
+    for i in 1..16 {
+        ref_body.push_str(&format!(
+            "    ld.global.f32 %f2, [%rd1+{}];
+    add.f32 %f1, %f1, %f2;
+",
+            i * 4
+        ));
+    }
+    ref_body.push_str(
+        "    st.global.f32 [%rd2], %f1;
+    ret;
+}
+",
+    );
+    let b = analyze_kernel(&parse(&wrap(&ref_body)), None, in_out_config(1, 16)).unwrap();
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
+/// A shfl value sourced from an exited (in-mask) lane is Undefined, per the
+/// ISA: "results are undefined if a thread sources a register from an
+/// inactive thread". Storing it directly to an output array surfaces as
+/// UndefinedOutput; the group itself fires (no Deadlock).
+#[test]
+fn test_shfl_from_exited_lane_is_undefined() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r1, %tid.x;
+    setp.gt.u32 %p1, %r1, 15;
+@%p1 ret;
+    shl.b32 %r2, %r1, 2;
+    cvt.u64.u32 %rd3, %r2;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    mov.u32 %r3, 31;
+    mov.u32 %r4, -1;
+    mov.u32 %r5, 8;
+    shfl.sync.down.b32 %f2, %f1, %r5, %r3, %r4;
+    add.s64 %rd5, %rd2, %rd3;
+    st.global.f32 [%rd5], %f2;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    // Lanes 8..15 source exited lanes 16..23 and store the Undefined result.
+    let err = analyze_kernel(&module, None, in_out_config(32, 16)).unwrap_err();
+    assert!(
+        matches!(err, AnalysisError::Eval(EvalError::UndefinedOutput { .. })),
+        "expected undefined output from exited source lane, got: {}",
+        err
+    );
+}
+
+/// The verified false race: a lane reads shared memory and exits; the
+/// survivor bar.warp.syncs on the full mask and writes the same byte. The
+/// paper's syncMem clears pending sets over the whole I including the
+/// returned lane, so this is NOT a race (it previously was reported as
+/// one, because only live members joined the chi sync set).
+#[test]
+fn test_bar_warp_sync_clears_chi_for_exited_reader() {
+    let src = wrap(
+        ".visible .entry k()
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .shared .align 4 .b8 sdata[8];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, sdata;
+    setp.eq.u32 %p1, %r1, 1;
+@%p1 ld.shared.u32 %r3, [%r2];
+@%p1 ret;
+    bar.warp.sync 3;
+    st.shared.u32 [%r2], %r1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    analyze_kernel(&module, None, AnalysisConfig::new((2, 1, 1)))
+        .expect("read-then-exit / sync / write must not race under the paper's syncMem");
+}
+
+/// Mirrored variant: a lane writes shared memory and exits; the survivor
+/// syncs and reads the byte back. No race, and the exited lane's value is
+/// visible (syncMem clears ordering state, not memory).
+#[test]
+fn test_bar_warp_sync_clears_chi_for_exited_writer() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<2>;
+    .shared .align 4 .b8 sdata[8];
+
+    ld.param.u64 %rd1, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, sdata;
+    setp.eq.u32 %p1, %r1, 1;
+    mov.u32 %r3, 42;
+@%p1 st.shared.u32 [%r2], %r3;
+@%p1 ret;
+    bar.warp.sync 3;
+    ld.shared.u32 %r4, [%r2];
+    st.global.u32 [%rd1], %r4;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let output = analyze_kernel(&module, None, in_out_config(2, 1))
+        .expect("write-then-exit / sync / read must not race under the paper's syncMem");
+    assert_eq!(display_output(&output, "out", 0), "42");
+}
+
+/// bar.warp.sync end-to-end (previously UnsupportedInstruction at
+/// lowering): the neighbor exchange synchronized by a warp barrier instead
+/// of a CTA barrier.
+#[test]
+fn test_bar_warp_sync_neighbor_exchange() {
+    let src = wrap(&SWAP_BODY.replace("BARRIER", "bar.warp.sync 3;"));
+    let module = parse(&src);
+    let output = analyze_kernel(&module, None, in_out_config(2, 2)).unwrap();
+    assert_eq!(display_output(&output, "out", 0), "in[1]");
+    assert_eq!(display_output(&output, "out", 1), "in[0]");
+    assert_eq!(output.stats.block_syncs, 0);
+    assert_eq!(output.stats.warp_syncs, 1);
+}
+
+/// `barrier.sync{.aligned} a` (no thread count) is the same full-CTA
+/// barrier as `bar.sync a` (ISA: "bar{.cta}.sync is equivalent to
+/// barrier{.cta}.sync.aligned").
+#[test]
+fn test_barrier_sync_is_bar_sync() {
+    for form in ["barrier.sync 0;", "barrier.cta.sync.aligned 0;"] {
+        let src = wrap(&SWAP_BODY.replace("BARRIER", form));
+        let module = parse(&src);
+        let output = analyze_kernel(&module, None, in_out_config(2, 2))
+            .unwrap_or_else(|e| panic!("{} failed: {}", form, e));
+        assert_eq!(display_output(&output, "out", 0), "in[1]");
+        assert_eq!(display_output(&output, "out", 1), "in[0]");
+        assert_eq!(output.stats.block_syncs, 2);
+    }
+}
+
+// =========================================================================
+// activemask: exact for the converged case (existing, non-exited lanes)
+// =========================================================================
+
+/// activemask kernel: every thread records its mask, with a CTA barrier
+/// after the query so no thread has exited when any thread queries (each
+/// thread blocks rather than exits, making the all-alive answer
+/// deterministic under round-robin).
+fn activemask_body(barrier: &str) -> String {
+    format!(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r2, %tid.x;
+    {barrier}
+    activemask.b32 %r1;
+    shl.b32 %r3, %r2, 2;
+    cvt.u64.u32 %rd2, %r3;
+    add.s64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r1;
+    ret;
+}}
+"
+    )
+}
+
+/// All 32 lanes alive: every thread reads 0xFFFFFFFF. The barrier comes
+/// *after* activemask here, so each thread queries while all others are
+/// alive (blocked or not-yet-run, never exited).
+#[test]
+fn test_activemask_all_alive_full_warp() {
+    let body = activemask_body("").replace(
+        "activemask.b32 %r1;",
+        "activemask.b32 %r1;\n    bar.sync 0;",
+    );
+    let module = parse(&wrap(&body));
+    let output = analyze_kernel(&module, None, in_out_config(32, 32)).unwrap();
+    for i in 0..32 {
+        assert_eq!(display_output(&output, "out", i), "4294967295");
+    }
+}
+
+/// A 16-thread block: warp lanes 16..31 do not exist and contribute 0, so
+/// every thread reads 0xFFFF (again with the barrier after the query, so
+/// all queries happen before any exit).
+#[test]
+fn test_activemask_16_thread_block() {
+    let body = activemask_body("").replace(
+        "activemask.b32 %r1;",
+        "activemask.b32 %r1;\n    bar.sync 0;",
+    );
+    let module = parse(&wrap(&body));
+    let output = analyze_kernel(&module, None, in_out_config(16, 16)).unwrap();
+    for i in 0..16 {
+        assert_eq!(display_output(&output, "out", i), "65535");
+    }
+}
+
+/// Tail-exit: threads 16..31 exit before the barrier; survivors query
+/// after it. Only thread 0's value is asserted: under round-robin each
+/// survivor also observes the *earlier survivors'* exits (thread 1 sees
+/// thread 0 gone, and so on), just as hardware activemask depends on
+/// execution timing - the model deliberately promises nothing about
+/// exit ordering beyond the executing thread's own observation point.
+#[test]
+fn test_activemask_after_tail_exit() {
+    let mut body = activemask_body("bar.sync 0;");
+    body = body.replace(
+        "    mov.u32 %r2, %tid.x;\n",
+        "    mov.u32 %r2, %tid.x;\n    setp.gt.u32 %p1, %r2, 15;\n@%p1 ret;\n",
+    );
+    let module = parse(&wrap(&body));
+    let output = analyze_kernel(&module, None, in_out_config(32, 32)).unwrap();
+    assert_eq!(display_output(&output, "out", 0), "65535");
+}
+
+// =========================================================================
+// Bounds hardening: ownership containment, whole-vector footprints, and
+// overflow-proof address arithmetic (all release-active)
+// =========================================================================
+
+/// The paper's own §6.2 pattern: `__shared__ int A[48]` read at
+/// `A[tid]` by 64 threads - threads 48..63 read out of bounds and must be
+/// caught (hardware happens to tolerate this; the model must not).
+#[test]
+fn test_shared_array_overflow_read_is_out_of_bounds() {
+    let src = wrap(
+        ".visible .entry k()
+{
+    .reg .b32 %r<6>;
+    .shared .align 4 .b8 A[192];
+
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r2, %r1, 2;
+    mov.u32 %r3, A;
+    add.s32 %r4, %r3, %r2;
+    ld.shared.u32 %r5, [%r4];
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((64, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::OutOfBounds { addr: 192, .. })
+        ),
+        "expected out-of-bounds at A+192, got: {}",
+        err
+    );
+}
+
+/// Cross-array overflow into an adjacent shared array: a v4 (16-byte)
+/// load whose first byte lies in A but whose tail runs into the adjacent
+/// B. The whole-footprint ownership check makes this a loud OutOfBounds;
+/// the per-element checks alone each passed inside a different array and
+/// silently read the neighbor.
+#[test]
+fn test_vector_straddling_adjacent_shared_arrays() {
+    let src = wrap(
+        ".visible .entry k()
+{
+    .reg .b32 %r<7>;
+    .shared .align 4 .b8 A[40];
+    .shared .align 4 .b8 B[64];
+
+    mov.u32 %r1, A;
+    ld.shared.v4.u32 {%r2, %r3, %r4, %r5}, [%r1+32];
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((1, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::OutOfBounds {
+                addr: 32,
+                width: 16,
+                ..
+            })
+        ),
+        "expected the v4 straddle to be out of bounds, got: {}",
+        err
+    );
+}
+
+/// `x[tid - 1]` at tid = 0 with the array based at address 0: the index
+/// wraps to 0xFFFF_FFFF_FFFF_FFFC. The additive bounds check wrapped with
+/// it in release builds and silently accepted the access (yielding a
+/// silent Undefined); the subtraction-form check rejects it in every
+/// build profile. The test suite runs in release, where this must hold.
+#[test]
+fn test_negative_index_wrap_is_out_of_bounds() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<2>;
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r1, %tid.x;
+    add.s32 %r2, %r1, -1;
+    cvt.s64.s32 %rd3, %r2;
+    shl.b64 %rd3, %rd3, 2;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    st.global.f32 [%rd2], %f1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let mut config = in_out_config(1, 4);
+    config.arrays[0].base = 0; // x based at 0: base + (-4) wraps
+    let err = analyze_kernel(&module, None, config).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::OutOfBounds { addr, width: 4, .. })
+                if addr == u64::MAX - 3
+        ),
+        "expected the wrapped address to be out of bounds, got: {}",
+        err
+    );
+}
+
+/// Aligned in-bounds accesses at region edges still pass: the last scalar
+/// element of a shared array (exact fit against the region end, with an
+/// adjacent array following) and an exact-fit v4 footprint ending at the
+/// region end.
+#[test]
+fn test_region_edge_exact_fit_accesses_pass() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b32 %r<13>;
+    .reg .b64 %rd<2>;
+    .shared .align 4 .b8 A[48];
+    .shared .align 4 .b8 B[64];
+
+    ld.param.u64 %rd1, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, A;
+    mov.u32 %r2, 1;
+    mov.u32 %r3, 2;
+    mov.u32 %r4, 3;
+    mov.u32 %r5, 4;
+    st.shared.v4.u32 [%r1+32], {%r2, %r3, %r4, %r5};
+    mov.u32 %r6, 7;
+    st.shared.u32 [%r1+44], %r6;
+    ld.shared.u32 %r7, [%r1+44];
+    ld.shared.v4.u32 {%r8, %r9, %r10, %r11}, [%r1+32];
+    mov.u32 %r12, B;
+    st.shared.u32 [%r12], %r7;
+    ld.shared.u32 %r7, [%r12];
+    st.global.u32 [%rd1], %r7;
+    st.global.u32 [%rd1+4], %r8;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let output = analyze_kernel(&module, None, in_out_config(1, 2))
+        .expect("exact-fit edge accesses must stay in bounds");
+    // The scalar store at A+44 overwrote the v4's last element; the v4
+    // read back yields {1, 2, 3, 7}.
+    assert_eq!(display_output(&output, "out", 0), "7");
+    assert_eq!(display_output(&output, "out", 1), "1");
+}
+
+// =========================================================================
+// cvta restriction: only cvta.to.global (the corpus form) is accepted
+// =========================================================================
+
+fn cvta_kernel(form: &str) -> String {
+    wrap(&format!(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<4>;
+    .shared .align 4 .b8 sdata[16];
+
+    ld.param.u64 %rd1, [k_param_1];
+    mov.u32 %r1, sdata;
+    cvt.u64.u32 %rd2, %r1;
+    {form}
+    ret;
+}}
+"
+    ))
+}
+
+/// The corpus's one cvta form is accepted as the identity.
+#[test]
+fn test_cvta_to_global_accepted() {
+    let module = parse(&cvta_kernel("cvta.to.global.u64 %rd3, %rd1;"));
+    analyze_kernel(&module, None, in_out_config(1, 1)).expect("cvta.to.global is the corpus form");
+}
+
+/// Every other cvta form is rejected by name: the to-generic direction
+/// (`cvta.<space>`) would mint an absolute address in the wrong space,
+/// and `cvta.to.<other-space>` would bless an arbitrary value as a
+/// shared/local address.
+#[test]
+fn test_cvta_other_forms_rejected() {
+    for (form, expect) in [
+        ("cvta.shared.u64 %rd3, %rd2;", "cvta.shared"),
+        ("cvta.to.shared.u64 %rd3, %rd1;", "cvta.to.shared"),
+    ] {
+        let module = parse(&cvta_kernel(form));
+        let err = analyze_kernel(&module, None, in_out_config(1, 1)).unwrap_err();
+        match &err {
+            AnalysisError::Lower(LowerError::UnsupportedInstruction { instruction, .. }) => {
+                assert_eq!(instruction, expect, "wrong instruction name for {}", form);
+            }
+            other => panic!(
+                "expected UnsupportedInstruction for {}, got: {}",
+                form, other
+            ),
+        }
+    }
 }

@@ -101,6 +101,8 @@ const WMMA_MIN_STRIDE_ELEMS: i64 = 16;
 
 impl Interpreter<'_> {
     /// Execute a complete warp group blocked at `pc` with lane mask `mask`.
+    /// `members` holds the *live* lanes (converged at `pc`); exited mask
+    /// lanes arrive implicitly (see `find_ready_warp_group`).
     pub(in crate::eval) fn execute_warp_op(
         &mut self,
         pc: InstrId,
@@ -113,6 +115,21 @@ impl Interpreter<'_> {
             .expect("warp group blocked at a valid pc")
             .clone();
 
+        // The sync set is the paper's full I: every mask lane, exited lanes
+        // included - `syncMem(I, X)` clears pending sets over the whole I,
+        // and a lane that already returned is still in I. Syncing the live
+        // members alone would leave an exited lane's pre-exit access
+        // pending against the survivors and report a race the paper's
+        // semantics does not have. Only live members execute and advance.
+        // Every mask lane exists: `find_ready_warp_group` already rejected
+        // masks naming lanes beyond the CTA, and the leader is always a
+        // live member, so `members` is nonempty.
+        let warp_base = (members[0].0 / WARP_SIZE) * WARP_SIZE;
+        let group: Vec<ThreadId> = (0..WARP_SIZE)
+            .filter(|lane| mask & (1u32 << lane) != 0)
+            .map(|lane| ThreadId(warp_base + lane))
+            .collect();
+
         // Every warp-cooperative op is a synchronization point for its group
         // (the paper's `sync I`). The group's accesses are bracketed by
         // syncs: the sync *before* keeps the op's reads from racing with the
@@ -121,7 +138,7 @@ impl Interpreter<'_> {
         // post-op reads (wmma.store followed by per-lane ld.shared) - a
         // converged warp is synchronized on both sides of the op.
         self.stats.warp_syncs += 1;
-        self.sync_warp_group(members);
+        self.sync_warp_group(&group);
 
         match &instr {
             LoweredInstr::BarWarpSync { .. } => {}
@@ -166,8 +183,34 @@ impl Interpreter<'_> {
             }
         }
 
-        self.sync_warp_group(members);
+        self.sync_warp_group(&group);
         self.advance_warp_group(members);
+        Ok(())
+    }
+
+    /// Reject a tensor-core cooperative op whose warp has exited lanes.
+    /// The ISA defines each of `ldmatrix`, `mma`, `wmma.load`,
+    /// `wmma.store`, and `wmma.mma` as undefined "if any thread in the
+    /// warp has exited" (their respective Descriptions, PTX ISA 9.1), so -
+    /// as for misalignment - the undefined behavior is rejected loudly
+    /// rather than silently modeled: an exited lane's addresses and
+    /// fragment registers are unknowable, leaving no byte-precise access
+    /// attribution. These ops block with the full-warp mask, and
+    /// `find_ready_warp_group` already rejects masks naming lanes beyond
+    /// the CTA, so fewer than 32 live members means exited lanes.
+    fn require_live_warp(&self, pc: InstrId, members: &[ThreadId], what: &str) -> EvalResult<()> {
+        if members.len() != WARP_SIZE as usize {
+            return Err(EvalError::WarpMismatch {
+                pc,
+                reason: format!(
+                    "{} requires all 32 warp lanes live, but only {} are \
+                     (the PTX ISA defines the instruction as undefined if \
+                     any thread in the warp has exited)",
+                    what,
+                    members.len()
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -233,7 +276,20 @@ impl Interpreter<'_> {
                     ),
                 });
             }
-            let value = lane_src[j as usize].expect("mask lanes were gathered");
+            let value = match lane_src[j as usize] {
+                Some(v) => v,
+                // Source lane in the mask but exited: "results are
+                // undefined if a thread sources a register from an
+                // inactive thread" (shfl.sync Description) - the lazily
+                // erroring `Undefined` is that exact model, failing only
+                // if the value reaches an output or a concreteness point.
+                // The ISA pseudocode sets `p = pval` from the pure lane
+                // arithmetic without consulting the source's activity, so
+                // the predicate keeps its computed value here (in
+                // particular it is *true* for an in-range exited source,
+                // unlike the out-of-segment case).
+                None => Value::Scalar(self.arena.undefined()),
+            };
             results.push((m, pval, value));
         }
 
@@ -266,12 +322,11 @@ impl Interpreter<'_> {
                 what: "ldmatrix .trans".to_string(),
             });
         }
-        if members.len() != WARP_SIZE as usize {
-            return Err(EvalError::WarpMismatch {
-                pc,
-                reason: "ldmatrix requires a full warp".to_string(),
-            });
-        }
+        // Covers the exited address-supplying lane in particular: lane
+        // `i*8 + r` holds row r's address in a register, and an exited
+        // lane's registers are not observable, so the row's footprint
+        // cannot be modeled.
+        self.require_live_warp(pc, members, "ldmatrix")?;
         if dst.len() != num as usize {
             return Err(EvalError::Unsupported {
                 pc,
@@ -295,6 +350,9 @@ impl Interpreter<'_> {
         for &m in members {
             let lane = m.0 % WARP_SIZE;
             for (i, reg) in dst.iter().enumerate() {
+                // Wrap-free in every profile: the row address passed the
+                // 16-byte alignment check above, so it is at most
+                // `u64::MAX - 15`, and the lane offset is at most 12.
                 let byte = row_addr[i][(lane / 4) as usize] + (lane % 4) as u64 * 4;
                 let v = self.mem_read(m, pc, MemSpace::Shared, byte, 4)?;
                 self.threads[m].regs.write(*reg, v);
@@ -336,12 +394,8 @@ impl Interpreter<'_> {
                 what: "mma with non-row.col layouts".to_string(),
             });
         }
-        if members.len() != WARP_SIZE as usize {
-            return Err(EvalError::WarpMismatch {
-                pc,
-                reason: "mma.sync requires a full warp".to_string(),
-            });
-        }
+        // Every lane owns a/b/c fragment elements the product needs.
+        self.require_live_warp(pc, members, "mma.sync")?;
 
         let mut a = Grid::new(16, 16);
         let mut b = Grid::new(16, 8);
@@ -569,12 +623,9 @@ impl Interpreter<'_> {
                 what: format!("wmma shape {}", shape),
             });
         }
-        if members.len() != WARP_SIZE as usize {
-            return Err(EvalError::WarpMismatch {
-                pc,
-                reason: "wmma requires a full warp".to_string(),
-            });
-        }
+        // Every lane owns fragment elements (and the loads/stores need the
+        // whole warp's footprint).
+        self.require_live_warp(pc, members, "wmma")?;
         Ok(())
     }
 
@@ -604,6 +655,23 @@ impl Interpreter<'_> {
         }
         let stride = stride as u64;
         self.check_alignment(lead, pc, space, base, WMMA_BASE_ALIGN_BYTES)?;
+        // The whole 16x16 fragment footprint must stay within the u64
+        // address space (release-active, computed in u128 so the check
+        // itself cannot overflow): the per-element sums below -
+        // `base + (row*stride + col) * elem_bytes` with row/col <= 15 -
+        // are then provably wrap-free, so no wrapped intermediate can
+        // reach the bounds checker as an unrelated small address.
+        let elem_bytes = elem_type.size_bytes() as u128;
+        let max_off = 15u128 * stride as u128 + 15;
+        if base as u128 + max_off * elem_bytes > u64::MAX as u128 {
+            return Err(EvalError::Unsupported {
+                pc,
+                what: format!(
+                    "wmma footprint from base {:#x} with stride {} overflows the address space",
+                    base, stride
+                ),
+            });
+        }
         let row_bytes = elem_type.size_bytes() as u64 * stride;
         if !row_bytes.is_multiple_of(WMMA_STRIDE_ALIGN_BYTES) {
             // With `base` aligned, the first misaligned leading-dimension

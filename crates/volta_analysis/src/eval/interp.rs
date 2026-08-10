@@ -71,8 +71,20 @@ struct Region {
 }
 
 impl Region {
+    /// Whole-access containment, in subtraction form: no sum here can
+    /// overflow in any build profile. The additive form
+    /// `addr + width <= base + size` wraps for addresses near `u64::MAX`
+    /// (e.g. a negative index reaching `effective_addr`) and in release
+    /// mode silently *accepts* the wrapped access; verification-relevant
+    /// checks must not rely on debug overflow panics.
     fn contains(&self, addr: u64, width: u64) -> bool {
-        addr >= self.base && addr + width <= self.base + self.size
+        width <= self.size && addr >= self.base && addr - self.base <= self.size - width
+    }
+
+    /// Whether `addr` lies inside `[base, base + size)`, i.e. this region
+    /// owns the byte. Subtraction form; a zero-size region owns nothing.
+    fn owns(&self, addr: u64) -> bool {
+        addr >= self.base && addr - self.base < self.size
     }
 }
 
@@ -172,19 +184,35 @@ impl<'p> Interpreter<'p> {
             let _ = params.push(v);
         }
 
-        // Build validity regions.
+        // Build validity regions. Every region must satisfy
+        // `base + size <= u64::MAX` (checked here, release-active): with
+        // that invariant and the subtraction-form `Region::contains`, any
+        // access that passes `check_bounds` has `addr + width` within u64
+        // range, so the byte-range loops downstream (race recording, input
+        // materialization, memory granules) can never wrap.
+        fn push_region(list: &mut Vec<Region>, base: u64, size: u64, what: &str) -> EvalResult<()> {
+            if size > u64::MAX - base {
+                return Err(EvalError::Config {
+                    message: format!(
+                        "{} region [{:#x}, {:#x} + {}) overflows the address space",
+                        what, base, base, size
+                    ),
+                });
+            }
+            list.push(Region { base, size });
+            Ok(())
+        }
         let mut regions = MemRegions::default();
         for array in &config.arrays {
-            regions.global.push(Region {
-                base: array.base,
-                size: array.size_bytes(),
-            });
+            push_region(&mut regions.global, array.base, array.size_bytes(), "array")?;
         }
         for var in program.symbols.global_vars() {
-            regions.global.push(Region {
-                base: var.addr,
-                size: var.size_bytes,
-            });
+            push_region(
+                &mut regions.global,
+                var.addr,
+                var.size_bytes,
+                "global variable",
+            )?;
         }
         if program.symbols.has_extern_shared() && config.dynamic_shared_bytes == 0 {
             return Err(EvalError::Config {
@@ -197,24 +225,30 @@ impl<'p> Interpreter<'p> {
                 // region for it is added below.
                 continue;
             }
-            regions.shared.push(Region {
-                base: info.offset,
-                size: info.size_bytes,
-            });
+            push_region(
+                &mut regions.shared,
+                info.offset,
+                info.size_bytes,
+                "shared variable",
+            )?;
         }
         // The dynamic (`.extern .shared`) window: based after all static
         // allocations, sized by the launch configuration.
         if let Some(base) = program.symbols.extern_shared_base() {
-            regions.shared.push(Region {
+            push_region(
+                &mut regions.shared,
                 base,
-                size: config.dynamic_shared_bytes,
-            });
+                config.dynamic_shared_bytes,
+                "dynamic shared",
+            )?;
         }
         for var in program.symbols.local_vars() {
-            regions.local.push(Region {
-                base: var.offset,
-                size: var.size_bytes,
-            });
+            push_region(
+                &mut regions.local,
+                var.offset,
+                var.size_bytes,
+                "local variable",
+            )?;
         }
 
         // Input-array symbols are materialized lazily on first read (arrays
@@ -299,10 +333,12 @@ impl<'p> Interpreter<'p> {
             if !array.kind.is_output() {
                 continue;
             }
-            let end = array.base + array.size_bytes();
+            let size = array.size_bytes();
             let mut elems: Vec<(u64, ExprId)> = Vec::new();
             for (addr, width, value) in self.global.dirty_cells() {
-                if addr < array.base || addr + width > end {
+                // Whole-cell containment in subtraction form (as in
+                // `Region::contains`): no overflowing sums for any cell.
+                if addr < array.base || width > size || addr - array.base > size - width {
                     continue;
                 }
                 let offset = addr - array.base;
@@ -419,18 +455,14 @@ impl<'p> Interpreter<'p> {
         }
     }
 
-    /// Find a warp group whose members have all arrived at the same pc with
-    /// the same mask. Returns (pc, mask, member threads).
+    /// Find a warp group whose live members have all arrived at the same pc
+    /// with the same mask. Returns (pc, mask, live member threads).
     fn find_ready_warp_group(&self) -> EvalResult<Option<(InstrId, u32, Vec<ThreadId>)>> {
         'candidates: for (leader, state) in self.threads.iter() {
             let Status::AtWarpOp { mask } = state.status else {
                 continue;
             };
             let pc = state.pc;
-            let is_pure_sync = matches!(
-                self.program.instruction(pc),
-                Some(LoweredInstr::BarWarpSync { .. })
-            );
             let warp_base = (leader.0 / WARP_SIZE) * WARP_SIZE;
             let mut members = Vec::new();
             for lane in 0..WARP_SIZE {
@@ -452,9 +484,22 @@ impl<'p> Interpreter<'p> {
                     Status::AtWarpOp { mask: m } if m == mask && member.pc == pc => {
                         members.push(ThreadId(tid));
                     }
-                    // A pure sync treats exited lanes as arrived (paper's
-                    // Sync rule); data ops need every lane's state.
-                    Status::Exited if is_pure_sync => {}
+                    // An exited lane counts as arrived at *every* warp op,
+                    // not just pure syncs: the paper's Sync rule fires when
+                    // each i in I is at the sync *or at return*, and the ISA
+                    // says the same for shfl.sync ("wait until all
+                    // non-exited threads corresponding to membermask have
+                    // executed shfl.sync"). Exited lanes execute nothing
+                    // (they are excluded from `members`) but rejoin the
+                    // group for the chi-clear in `execute_warp_op`; data
+                    // sourced from them is handled per-op.
+                    Status::Exited => {}
+                    // A live lane elsewhere (different pc or mask): the
+                    // group is not ready. The paper's straight-line model is
+                    // silent on matching syncs across program points, so a
+                    // group whose live lanes never converge at one pc stays
+                    // stuck and surfaces as Deadlock - the conservative
+                    // choice over cross-pc matching.
                     _ => continue 'candidates,
                 }
             }
@@ -480,6 +525,15 @@ impl<'p> Interpreter<'p> {
         if id.is_none() {
             return false; // everyone exited (or nobody is at a barrier)
         }
+        // Deliberately the paper's Sync'/syncMem semantics with I = the full
+        // CTA: exited threads count as arrived (the loop above) and are
+        // *included* in the chi-clear - `sync_all` empties every pending
+        // set, theirs too. This is stronger than the ISA's barrier{.cta}
+        // ordering, which only orders accesses "relative to all threads
+        // participating in the barrier" (an exited thread participates in
+        // nothing), so a spec-level race pairing a thread's pre-exit access
+        // with another thread's post-barrier access is intentionally not
+        // reported.
         self.race.sync_all();
         trace!("fired bar.sync {}", id.unwrap_or(0));
         for state in self.threads.values_mut() {
@@ -591,9 +645,12 @@ impl<'p> Interpreter<'p> {
                 let width = ty.size_bytes() as u64;
                 // The access size of a vector load is the *total* number of
                 // bytes accessed (`ld.v4.b32` is one 16-byte access, PTX
-                // ISA 6.4.2), so the whole vector's alignment is checked
-                // once here; the element-width checks in `mem_read` below
-                // are implied by it.
+                // ISA 6.4.2), so the whole vector's bounds and alignment
+                // are checked once here. The whole-footprint bounds check
+                // is load-bearing: the per-element checks in `mem_read`
+                // below would each pass inside a *different* region and let
+                // a v4 straddle two adjacent arrays silently.
+                self.check_bounds(t, pc, *space, addr, dst.len() as u64 * width)?;
                 self.check_alignment(t, pc, *space, addr, dst.len() as u64 * width)?;
                 for (k, reg) in dst.iter().enumerate() {
                     let v = self.mem_read(t, pc, *space, addr + k as u64 * width, width)?;
@@ -624,8 +681,11 @@ impl<'p> Interpreter<'p> {
             } => {
                 let addr = self.effective_addr(t, pc, base, *offset)?;
                 let width = ty.size_bytes() as u64;
-                // As for `LoadVec`: a vector store's access size is the
-                // total bytes stored, checked once for the whole vector.
+                // As for `LoadVec`: a vector store is one access of the
+                // total size, so its whole footprint must fit in the one
+                // region owning its first byte, and its alignment is the
+                // total size's.
+                self.check_bounds(t, pc, *space, addr, src.len() as u64 * width)?;
                 self.check_alignment(t, pc, *space, addr, src.len() as u64 * width)?;
                 for (k, reg) in src.iter().enumerate() {
                     let v = self.read_reg(t, pc, *reg)?;
@@ -647,7 +707,10 @@ impl<'p> Interpreter<'p> {
                 self.threads[t].regs.write(*dst, v);
             }
 
-            // Address-space conversion is the identity on our absolute addresses.
+            // Only `cvta.to.global` reaches evaluation (lowering rejects
+            // every other cvta form): global addresses are absolute u64s
+            // and the generic window over global is identity-mapped, so
+            // the conversion is the identity.
             LoweredInstr::Cvta { dst, src, .. } => {
                 let v = self.operand_value(t, pc, src)?;
                 self.threads[t].regs.write(*dst, v);
@@ -877,9 +940,26 @@ impl<'p> Interpreter<'p> {
             }
 
             LoweredInstr::Activemask { dst } => {
-                // All-lanes-active: the benchmarks use activemask only from
-                // converged code to build shfl.sync masks.
-                let r = self.arena.int(u32::MAX as i64);
+                // The OR of `1 << lane` over the executing thread's warp
+                // lanes that exist in the CTA and have not exited (ISA
+                // 9.7.13.11: an "exited or inactive or predicated-off
+                // thread will contribute 0"). Predication and divergence
+                // are deliberately unmodeled - the per-thread interpreter
+                // runs every thread's full straight-line program - so this
+                // is exact for the converged case. Which lanes have exited
+                // when a given thread executes activemask depends on the
+                // round-robin schedule, just as it depends on timing on
+                // real hardware; no cross-thread agreement is implied.
+                let warp_base = (t.0 / WARP_SIZE) * WARP_SIZE;
+                let mut mask: u32 = 0;
+                for lane in 0..WARP_SIZE {
+                    let tid = warp_base + lane;
+                    if tid < self.n_threads && self.threads[ThreadId(tid)].status != Status::Exited
+                    {
+                        mask |= 1 << lane;
+                    }
+                }
+                let r = self.arena.int(mask as i64);
                 self.threads[t].regs.write(*dst, Value::Scalar(r));
             }
 
@@ -1053,6 +1133,12 @@ impl<'p> Interpreter<'p> {
     // =====================================================================
 
     /// Compute the concrete effective address `base + offset`.
+    ///
+    /// The `[reg + imm]` sum is checked, not wrapped (release-active): a
+    /// wrapped "address" would be handed to the bounds machinery as an
+    /// unrelated location. No real launch places data within an `i64`
+    /// immediate of the address-space edge, so overflow here is always a
+    /// program/config error and is reported loudly.
     pub(in crate::eval) fn effective_addr(
         &mut self,
         t: ThreadId,
@@ -1061,9 +1147,27 @@ impl<'p> Interpreter<'p> {
         offset: i64,
     ) -> EvalResult<u64> {
         let base = self.concrete_operand(t, pc, base, "memory address")?;
-        Ok(base.wrapping_add(offset) as u64)
+        match base.checked_add(offset) {
+            Some(addr) => Ok(addr as u64),
+            None => Err(EvalError::AddressOverflow {
+                thread: t,
+                pc,
+                base,
+                offset,
+            }),
+        }
     }
 
+    /// Ownership containment: the region owning the access's *first byte*
+    /// must contain the whole access; an access whose first byte no region
+    /// owns is out of bounds. Anchoring at the first byte's owner makes an
+    /// access that starts inside one array and runs past its end a loud
+    /// `OutOfBounds` even when the trailing bytes land inside an adjacent
+    /// array (the paper's §6.2 point: hardware happens to tolerate
+    /// out-of-bounds shared reads, the model must not). Regions never
+    /// overlap (config validation and the symbol-table packer both
+    /// guarantee it), so the owner is unique; `find` keeps the answer
+    /// deterministic regardless.
     fn check_bounds(
         &self,
         t: ThreadId,
@@ -1083,16 +1187,15 @@ impl<'p> Interpreter<'p> {
                 });
             }
         };
-        if regions.iter().any(|r| r.contains(addr, width)) {
-            Ok(())
-        } else {
-            Err(EvalError::OutOfBounds {
+        match regions.iter().find(|r| r.owns(addr)) {
+            Some(owner) if owner.contains(addr, width) => Ok(()),
+            _ => Err(EvalError::OutOfBounds {
                 thread: t,
                 pc,
                 space,
                 addr,
                 width,
-            })
+            }),
         }
     }
 
@@ -1223,10 +1326,24 @@ impl<'p> Interpreter<'p> {
             if !array.kind.is_input() {
                 continue;
             }
-            let end = array.base + array.size_bytes();
-            if addr + width <= array.base || addr >= end {
+            // Overlap of [addr, addr+width) with [base, base+size), in
+            // subtraction form so neither sum is formed: the intervals
+            // overlap iff each start lies short of the other end.
+            let size = array.size_bytes();
+            let overlaps = if addr >= array.base {
+                addr - array.base < size
+            } else {
+                array.base - addr < width
+            };
+            if !overlaps {
                 continue;
             }
+            // Both sums below are exact: the access was bounds-checked
+            // (`addr + width` fits inside its owning region) and the
+            // array's end fits in u64 (`AnalysisConfig::validate`), so
+            // with width >= 1 neither `addr + width - 1` nor
+            // `base + size - 1` can wrap.
+            let end = array.base + size;
             let first = (addr.max(array.base) - array.base) / array.elem_width;
             let last = ((addr + width - 1).min(end - 1) - array.base) / array.elem_width;
             let mut array_sid: Option<StringId> = None;

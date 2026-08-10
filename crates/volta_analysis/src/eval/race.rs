@@ -64,6 +64,11 @@ impl RaceTracker {
 
     /// Record a read of `[addr, addr + width)` by `thread`, checking for a
     /// race with the last writer of each byte.
+    ///
+    /// The byte range cannot wrap: callers (`mem_read`) bounds-check the
+    /// access first, and every region satisfies `base + size <= u64::MAX`
+    /// (checked at region construction in `Interpreter::new`), so
+    /// `addr + width` is always representable.
     pub fn read(
         &mut self,
         space: MemSpace,
@@ -103,6 +108,10 @@ impl RaceTracker {
     /// Record a write of `[addr, addr + width)` by `thread`, checking for a
     /// race with every recorded reader and the last writer of each byte.
     /// Following the paper's WrMem', the read sets are left unchanged.
+    ///
+    /// As for [`Self::read`], the byte range cannot wrap: accesses are
+    /// bounds-checked against overflow-checked regions before reaching
+    /// here.
     pub fn write(
         &mut self,
         space: MemSpace,

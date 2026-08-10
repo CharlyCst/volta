@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use volta_common::Span;
 use volta_frontend::ascii::AsciiSliceExt;
 use volta_frontend::ast::{
-    self, AbsInstr, AddInstr, Address, AddressBase, BarInstr, BarMode, BraInstr, CallInstr,
+    self, AbsInstr, AddInstr, Address, AddressBase, BarMode, BraInstr, CallInstr,
     CmpOp as AstCmpOp, CvtInstr, CvtRounding, DivInstr, FmaInstr, FromAscii, Function,
     FunctionBody, Instruction, InstructionOp, LdInstr, MadInstr, MaxInstr, MemSemantics, MinInstr,
     MulInstr, MulMode, NegInstr, Operand as AstOperand, ParsedInstruction, ScalarType, SetpInstr,
@@ -1491,20 +1491,51 @@ fn lower_parsed_instruction(
         // Data Movement - Cvta (address conversion)
         // =========================================================================
         ParsedInstruction::Cvta(cvta) => {
-            // to_generic and ty are ignorable: addresses here are absolute
-            // u64 offsets in per-space address spaces, so the conversion is
-            // the identity in both directions and at either pointer width.
             let ast::CvtaInstr {
-                to_generic: _to_generic,
+                to_generic,
                 space,
-                ty: _ty,
+                ty: _ty, // pointer width; the identity holds at either width
                 dst,
                 src,
             } = cvta;
+            // Only `cvta.to.global` is accepted, as the identity: global
+            // addresses are absolute u64s here and the generic window over
+            // global is identity-mapped, so generic->global is exact (the
+            // corpus's one cvta form: param pointers into global arrays).
+            // Every other form is rejected loudly. Generic addressing has
+            // no per-space windows in this model, so a generic address
+            // minted from a shared/local/const address (`cvta.<space>`,
+            // the to-generic direction) would be an absolute address in
+            // the *wrong* space, and `cvta.to.<other-space>` would bless
+            // an arbitrary value as a shared/local address. Spaceless
+            // ld/st is already rejected (`convert_space`), so no accepted
+            // instruction can consume a generic address derived from
+            // shared/local - rejecting the producers closes the loop.
+            if *to_generic || *space != StateSpace::Global {
+                let form = format!(
+                    "cvta{}.{}",
+                    if *to_generic { "" } else { ".to" },
+                    format!("{:?}", space).to_lowercase()
+                );
+                return Err(LowerError::UnsupportedInstruction {
+                    instruction: form,
+                    reason: Some(
+                        "only cvta.to.global is modeled (as the identity); generic \
+                         addresses have no per-space windows in this model"
+                            .to_string(),
+                    ),
+                });
+            }
             let dst = ctx.resolve_dst(dst)?;
             let src = ctx.resolve_operand(src)?;
-            let space = ctx.convert_space(Some(*space), "cvta")?;
-            ctx.emit(LoweredInstr::Cvta { dst, src, space }, predicate)?;
+            ctx.emit(
+                LoweredInstr::Cvta {
+                    dst,
+                    src,
+                    space: MemSpace::Global,
+                },
+                predicate,
+            )?;
         }
 
         // =========================================================================
@@ -1538,7 +1569,29 @@ fn lower_parsed_instruction(
         // Synchronization - Bar
         // =========================================================================
         ParsedInstruction::Bar(bar) => {
-            lower_bar(ctx, bar, predicate)?;
+            lower_bar(ctx, bar.mode, &bar.operands, predicate)?;
+        }
+
+        // `barrier{.cta}.sync{.aligned} a` without a thread count is the
+        // same full-CTA barrier as `bar.sync a`: the ISA states
+        // "bar{.cta}.sync is equivalent to barrier{.cta}.sync.aligned",
+        // and dropping `.aligned` only drops the compile-time promise that
+        // all threads reach the same textual barrier - the runtime
+        // semantics the evaluator models are identical. The bar path's
+        // restrictions (immediate id 0-15, no thread-count operand, no
+        // .arrive/.red) apply unchanged.
+        ParsedInstruction::Barrier(barrier) => {
+            lower_bar(ctx, barrier.mode, &barrier.operands, predicate)?;
+        }
+
+        // =========================================================================
+        // Synchronization - bar.warp.sync
+        // =========================================================================
+        ParsedInstruction::BarWarpSync(bws) => {
+            // The membermask lowers exactly like shfl.sync's: any operand
+            // form, required concrete at evaluation time.
+            let mask = ctx.resolve_operand(&bws.membermask)?;
+            ctx.emit(LoweredInstr::BarWarpSync { mask }, predicate)?;
         }
 
         // =========================================================================
@@ -3521,12 +3574,14 @@ fn lower_branch(
     Ok(())
 }
 
+/// Lower `bar.sync a` / `barrier.sync{.aligned} a` (both callers pass their
+/// mode and operand list; the two spellings share these semantics).
 fn lower_bar(
     ctx: &mut LoweringContext,
-    bar: &BarInstr,
+    mode: BarMode,
+    operands: &[AstOperand],
     predicate: Option<Predicate>,
 ) -> LowerResult<()> {
-    let BarInstr { mode, operands } = bar;
     match mode {
         BarMode::Sync => {}
         // bar.arrive does not block the arriving thread; emitting a blocking
@@ -3538,7 +3593,7 @@ fn lower_bar(
 
     // The barrier id must be a concrete immediate: barriers are identified
     // per-id at evaluation time, so a register id cannot be resolved here.
-    let barrier_id = match operands.as_slice() {
+    let barrier_id = match operands {
         [] => {
             return Err(unsupported(
                 "bar.sync",
