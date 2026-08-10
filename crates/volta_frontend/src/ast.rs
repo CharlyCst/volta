@@ -2023,50 +2023,9 @@ impl FromAscii for CacheOp {
     }
 }
 
-/// L1 cache eviction priority (Blocks 86-89)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L1EvictionPriority {
-    EvictNormal,
-    EvictUnchanged,
-    EvictFirst,
-    EvictLast,
-    NoAllocate,
-}
-
-impl FromAscii for L1EvictionPriority {
-    fn from_ascii(s: &[AsciiChar]) -> Option<Self> {
-        Some(match s.as_bytes() {
-            b"L1::evict_normal" => L1EvictionPriority::EvictNormal,
-            b"L1::evict_unchanged" => L1EvictionPriority::EvictUnchanged,
-            b"L1::evict_first" => L1EvictionPriority::EvictFirst,
-            b"L1::evict_last" => L1EvictionPriority::EvictLast,
-            b"L1::no_allocate" => L1EvictionPriority::NoAllocate,
-            _ => return None,
-        })
-    }
-}
-
-/// L2 cache eviction priority (Blocks 86-89)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L2EvictionPriority {
-    EvictNormal,
-    EvictFirst,
-    EvictLast,
-}
-
-impl FromAscii for L2EvictionPriority {
-    fn from_ascii(s: &[AsciiChar]) -> Option<Self> {
-        Some(match s.as_bytes() {
-            b"L2::evict_normal" => L2EvictionPriority::EvictNormal,
-            b"L2::evict_first" => L2EvictionPriority::EvictFirst,
-            b"L2::evict_last" => L2EvictionPriority::EvictLast,
-            _ => return None,
-        })
-    }
-}
-
 /// Load instruction: `ld{.sem}{.scope}{.space}{.cop}{.vec}.type d, [a]`
-/// Blocks 86-87: Supports eviction priority modifiers
+/// (Blocks 86-87). Cache performance-hint qualifiers (eviction priority,
+/// prefetch size) are consumed and dropped at parse time.
 #[derive(Debug, Clone)]
 pub struct LdInstr {
     pub semantics: MemSemantics,
@@ -2075,10 +2034,6 @@ pub struct LdInstr {
     pub space_qualifier: Option<StateSpaceQualifier>,
     pub cache_op: Option<CacheOp>,
     pub vec: Option<VecWidth>,
-    /// L1 cache eviction priority (Block 87)
-    pub l1_eviction: Option<L1EvictionPriority>,
-    /// L2 cache eviction priority (Block 87)
-    pub l2_eviction: Option<L2EvictionPriority>,
     /// Non-coherent load (ld.global.nc)
     pub nc: bool,
     /// MMIO load (ld.mmio)
@@ -2091,7 +2046,8 @@ pub struct LdInstr {
 }
 
 /// Store instruction: `st{.sem}{.scope}{.space}{.cop}{.vec}.type [a], b`
-/// Block 89: Supports eviction priority modifiers
+/// (Block 89). Cache performance-hint qualifiers (eviction priority,
+/// prefetch size) are consumed and dropped at parse time.
 #[derive(Debug, Clone)]
 pub struct StInstr {
     pub semantics: MemSemantics,
@@ -2100,10 +2056,6 @@ pub struct StInstr {
     pub space_qualifier: Option<StateSpaceQualifier>,
     pub cache_op: Option<CacheOp>,
     pub vec: Option<VecWidth>,
-    /// L1 cache eviction priority (Block 89)
-    pub l1_eviction: Option<L1EvictionPriority>,
-    /// L2 cache eviction priority (Block 89)
-    pub l2_eviction: Option<L2EvictionPriority>,
     /// MMIO store (st.mmio)
     pub mmio: bool,
     pub ty: ScalarType,

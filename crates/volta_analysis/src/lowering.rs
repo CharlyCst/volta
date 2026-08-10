@@ -22,7 +22,7 @@ use volta_frontend::ast::{
     VecWidth,
 };
 use volta_frontend::instr::InstrKind;
-use volta_frontend::instr_parse::parse_instruction;
+use volta_frontend::instr_parse::{is_cache_perf_hint, parse_instruction};
 use volta_frontend::lex::DottedIdent;
 
 use id_collections::{Id, IdVec};
@@ -2848,9 +2848,14 @@ fn lower_setp(
 }
 
 /// Check the ordering/system qualifiers shared by `ld` and `st`. `.weak` is
-/// the default and `.volatile` only forbids caching/reordering optimizations,
-/// neither of which the interpreter performs, so both are sound to accept;
-/// everything else is an unmodeled synchronization/system semantic.
+/// the default and is what the interpreter models. `.volatile` is more than
+/// an optimization barrier: ISA §8.4.2 makes it equivalent to a relaxed
+/// system-scope - i.e. morally strong - operation, so there are volatile
+/// handshakes that are race-free under the spec. Volta deliberately treats
+/// every access as weak (the paper's race model), which can only ADD
+/// reported races on such programs, never hide one - the conservative
+/// direction for a race checker. Everything else is an unmodeled
+/// synchronization/system semantic.
 fn check_mem_access_qualifiers(
     instruction: &str,
     semantics: MemSemantics,
@@ -2927,9 +2932,11 @@ fn lower_load(
         // Cache-behavior hints only; the loaded value is unaffected.
         cache_op: _cache_op,
         vec,
-        l1_eviction: _l1_eviction,
-        l2_eviction: _l2_eviction,
-        // Non-coherent load: a cache-coherence hint, same loaded value.
+        // Non-coherent load: the memory consistency model does not apply
+        // to ld.global.nc, so hardware may return stale data if the
+        // kernel violates the read-only contract (nvcc emits .nc only for
+        // const __restrict__ data). Volta returns the fresh value; a
+        // kernel that breaks the contract is a garbage-in case.
         nc: _nc,
         mmio,
         unified,
@@ -3018,8 +3025,6 @@ fn lower_store(
         // Cache-behavior hints only; the stored value is unaffected.
         cache_op: _cache_op,
         vec,
-        l1_eviction: _l1_eviction,
-        l2_eviction: _l2_eviction,
         mmio,
         ty,
         addr,
@@ -3497,8 +3502,12 @@ fn lower_ld_global_nc(
 
     for modifier in modifiers {
         if let DottedIdent::Qualified(parts) = modifier {
-            // L1::/L2:: eviction-priority hints: cache behavior only.
-            if matches!(parts.first(), Some(p) if p.as_bytes() == b"L1" || p.as_bytes() == b"L2") {
+            // Cache performance hints (eviction priority, prefetch size)
+            // are accepted and ignored - the same whitelist as plain
+            // ld/st. Anything else qualified (notably L2::cache_hint,
+            // which requires a cache-policy operand we do not parse) is
+            // rejected by name.
+            if is_cache_perf_hint(parts) {
                 continue;
             }
             return Err(unsupported(
@@ -4579,6 +4588,40 @@ mod tests {
     fn test_reject_ld_ordering_qualifiers() {
         assert_rejected("ld.acquire.gpu.global.u32 %r1, [%rd1];", "memory-ordering");
         assert_rejected("st.release.gpu.global.u32 [%rd1], %r1;", "memory-ordering");
+    }
+
+    #[test]
+    fn test_cache_perf_hints_accepted_cache_hint_rejected() {
+        // Eviction-priority and prefetch-size qualifiers are pure
+        // performance hints with no extra operand; they are accepted and
+        // ignored on ld, st, and ld.global.nc alike.
+        assert_lowers("ld.global.L2::128B.f32 %f1, [%rd1];");
+        assert_lowers("ld.global.L1::evict_last.L2::evict_first.u32 %r1, [%rd1];");
+        assert_lowers("ld.global.L1::no_allocate.L2::256B.f32 %f1, [%rd1];");
+        assert_lowers("st.global.L1::evict_first.f32 [%rd1], %f1;");
+        assert_lowers("st.global.L2::evict_last.u32 [%rd1], %r1;");
+        assert_lowers("ld.global.nc.L1::evict_unchanged.L2::64B.f32 %f1, [%rd1];");
+        // L2::cache_hint requires a cache-policy operand we do not parse;
+        // it must stay rejected on every path, not be skipped as a hint.
+        assert_rejected(
+            "ld.global.L2::cache_hint.f32 %f1, [%rd1];",
+            "QualifiedModifier",
+        );
+        assert_rejected(
+            "st.global.L2::cache_hint.f32 [%rd1], %f1;",
+            "QualifiedModifier",
+        );
+        assert_rejected("ld.global.nc.L2::cache_hint.f32 %f1, [%rd1];", "cache_hint");
+        // Spellings outside the spec's exact ld/st enumeration (L2 has no
+        // no_allocate) stay rejected too.
+        assert_rejected(
+            "ld.global.L2::no_allocate.f32 %f1, [%rd1];",
+            "QualifiedModifier",
+        );
+        assert_rejected(
+            "ld.global.nc.L2::no_allocate.f32 %f1, [%rd1];",
+            "no_allocate",
+        );
     }
 
     #[test]

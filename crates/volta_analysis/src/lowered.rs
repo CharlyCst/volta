@@ -388,12 +388,6 @@ pub enum LoweredInstr {
     /// CTA barrier: bar.sync barrier_id
     BarSync { barrier_id: u32 },
 
-    /// CTA barrier with thread count
-    BarSyncCount {
-        barrier_id: u32,
-        thread_count: Operand,
-    },
-
     /// Warp barrier: bar.warp.sync mask
     BarWarpSync { mask: Operand },
 
@@ -568,7 +562,6 @@ define_instr_kinds!(
     Ret,
     Exit,
     BarSync,
-    BarSyncCount,
     BarWarpSync,
     Membar,
     Shfl,
@@ -660,7 +653,6 @@ impl LoweredInstr {
 
             // Synchronization
             Self::BarSync { .. } => vec![],
-            Self::BarSyncCount { thread_count, .. } => from_op(thread_count).into_iter().collect(),
             Self::BarWarpSync { mask } => from_op(mask).into_iter().collect(),
             Self::Membar { .. } => vec![],
 
@@ -763,7 +755,6 @@ impl LoweredInstr {
             | Self::Exit
             | Self::Trap
             | Self::BarSync { .. }
-            | Self::BarSyncCount { .. }
             | Self::BarWarpSync { .. }
             | Self::Membar { .. }
             | Self::Nop => vec![],

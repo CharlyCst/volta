@@ -787,13 +787,6 @@ impl<'p> Interpreter<'p> {
                 return Ok(()); // pc advances when the barrier fires
             }
 
-            LoweredInstr::BarSyncCount { .. } => {
-                return Err(EvalError::Unsupported {
-                    pc,
-                    what: "bar.sync with thread count".to_string(),
-                });
-            }
-
             LoweredInstr::BarWarpSync { mask } => {
                 let mask = self.concrete_operand(t, pc, mask, "warp sync mask")? as u32;
                 self.block_at_warp_op(t, pc, mask)?;

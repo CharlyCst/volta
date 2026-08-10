@@ -290,12 +290,40 @@ fn token_to_binary_op(tok: &Token) -> BinaryOp {
 /// Convert suffix qualifiers from Ident::as_instr() into DottedIdent modifiers.
 /// E.g., for "st.async.weak" with mnemonic "st.async", the suffix is ".weak",
 /// which splits to ["", "weak"]. This function filters empty parts and wraps
-/// each in DottedIdent::Simple.
+/// each in DottedIdent::Simple; a part containing `::` (e.g. `L2::128B` from
+/// `ld.global.L2::128B.f32`) becomes DottedIdent::Qualified with the same
+/// component split the lexer gives stand-alone dotted qualifiers.
 fn parse_suffix_modifiers<'a>(suffix: impl Iterator<Item = &'a [AsciiChar]>) -> Vec<DottedIdent> {
     suffix
         .filter(|s| !s.is_empty())
-        .map(|s| DottedIdent::Simple(s.to_owned_ascii()))
+        .map(|s| {
+            let mut parts = split_double_colon(s);
+            if parts.len() == 1 {
+                DottedIdent::Simple(parts.pop().unwrap())
+            } else {
+                DottedIdent::Qualified(parts)
+            }
+        })
         .collect()
+}
+
+/// Split a modifier segment at each `::`. The lexer only ever consumes a
+/// `::` when a component follows it, so the resulting parts are non-empty.
+fn split_double_colon(s: &[AsciiChar]) -> Vec<AsciiString> {
+    let mut parts = Vec::new();
+    let mut rest = s;
+    loop {
+        match rest.windows(2).position(|w| w == ascii("::")) {
+            Some(i) => {
+                parts.push(rest[..i].to_owned_ascii());
+                rest = &rest[i + 2..];
+            }
+            None => {
+                parts.push(rest.to_owned_ascii());
+                return parts;
+            }
+        }
+    }
 }
 
 type LexerError = crate::lex::Error;

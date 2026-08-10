@@ -1087,9 +1087,26 @@ fn consume_name(start: usize, src: &[AsciiChar]) -> Option<(usize, Token)> {
     // An identifier "[a-zA-Z]{followsym}*" or an instruction mnemonic
     if c.is_alphabetic() {
         let mut pos = start + 1;
-        while let Some(&c) = src.get(pos) {
-            if is_followsym(c) || c == AsciiChar::FullStop {
+        let mut seen_dot = false;
+        loop {
+            let Some(&c) = src.get(pos) else { break };
+            if c == AsciiChar::FullStop {
+                seen_dot = true;
                 pos += 1;
+            } else if is_followsym(c) {
+                pos += 1;
+            } else if seen_dot
+                && let Some(comp_start) = consume_exact(pos, src, ascii("::"))
+                && let Some((comp_end, _)) = consume_followsyms(comp_start, src)
+            {
+                // A `::`-qualified component inside a dot-prefixed segment
+                // of an instruction mnemonic, e.g. the `.L2::128B` of
+                // `ld.global.L2::128B.f32`. Consumed only when another
+                // component follows, mirroring the dotted-qualifier path
+                // below (ptxas cases 3 and 4); a `::` before any dot is
+                // not consumed (ptxas case 1: `s::t.async` is a syntax
+                // error near ':').
+                pos = comp_end;
             } else {
                 break;
             }
@@ -1632,6 +1649,39 @@ mod tests {
         assert_eq!(lexer.next(), Some(Ok(Token::Colon)));
         assert_eq!(lexer.next(), Some(Ok(Token::Colon)));
         assert!(lexer.next().unwrap().is_err());
+    }
+
+    #[test]
+    fn test_qualified_components_in_instruction_idents() {
+        // A `::`-qualified component inside a dotted segment stays part of
+        // the instruction token (ptxas lexes `.L2::128B` as one modifier).
+        assert_eq!(
+            lex("ld.global.L2::128B.f32"),
+            Ok(vec![Token::Ident(Ident::new(
+                ascii("ld.global.L2::128B.f32").to_owned_ascii()
+            ))])
+        );
+        // A `::` before any dot is not consumed (ptxas case 1: `s::t` is a
+        // syntax error near ':').
+        assert_eq!(
+            lex("s::t"),
+            Ok(vec![
+                Token::Ident(Ident::new(ascii("s").to_owned_ascii())),
+                Token::Colon,
+                Token::Colon,
+                Token::Ident(Ident::new(ascii("t").to_owned_ascii())),
+            ])
+        );
+        // A `::` not followed by a component is not consumed (ptxas cases
+        // 3 and 4).
+        assert_eq!(
+            lex("st.async::"),
+            Ok(vec![
+                Token::Ident(Ident::new(ascii("st.async").to_owned_ascii())),
+                Token::Colon,
+                Token::Colon,
+            ])
+        );
     }
 
     // =========================================================================

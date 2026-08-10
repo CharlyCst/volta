@@ -153,7 +153,6 @@ fn eval_inner(
         }
 
         ExprNode::ToFloat(a) => ev(*a, memo)?,
-        ExprNode::ToInt(a) => ev(*a, memo)?.trunc(),
 
         ExprNode::SymbolicRead { array, index } => {
             // Resolves to the same identity as the materialized

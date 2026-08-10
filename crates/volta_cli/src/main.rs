@@ -746,6 +746,9 @@ const DUMP_MAGIC: &[u8; 8] = b"VOLTAVCD";
 /// `ExprNode`'s bincode layout).
 // 2.0: removed the never-produced SignExtend/ZeroExtend/Truncate ExprNode
 // variants, which shifts the bincode variant tags of every later variant.
+// The equally never-produced ToInt variant was then removed within the same
+// unreleased format revision; its tag shift rides the same 2.0 (no build
+// that wrote the intermediate layout ever shipped).
 const DUMP_MAJOR: u16 = 2;
 const DUMP_MINOR: u16 = 0;
 

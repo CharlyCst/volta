@@ -185,8 +185,6 @@ pub enum ExprNode {
     // =====================================================================
     /// Convert to float (from int)
     ToFloat(ExprId),
-    /// Convert to int (from float, truncating)
-    ToInt(ExprId),
 
     // =====================================================================
     // Special
@@ -231,7 +229,6 @@ impl ExprNode {
             | ExprNode::BitNot(a)
             | ExprNode::Not(a)
             | ExprNode::ToFloat(a)
-            | ExprNode::ToInt(a)
             | ExprNode::SymbolicRead { index: a, .. } => f(*a),
 
             ExprNode::Add(a, b)
@@ -875,14 +872,6 @@ impl ExprArena {
         self.push(ExprNode::ToFloat(a))
     }
 
-    /// Convert to int (from float, truncating), with constant folding.
-    pub fn to_int(&mut self, a: ExprId) -> ExprId {
-        if let ExprNode::FloatConst(v) = *self.node(a) {
-            return self.int(v as i64);
-        }
-        self.push(ExprNode::ToInt(a))
-    }
-
     // =================================================================
     // Query methods
     // =================================================================
@@ -1169,11 +1158,6 @@ impl ExprArena {
                 self.fmt_expr(*a, f)?;
                 write!(f, ")")
             }
-            ExprNode::ToInt(a) => {
-                write!(f, "int(")?;
-                self.fmt_expr(*a, f)?;
-                write!(f, ")")
-            }
             ExprNode::Fma(a, b, c) => {
                 write!(f, "fma(")?;
                 self.fmt_expr(*a, f)?;
@@ -1307,8 +1291,7 @@ fn structurally_equal_inner(
         | (Abs(a1), Abs(b1))
         | (BitNot(a1), BitNot(b1))
         | (Not(a1), Not(b1))
-        | (ToFloat(a1), ToFloat(b1))
-        | (ToInt(a1), ToInt(b1)) => structurally_equal(a_arena, *a1, b_arena, *b1),
+        | (ToFloat(a1), ToFloat(b1)) => structurally_equal(a_arena, *a1, b_arena, *b1),
 
         // Ternary ops
         (Fma(a1, a2, a3), Fma(b1, b2, b3)) | (Select(a1, a2, a3), Select(b1, b2, b3)) => {

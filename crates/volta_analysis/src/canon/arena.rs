@@ -86,8 +86,6 @@ pub enum UninterpOp {
     Sqrt,
     Abs,
     Rem,
-    /// Float-to-int truncation.
-    Floor,
     BitAnd,
     BitOr,
     BitXor,

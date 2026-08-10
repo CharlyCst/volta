@@ -195,7 +195,6 @@ impl Session {
             ExprNode::And(a, b) => self.uninterp2(side, arena, UninterpOp::And, *a, *b),
             ExprNode::Or(a, b) => self.uninterp2(side, arena, UninterpOp::Or, *a, *b),
             ExprNode::Not(a) => self.uninterp1(side, arena, UninterpOp::Not, *a),
-            ExprNode::ToInt(a) => self.uninterp1(side, arena, UninterpOp::Floor, *a),
             ExprNode::Select(c, t, f) => {
                 let rc = self.canon_value(side, arena, *c)?;
                 let rc = self.ratv_intern(rc);

@@ -203,46 +203,16 @@ impl ModifierParser {
             .ok_or(InstrParseError::MissingType)
     }
 
-    /// Try to parse L1 eviction priority (qualified modifiers like L1::evict_first)
-    pub fn try_l1_eviction_priority(&mut self) -> Option<L1EvictionPriority> {
-        if let Some(DottedIdent::Qualified(parts)) = self.peek()
-            && parts.len() == 2
-            && parts[0].as_bytes() == b"L1"
+    /// Consume any run of cache performance-hint qualifiers (eviction
+    /// priorities, prefetch sizes) at the current position, ignoring them.
+    /// Anything else `::`-qualified - notably `L2::cache_hint`, which
+    /// requires a cache-policy operand we do not parse - is left in place
+    /// for `reject_qualified` to error on.
+    pub fn skip_cache_perf_hints(&mut self) {
+        while matches!(self.peek(), Some(DottedIdent::Qualified(parts)) if is_cache_perf_hint(parts))
         {
-            let priority = match parts[1].as_bytes() {
-                b"evict_normal" => Some(L1EvictionPriority::EvictNormal),
-                b"evict_unchanged" => Some(L1EvictionPriority::EvictUnchanged),
-                b"evict_first" => Some(L1EvictionPriority::EvictFirst),
-                b"evict_last" => Some(L1EvictionPriority::EvictLast),
-                b"no_allocate" => Some(L1EvictionPriority::NoAllocate),
-                _ => None,
-            };
-            if priority.is_some() {
-                self.pos += 1;
-                return priority;
-            }
+            self.pos += 1;
         }
-        None
-    }
-
-    /// Try to parse L2 eviction priority (qualified modifiers like L2::evict_first)
-    pub fn try_l2_eviction_priority(&mut self) -> Option<L2EvictionPriority> {
-        if let Some(DottedIdent::Qualified(parts)) = self.peek()
-            && parts.len() == 2
-            && parts[0].as_bytes() == b"L2"
-        {
-            let priority = match parts[1].as_bytes() {
-                b"evict_normal" => Some(L2EvictionPriority::EvictNormal),
-                b"evict_first" => Some(L2EvictionPriority::EvictFirst),
-                b"evict_last" => Some(L2EvictionPriority::EvictLast),
-                _ => None,
-            };
-            if priority.is_some() {
-                self.pos += 1;
-                return priority;
-            }
-        }
-        None
     }
 
     /// Reject any `::`-qualified modifier at the current position (like
@@ -286,6 +256,37 @@ impl ModifierParser {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Whether a `::`-qualified modifier (split at `::`) is a cache-control
+/// qualifier that is a pure performance hint taking no extra operand, and
+/// can therefore be accepted and ignored on `ld`, `st`, and
+/// `ld.global.nc`: the eviction priorities (PTX ISA 9.7.9.2: "Cache
+/// eviction priority on load or store instructions is treated as a
+/// performance hint") and the prefetch sizes ("The .level::prefetch_size
+/// qualifier is treated as a performance hint only"). The sets are the
+/// spec's exact enumerations - note L2 eviction is narrower than L1's.
+/// `L2::cache_hint` is deliberately excluded: it requires an additional
+/// cache-policy operand that we do not parse.
+pub fn is_cache_perf_hint(parts: &[AsciiString]) -> bool {
+    let [level, hint] = parts else {
+        return false;
+    };
+    match level.as_bytes() {
+        // .level1::eviction_priority
+        b"L1" => matches!(
+            hint.as_bytes(),
+            b"evict_normal" | b"evict_unchanged" | b"evict_first" | b"evict_last" | b"no_allocate"
+        ),
+        b"L2" => matches!(
+            hint.as_bytes(),
+            // .level2::eviction_priority
+            b"evict_normal" | b"evict_first" | b"evict_last"
+            // .level::prefetch_size
+            | b"64B" | b"128B" | b"256B"
+        ),
+        _ => false,
     }
 }
 
@@ -2723,11 +2724,12 @@ fn parse_ld(
     let scope = mp.try_parse::<MemScope>();
     let space = mp.try_parse::<StateSpace>();
     let cache_op = mp.try_parse::<CacheOp>();
-    // Block 87: Eviction priority modifiers (L1::evict_*, L2::evict_*)
-    let l1_eviction = mp.try_l1_eviction_priority();
-    let l2_eviction = mp.try_l2_eviction_priority();
-    // Any other qualified modifier (a ::-qualified state space we did not
-    // parse above, L2::cache_hint, ...) is unsupported; error loudly.
+    // Eviction-priority and prefetch-size qualifiers are pure performance
+    // hints with no extra operand; accept and ignore them. Any other
+    // qualified modifier (a ::-qualified state space we did not parse
+    // above, L2::cache_hint - which requires a cache-policy operand we do
+    // not parse, ...) is unsupported; error loudly.
+    mp.skip_cache_perf_hints();
     mp.reject_qualified()?;
     let nc = mp.try_consume(ascii("nc"));
     let vec = mp.try_parse::<VecWidth>();
@@ -2744,8 +2746,6 @@ fn parse_ld(
         space_qualifier: None,
         cache_op,
         vec,
-        l1_eviction,
-        l2_eviction,
         nc,
         mmio,
         unified,
@@ -2786,11 +2786,12 @@ fn parse_st(
     let scope = mp.try_parse::<MemScope>();
     let space = mp.try_parse::<StateSpace>();
     let cache_op = mp.try_parse::<CacheOp>();
-    // Block 89: Eviction priority modifiers (L1::evict_*, L2::evict_*)
-    let l1_eviction = mp.try_l1_eviction_priority();
-    let l2_eviction = mp.try_l2_eviction_priority();
-    // Any other qualified modifier (a ::-qualified state space we did not
-    // parse above, L2::cache_hint, ...) is unsupported; error loudly.
+    // Eviction-priority and prefetch-size qualifiers are pure performance
+    // hints with no extra operand; accept and ignore them. Any other
+    // qualified modifier (a ::-qualified state space we did not parse
+    // above, L2::cache_hint - which requires a cache-policy operand we do
+    // not parse, ...) is unsupported; error loudly.
+    mp.skip_cache_perf_hints();
     mp.reject_qualified()?;
     let vec = mp.try_parse::<VecWidth>();
     let ty = mp.require_scalar_type()?;
@@ -2805,8 +2806,6 @@ fn parse_st(
         space_qualifier: None,
         cache_op,
         vec,
-        l1_eviction,
-        l2_eviction,
         mmio,
         ty,
         addr,
