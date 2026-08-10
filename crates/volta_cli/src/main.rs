@@ -744,7 +744,9 @@ const DUMP_MAGIC: &[u8; 8] = b"VOLTAVCD";
 /// backwards-compatible additions (older files stay loadable), bump
 /// `DUMP_MAJOR` and reset minor for breaking changes (e.g. any change to
 /// `ExprNode`'s bincode layout).
-const DUMP_MAJOR: u16 = 1;
+// 2.0: removed the never-produced SignExtend/ZeroExtend/Truncate ExprNode
+// variants, which shifts the bincode variant tags of every later variant.
+const DUMP_MAJOR: u16 = 2;
 const DUMP_MINOR: u16 = 0;
 
 fn write_dump(dump: &VcDump, path: &Path) -> io::Result<()> {

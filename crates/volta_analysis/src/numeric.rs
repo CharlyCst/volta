@@ -154,9 +154,6 @@ fn eval_inner(
 
         ExprNode::ToFloat(a) => ev(*a, memo)?,
         ExprNode::ToInt(a) => ev(*a, memo)?.trunc(),
-        ExprNode::SignExtend { value, .. }
-        | ExprNode::ZeroExtend { value, .. }
-        | ExprNode::Truncate { value, .. } => ev(*value, memo)?,
 
         ExprNode::SymbolicRead { array, index } => {
             // Resolves to the same identity as the materialized

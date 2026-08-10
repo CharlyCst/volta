@@ -220,10 +220,7 @@ impl Session {
             }
 
             // Conversions: identity over the reals.
-            ExprNode::ToFloat(a)
-            | ExprNode::SignExtend { value: a, .. }
-            | ExprNode::ZeroExtend { value: a, .. }
-            | ExprNode::Truncate { value: a, .. } => self.canon_value(side, arena, *a),
+            ExprNode::ToFloat(a) => self.canon_value(side, arena, *a),
 
             ExprNode::Discarded | ExprNode::Undefined => Err(CanonError::Undefined),
         }

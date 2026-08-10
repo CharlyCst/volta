@@ -341,13 +341,10 @@ fn translate_uncached(
             Ok(bld.bind(format!("(ite (<= {} {}) {} {})", ta, tb, ta, tb)))
         }
 
-        // Conversions: identity over the reals (matches
-        // `canon::canonicalize`'s treatment of the same nodes exactly).
-        // Not bound themselves - they forward straight to the child.
-        ExprNode::ToFloat(a)
-        | ExprNode::SignExtend { value: a, .. }
-        | ExprNode::ZeroExtend { value: a, .. }
-        | ExprNode::Truncate { value: a, .. } => translate(bld, memo, arena, *a),
+        // Conversion: identity over the reals (matches
+        // `canon::canonicalize`'s treatment of the same node exactly).
+        // Not bound itself - it forwards straight to the child.
+        ExprNode::ToFloat(a) => translate(bld, memo, arena, *a),
 
         other => Err(Unsupported(describe(other))),
     }

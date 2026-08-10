@@ -187,20 +187,6 @@ pub enum ExprNode {
     ToFloat(ExprId),
     /// Convert to int (from float, truncating)
     ToInt(ExprId),
-    /// Sign extend from narrower int
-    SignExtend {
-        value: ExprId,
-        from_bits: u32,
-        to_bits: u32,
-    },
-    /// Zero extend from narrower int
-    ZeroExtend {
-        value: ExprId,
-        from_bits: u32,
-        to_bits: u32,
-    },
-    /// Truncate to narrower int
-    Truncate { value: ExprId, to_bits: u32 },
 
     // =====================================================================
     // Special
@@ -246,9 +232,6 @@ impl ExprNode {
             | ExprNode::Not(a)
             | ExprNode::ToFloat(a)
             | ExprNode::ToInt(a)
-            | ExprNode::SignExtend { value: a, .. }
-            | ExprNode::ZeroExtend { value: a, .. }
-            | ExprNode::Truncate { value: a, .. }
             | ExprNode::SymbolicRead { index: a, .. } => f(*a),
 
             ExprNode::Add(a, b)
@@ -900,50 +883,6 @@ impl ExprArena {
         self.push(ExprNode::ToInt(a))
     }
 
-    /// Sign extend from `from_bits` to `to_bits`, with constant folding.
-    pub fn sign_extend(&mut self, a: ExprId, from_bits: u32, to_bits: u32) -> ExprId {
-        if let ExprNode::IntConst(v) = *self.node(a) {
-            let shift = 64 - from_bits;
-            let extended = (v << shift) >> shift;
-            return self.int(extended);
-        }
-        self.push(ExprNode::SignExtend {
-            value: a,
-            from_bits,
-            to_bits,
-        })
-    }
-
-    /// Zero extend from `from_bits` to `to_bits`, with constant folding.
-    pub fn zero_extend(&mut self, a: ExprId, from_bits: u32, to_bits: u32) -> ExprId {
-        if let ExprNode::IntConst(v) = *self.node(a) {
-            let mask = if from_bits >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << from_bits) - 1
-            };
-            return self.int((v as u64 & mask) as i64);
-        }
-        self.push(ExprNode::ZeroExtend {
-            value: a,
-            from_bits,
-            to_bits,
-        })
-    }
-
-    /// Truncate to `to_bits`, with constant folding.
-    pub fn truncate(&mut self, a: ExprId, to_bits: u32) -> ExprId {
-        if let ExprNode::IntConst(v) = *self.node(a) {
-            let mask = if to_bits >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << to_bits) - 1
-            };
-            return self.int((v as u64 & mask) as i64);
-        }
-        self.push(ExprNode::Truncate { value: a, to_bits })
-    }
-
     // =================================================================
     // Query methods
     // =================================================================
@@ -1235,29 +1174,6 @@ impl ExprArena {
                 self.fmt_expr(*a, f)?;
                 write!(f, ")")
             }
-            ExprNode::SignExtend {
-                value,
-                from_bits,
-                to_bits,
-            } => {
-                write!(f, "sext{}to{}(", from_bits, to_bits)?;
-                self.fmt_expr(*value, f)?;
-                write!(f, ")")
-            }
-            ExprNode::ZeroExtend {
-                value,
-                from_bits,
-                to_bits,
-            } => {
-                write!(f, "zext{}to{}(", from_bits, to_bits)?;
-                self.fmt_expr(*value, f)?;
-                write!(f, ")")
-            }
-            ExprNode::Truncate { value, to_bits } => {
-                write!(f, "trunc{}(", to_bits)?;
-                self.fmt_expr(*value, f)?;
-                write!(f, ")")
-            }
             ExprNode::Fma(a, b, c) => {
                 write!(f, "fma(")?;
                 self.fmt_expr(*a, f)?;
@@ -1401,43 +1317,6 @@ fn structurally_equal_inner(
                 && structurally_equal(a_arena, *a3, b_arena, *b3)
         }
 
-        // Conversions with metadata
-        (
-            SignExtend {
-                value: v1,
-                from_bits: f1,
-                to_bits: t1,
-            },
-            SignExtend {
-                value: v2,
-                from_bits: f2,
-                to_bits: t2,
-            },
-        )
-        | (
-            ZeroExtend {
-                value: v1,
-                from_bits: f1,
-                to_bits: t1,
-            },
-            ZeroExtend {
-                value: v2,
-                from_bits: f2,
-                to_bits: t2,
-            },
-        ) => f1 == f2 && t1 == t2 && structurally_equal(a_arena, *v1, b_arena, *v2),
-
-        (
-            Truncate {
-                value: v1,
-                to_bits: t1,
-            },
-            Truncate {
-                value: v2,
-                to_bits: t2,
-            },
-        ) => t1 == t2 && structurally_equal(a_arena, *v1, b_arena, *v2),
-
         // Discarded values are structurally equal to each other
         (Discarded, Discarded) => true,
 
@@ -1561,46 +1440,6 @@ mod tests {
         let step1 = arena.lshr(a, b);
         let e = arena.shl(step1, c);
         assert_eq!(arena.as_i64(e), Some(256));
-    }
-
-    #[test]
-    fn test_sign_extend() {
-        let mut arena = ExprArena::new();
-
-        // Sign extend 8-bit -1 (0xFF) to 64 bits
-        let v = arena.int(0xFF);
-        let e = arena.sign_extend(v, 8, 64);
-        assert_eq!(arena.as_i64(e), Some(-1));
-
-        // Sign extend 8-bit 127 (0x7F) to 64 bits - stays positive
-        let v = arena.int(0x7F);
-        let e = arena.sign_extend(v, 8, 64);
-        assert_eq!(arena.as_i64(e), Some(127));
-
-        // Sign extend 32-bit 0 to 64 bits
-        let v = arena.int(0);
-        let e = arena.sign_extend(v, 32, 64);
-        assert_eq!(arena.as_i64(e), Some(0));
-    }
-
-    #[test]
-    fn test_zero_extend() {
-        let mut arena = ExprArena::new();
-
-        // Zero extend 8-bit 0xFF to 64 bits - stays 255
-        let v = arena.int(0xFF);
-        let e = arena.zero_extend(v, 8, 64);
-        assert_eq!(arena.as_i64(e), Some(255));
-    }
-
-    #[test]
-    fn test_truncate() {
-        let mut arena = ExprArena::new();
-
-        // Truncate 0x1234 to 8 bits = 0x34
-        let v = arena.int(0x1234);
-        let e = arena.truncate(v, 8);
-        assert_eq!(arena.as_i64(e), Some(0x34));
     }
 
     #[test]
