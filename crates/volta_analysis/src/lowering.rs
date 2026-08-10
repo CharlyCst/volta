@@ -29,7 +29,7 @@ use id_collections::{Id, IdVec};
 
 use crate::lower_error::{LowerError, LowerResult};
 use crate::lowered::{
-    BinOp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, MembarScope,
+    BinOp, Clamp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, MembarScope,
     MulMode as LoweredMulMode, Operand, Predicate, ShflMode, UnaryOp,
 };
 use crate::source_map::SourceMapBuilder;
@@ -67,6 +67,15 @@ fn check_not_packed(ty: ScalarType, instruction: &str) -> LowerResult<()> {
         )),
         _ => Ok(()),
     }
+}
+
+/// Scalar (single-lane) floating-point types - the domain of the modeled
+/// float value clamps (`Clamp`). Excludes the packed float types and tf32.
+fn is_scalar_float(ty: ScalarType) -> bool {
+    matches!(
+        ty,
+        ScalarType::F16 | ScalarType::Bf16 | ScalarType::F32 | ScalarType::F64
+    )
 }
 
 // =============================================================================
@@ -1144,6 +1153,7 @@ fn lower_parsed_instruction(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: rem.ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -1253,6 +1263,7 @@ fn lower_parsed_instruction(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: logic.ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -1305,6 +1316,7 @@ fn lower_parsed_instruction(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: shift.ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -1396,6 +1408,7 @@ fn lower_parsed_instruction(
                             src_a: hi,
                             src_b: Operand::ImmI64(elem_width as i64),
                             ty: mov.ty,
+                            clamp: None,
                         },
                         predicate,
                     )?;
@@ -1408,6 +1421,7 @@ fn lower_parsed_instruction(
                             src_a: Operand::Reg(dst),
                             src_b: lo,
                             ty: mov.ty,
+                            clamp: None,
                         },
                         predicate,
                     )?;
@@ -1672,6 +1686,7 @@ fn lower_add(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: *ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -1701,13 +1716,15 @@ fn lower_add(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
         }
         AddInstr::Float32 {
             // Rounding mode and subnormal flushing don't apply: floats are
-            // reals here, so every add is exact.
+            // reals here, so every add is exact. `.sat` is a value clamp
+            // (exact over the reals) threaded through as `Clamp::Sat`.
             rnd: _rnd,
             ftz: _ftz,
             sat,
@@ -1715,9 +1732,6 @@ fn lower_add(
             src_a,
             src_b,
         } => {
-            if *sat {
-                return Err(unsupported("add.f32", ".sat modifier"));
-            }
             let ty = ScalarType::F32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -1734,6 +1748,7 @@ fn lower_add(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty,
+                    clamp: sat.then_some(Clamp::Sat),
                 },
                 predicate,
             )?;
@@ -1764,12 +1779,14 @@ fn lower_add(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
         }
         AddInstr::HalfF16 {
-            // Rounding mode and subnormal flushing don't apply over the reals.
+            // Rounding mode and subnormal flushing don't apply over the
+            // reals; `.sat` is an exact value clamp.
             rnd: _rnd,
             ftz: _ftz,
             sat,
@@ -1778,15 +1795,13 @@ fn lower_add(
             src_a,
             src_b,
         } => {
-            if *sat {
-                return Err(unsupported("add.f16", ".sat modifier"));
-            }
             check_not_packed(*ty, "add")?;
             lower_half_binop(
                 ctx,
                 BinOp::Add,
                 "add.f16",
                 *ty,
+                sat.then_some(Clamp::Sat),
                 dst,
                 src_a,
                 src_b,
@@ -1807,6 +1822,7 @@ fn lower_add(
                 BinOp::Add,
                 "add.bf16",
                 *ty,
+                None,
                 dst,
                 src_a,
                 src_b,
@@ -1845,6 +1861,7 @@ fn lower_add(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: dst_ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -1860,6 +1877,7 @@ fn lower_half_binop(
     op: BinOp,
     instr_name: &str,
     ty: ScalarType,
+    clamp: Option<Clamp>,
     dst: &AstOperand,
     src_a: &AstOperand,
     src_b: &AstOperand,
@@ -1880,6 +1898,7 @@ fn lower_half_binop(
             src_a: src_a_typed.operand,
             src_b: src_b_typed.operand,
             ty,
+            clamp,
         },
         predicate,
     )?;
@@ -1915,6 +1934,7 @@ fn lower_sub(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: *ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -1944,6 +1964,7 @@ fn lower_sub(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -1957,9 +1978,6 @@ fn lower_sub(
             src_a,
             src_b,
         } => {
-            if *sat {
-                return Err(unsupported("sub.f32", ".sat modifier"));
-            }
             let ty = ScalarType::F32;
             let dst_typed = ctx.resolve_dst_typed(dst)?;
             let src_a_typed = ctx.resolve_operand_typed(src_a)?;
@@ -1976,6 +1994,7 @@ fn lower_sub(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty,
+                    clamp: sat.then_some(Clamp::Sat),
                 },
                 predicate,
             )?;
@@ -2006,12 +2025,14 @@ fn lower_sub(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
         }
         SubInstr::HalfF16 {
-            // Rounding mode and subnormal flushing don't apply over the reals.
+            // Rounding mode and subnormal flushing don't apply over the
+            // reals; `.sat` is an exact value clamp.
             rnd: _rnd,
             ftz: _ftz,
             sat,
@@ -2020,15 +2041,13 @@ fn lower_sub(
             src_a,
             src_b,
         } => {
-            if *sat {
-                return Err(unsupported("sub.f16", ".sat modifier"));
-            }
             check_not_packed(*ty, "sub")?;
             lower_half_binop(
                 ctx,
                 BinOp::Sub,
                 "sub.f16",
                 *ty,
+                sat.then_some(Clamp::Sat),
                 dst,
                 src_a,
                 src_b,
@@ -2049,6 +2068,7 @@ fn lower_sub(
                 BinOp::Sub,
                 "sub.bf16",
                 *ty,
+                None,
                 dst,
                 src_a,
                 src_b,
@@ -2086,6 +2106,7 @@ fn lower_sub(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: dst_ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -2159,6 +2180,7 @@ fn lower_mul(
                             src_a: src_a_typed.operand,
                             src_b: src_b_typed.operand,
                             ty: *ty,
+                            clamp: None,
                         },
                         predicate,
                     )?;
@@ -2166,7 +2188,8 @@ fn lower_mul(
             }
         }
         MulInstr::Float {
-            // Rounding mode and subnormal flushing don't apply over the reals.
+            // Rounding mode and subnormal flushing don't apply over the
+            // reals; `.sat` is an exact value clamp.
             rnd: _rnd,
             ftz: _ftz,
             sat,
@@ -2175,8 +2198,14 @@ fn lower_mul(
             src_a,
             src_b,
         } => {
-            if *sat {
-                return Err(unsupported("mul.f", ".sat modifier"));
+            // The ISA allows `.sat` on mul only for .f32 and .f16/.f16x2
+            // (the instruction parser already enforces this; this guard is
+            // fail-closed insurance for the variant's other types).
+            if *sat && !matches!(ty, ScalarType::F32 | ScalarType::F16 | ScalarType::F16x2) {
+                return Err(unsupported(
+                    "mul.f",
+                    format!(".sat modifier on {:?} (invalid PTX)", ty),
+                ));
             }
             check_not_packed(*ty, "mul")?;
 
@@ -2195,6 +2224,7 @@ fn lower_mul(
                     src_a: src_a_typed.operand,
                     src_b: src_b_typed.operand,
                     ty: *ty,
+                    clamp: sat.then_some(Clamp::Sat),
                 },
                 predicate,
             )?;
@@ -2295,6 +2325,7 @@ fn lower_mad(
                     src_b: src_b_typed.operand,
                     src_c: src_c_typed.operand,
                     ty: *ty,
+                    clamp: None,
                 },
                 predicate,
             )?;
@@ -2310,7 +2341,8 @@ fn lower_fma(
 ) -> LowerResult<()> {
     // In every accepted arm the rounding mode (and ftz, where present) is
     // ignorable: floats are reals here, so the fused multiply-add is exact.
-    let (ty, src_ty, instr_name, dst, src_a, src_b, src_c) = match fma {
+    // `.sat`/`.relu` are exact value clamps, threaded through as `Clamp`.
+    let (ty, src_ty, instr_name, clamp, dst, src_a, src_b, src_c) = match fma {
         FmaInstr::Float32 {
             rnd: _rnd,
             ftz: _ftz,
@@ -2320,11 +2352,9 @@ fn lower_fma(
             src_b,
             src_c,
         } => {
-            if *sat {
-                return Err(unsupported("fma.rn.f32", ".sat modifier"));
-            }
             let ty = ScalarType::F32;
-            (ty, ty, "fma.rn.f32", dst, src_a, src_b, src_c)
+            let clamp = sat.then_some(Clamp::Sat);
+            (ty, ty, "fma.rn.f32", clamp, dst, src_a, src_b, src_c)
         }
         FmaInstr::Float32x2 { .. } => {
             return Err(unsupported(
@@ -2340,7 +2370,7 @@ fn lower_fma(
             src_c,
         } => {
             let ty = ScalarType::F64;
-            (ty, ty, "fma.rn.f64", dst, src_a, src_b, src_c)
+            (ty, ty, "fma.rn.f64", None, dst, src_a, src_b, src_c)
         }
         FmaInstr::HalfF16Sat {
             rnd: _rnd,
@@ -2352,15 +2382,22 @@ fn lower_fma(
             src_b,
             src_c,
         } => {
-            // sat==false is the plain scalar f16 fma; only .sat is rejected.
-            if *sat {
-                return Err(unsupported("fma.rn.f16", ".sat modifier"));
-            }
             check_not_packed(*ty, "fma")?;
-            (*ty, *ty, "fma.rn.f16", dst, src_a, src_b, src_c)
+            let clamp = sat.then_some(Clamp::Sat);
+            (*ty, *ty, "fma.rn.f16", clamp, dst, src_a, src_b, src_c)
         }
-        FmaInstr::HalfF16Relu { .. } => {
-            return Err(unsupported("fma.rn.f16", ".relu modifier"));
+        FmaInstr::HalfF16Relu {
+            rnd: _rnd,
+            ftz: _ftz,
+            ty,
+            dst,
+            src_a,
+            src_b,
+            src_c,
+        } => {
+            check_not_packed(*ty, "fma")?;
+            let clamp = Some(Clamp::Relu);
+            (*ty, *ty, "fma.rn.relu.f16", clamp, dst, src_a, src_b, src_c)
         }
         FmaInstr::HalfBf16 {
             rnd: _rnd,
@@ -2375,7 +2412,7 @@ fn lower_fma(
                 return Err(unsupported("fma.rn.bf16", ".relu modifier"));
             }
             check_not_packed(*ty, "fma")?;
-            (*ty, *ty, "fma.rn.bf16", dst, src_a, src_b, src_c)
+            (*ty, *ty, "fma.rn.bf16", None, dst, src_a, src_b, src_c)
         }
         FmaInstr::Oob { .. } => {
             return Err(unsupported("fma.rn.oob", ".oob modifier"));
@@ -2397,6 +2434,7 @@ fn lower_fma(
                 ScalarType::F32,
                 *src_type,
                 "fma.rn.f32 (mixed)",
+                None,
                 dst,
                 src_a,
                 src_b,
@@ -2424,6 +2462,7 @@ fn lower_fma(
             src_b: src_b_typed.operand,
             src_c: src_c_typed.operand,
             ty,
+            clamp,
         },
         predicate,
     )?;
@@ -2481,6 +2520,7 @@ fn lower_div(
             src_a: src_a_typed.operand,
             src_b: src_b_typed.operand,
             ty,
+            clamp: None,
         },
         predicate,
     )?;
@@ -2705,6 +2745,7 @@ fn lower_min(
             src_a: src_a_typed.operand,
             src_b: src_b_typed.operand,
             ty,
+            clamp: None,
         },
         predicate,
     )?;
@@ -2796,6 +2837,7 @@ fn lower_max(
             src_a: src_a_typed.operand,
             src_b: src_b_typed.operand,
             ty,
+            clamp: None,
         },
         predicate,
     )?;
@@ -3299,15 +3341,54 @@ fn lower_cvt(
             dst,
             src,
         } => {
-            if *sat {
-                return Err(unsupported("cvt", ".sat modifier"));
-            }
-            if *relu {
-                return Err(unsupported("cvt", ".relu modifier"));
-            }
             if *satfinite {
+                // .satfinite clamps to the destination format's finite range
+                // - a different, format-dependent semantics from the [0,1]
+                // value clamp; not modeled.
                 return Err(unsupported("cvt", ".satfinite modifier"));
             }
+            // `.sat`/`.relu` on float->float conversions are exact value
+            // clamps over the reals, threaded through as `Clamp`.
+            // Integer-destination `.sat` (clamp to MININT..MAXINT) is a
+            // different operation and stays rejected, as does anything
+            // outside the ISA's legal destination types.
+            let clamp = match (*sat, *relu) {
+                (false, false) => None,
+                (true, true) => {
+                    return Err(unsupported("cvt", ".sat and .relu together (invalid PTX)"));
+                }
+                (true, false) => {
+                    // ISA: the float `.sat` clamp applies to .f16/.f32/.f64
+                    // destinations only.
+                    if !is_scalar_float(*src_type)
+                        || !matches!(
+                            dst_type,
+                            ScalarType::F16 | ScalarType::F32 | ScalarType::F64
+                        )
+                    {
+                        return Err(unsupported(
+                            "cvt",
+                            ".sat modifier outside a float->float form with .f16/.f32/.f64 \
+                             destination (integer saturation is not modeled)",
+                        ));
+                    }
+                    Some(Clamp::Sat)
+                }
+                (false, true) => {
+                    // ISA: the scalar `.relu` forms have .f16/.bf16
+                    // destinations only.
+                    if !is_scalar_float(*src_type)
+                        || !matches!(dst_type, ScalarType::F16 | ScalarType::Bf16)
+                    {
+                        return Err(unsupported(
+                            "cvt",
+                            ".relu modifier outside a float->float form with .f16/.bf16 \
+                             destination",
+                        ));
+                    }
+                    Some(Clamp::Relu)
+                }
+            };
             match rnd {
                 // Float rounding modes are ignorable: floats are reals here,
                 // and float<->float conversion is the identity (the paper's
@@ -3335,6 +3416,7 @@ fn lower_cvt(
                     src,
                     dst_ty: *dst_type,
                     src_ty: *src_type,
+                    clamp,
                 },
                 predicate,
             )?;
@@ -4541,6 +4623,28 @@ mod tests {
         }
     }
 
+    /// Lower `body` (which must contain exactly one clamp-capable
+    /// instruction - BinOp/Fma/Cvt) and return that instruction's clamp.
+    fn lowered_clamp(body: &str) -> Option<Clamp> {
+        let prog = lower_body(body)
+            .unwrap_or_else(|e| panic!("expected {:?} to lower, got {:?}", body, e));
+        let mut clamps = prog.instructions.values().filter_map(|instr| match instr {
+            LoweredInstr::BinOp { clamp, .. }
+            | LoweredInstr::Fma { clamp, .. }
+            | LoweredInstr::Cvt { clamp, .. } => Some(*clamp),
+            _ => None,
+        });
+        let clamp = clamps
+            .next()
+            .unwrap_or_else(|| panic!("no clamp-capable instruction lowered from {:?}", body));
+        assert!(
+            clamps.next().is_none(),
+            "expected exactly one clamp-capable instruction in {:?}",
+            body
+        );
+        clamp
+    }
+
     #[test]
     fn test_reject_setp_bool_combine_and_dual_dest() {
         assert_rejected("setp.lt.and.s32 %p1, %r1, %r2, %p2;", "boolean-combine");
@@ -4559,23 +4663,74 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_float_sat_and_accept_rnd_ftz() {
-        assert_rejected("add.sat.f32 %f1, %f2, %f3;", ".sat");
-        assert_rejected("sub.rn.ftz.sat.f32 %f1, %f2, %f3;", ".sat");
-        assert_rejected("mul.sat.f32 %f1, %f2, %f3;", ".sat");
-        assert_rejected("fma.rn.sat.f32 %f1, %f2, %f3, %f4;", ".sat");
-        // Rounding modes and ftz alone are ignorable under the reals model.
-        assert_lowers("add.rn.ftz.f32 %f1, %f2, %f3;");
-        assert_lowers("mul.rn.f32 %f1, %f2, %f3;");
-        assert_lowers("fma.rn.ftz.f32 %f1, %f2, %f3, %f4;");
-        assert_lowers("mul.f16 %rs1, %rs2, %rs3;");
+    fn test_float_sat_lowers_with_clamp() {
+        // Float `.sat` is the exact value clamp min(max(x, 0), 1) over the
+        // reals; f32 and scalar f16 forms carry it through lowering.
+        assert_eq!(
+            lowered_clamp("add.sat.f32 %f1, %f2, %f3;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("sub.rn.ftz.sat.f32 %f1, %f2, %f3;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("mul.sat.f32 %f1, %f2, %f3;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("fma.rn.sat.f32 %f1, %f2, %f3, %f4;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("add.rn.sat.f16 %rs1, %rs2, %rs3;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("sub.rn.sat.f16 %rs1, %rs2, %rs3;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("mul.rn.sat.f16 %rs1, %rs2, %rs3;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("fma.rn.sat.f16 %rs1, %rs2, %rs3, %rs4;"),
+            Some(Clamp::Sat)
+        );
+        // Rounding modes and ftz alone are ignorable under the reals model,
+        // and unclamped forms stay unclamped.
+        assert_eq!(lowered_clamp("add.rn.ftz.f32 %f1, %f2, %f3;"), None);
+        assert_eq!(lowered_clamp("mul.rn.f32 %f1, %f2, %f3;"), None);
+        assert_eq!(lowered_clamp("fma.rn.ftz.f32 %f1, %f2, %f3, %f4;"), None);
+        assert_eq!(lowered_clamp("mul.f16 %rs1, %rs2, %rs3;"), None);
     }
 
     #[test]
-    fn test_reject_fma_half_relu_and_oob() {
-        assert_rejected("fma.rn.relu.f16 %rs1, %rs2, %rs3, %rs4;", ".relu");
+    fn test_float_sat_out_of_scope_forms_stay_rejected() {
+        // mad.f and the mixed-precision (.f32.f16) arms are not modeled
+        // with .sat; packed forms are rejected as packed SIMD.
+        assert_rejected("mad.sat.f32 %f1, %f2, %f3, %f4;", ".sat");
+        assert_rejected("add.rn.sat.f32.f16 %f1, %rs2, %rs3;", ".sat");
+        assert_rejected("fma.rn.sat.f32.f16 %f1, %rs2, %rs3, %f4;", ".sat");
+        assert_rejected("add.rn.sat.f16x2 %r1, %r2, %r3;", "packed SIMD");
+        // `.sat` on .f64 add/mul/fma is illegal PTX (the ISA allows it on
+        // .f32/.f16 only); the instruction parser rejects it loudly.
+        assert_rejected("add.rn.sat.f64 %fd1, %fd2, %fd3;", "parsing failed");
+        assert_rejected("mul.rn.sat.f64 %fd1, %fd2, %fd3;", "parsing failed");
+        assert_rejected("fma.rn.sat.f64 %fd1, %fd2, %fd3, %fd4;", "parsing failed");
+    }
+
+    #[test]
+    fn test_fma_half_relu_lowers_oob_rejected() {
+        // fma.rn.relu.f16 is the exact value clamp max(x, 0).
+        assert_eq!(
+            lowered_clamp("fma.rn.relu.f16 %rs1, %rs2, %rs3, %rs4;"),
+            Some(Clamp::Relu)
+        );
+        assert_eq!(lowered_clamp("fma.rn.f16 %rs1, %rs2, %rs3, %rs4;"), None);
         assert_rejected("fma.rn.oob.f16 %rs1, %rs2, %rs3, %rs4;", ".oob");
-        assert_lowers("fma.rn.f16 %rs1, %rs2, %rs3, %rs4;");
+        assert_rejected("fma.rn.relu.bf16 %rs1, %rs2, %rs3, %rs4;", ".relu");
     }
 
     #[test]
@@ -4599,11 +4754,47 @@ mod tests {
     }
 
     #[test]
+    fn test_cvt_float_sat_relu_lower_with_clamp() {
+        // Float->float cvt `.sat`/`.relu` are exact value clamps; the
+        // fused-ReLU epilogue nvcc emits is `cvt.rn.relu.f16.f32`.
+        assert_eq!(
+            lowered_clamp("cvt.rn.relu.f16.f32 %rs1, %f1;"),
+            Some(Clamp::Relu)
+        );
+        assert_eq!(
+            lowered_clamp("cvt.rn.relu.bf16.f32 %rs1, %f1;"),
+            Some(Clamp::Relu)
+        );
+        assert_eq!(
+            lowered_clamp("cvt.rn.sat.f16.f32 %rs1, %f1;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("cvt.rn.sat.f32.f64 %f1, %fd1;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(
+            lowered_clamp("cvt.sat.f64.f32 %fd1, %f1;"),
+            Some(Clamp::Sat)
+        );
+        assert_eq!(lowered_clamp("cvt.rn.f16.f32 %rs1, %f1;"), None);
+    }
+
+    #[test]
     fn test_reject_cvt_modifiers_keep_plain_conversions() {
+        // Integer-destination saturation is a different operation (clamp to
+        // MININT..MAXINT) and stays rejected, as do non-float sources.
         assert_rejected("cvt.sat.u32.f32 %r1, %f1;", ".sat");
-        assert_rejected("cvt.rn.relu.f16.f32 %rs1, %f1;", ".relu");
+        assert_rejected("cvt.rn.sat.f16.s32 %rs1, %r1;", ".sat");
+        // .sat/.relu destinations outside the ISA's legal lists are invalid.
+        assert_rejected("cvt.rn.sat.bf16.f32 %rs1, %f1;", ".sat");
+        assert_rejected("cvt.rn.relu.f32.f16 %f1, %rs1;", ".relu");
+        // .satfinite clamps to the destination's finite range: not modeled.
+        assert_rejected("cvt.rn.satfinite.f16.f32 %rs1, %f1;", ".satfinite");
+        // Integer rounding stays rejected, including under an accepted clamp.
         assert_rejected("cvt.rmi.f32.f32 %f1, %f2;", "integer-rounding");
         assert_rejected("cvt.rzi.s32.f32 %r1, %f1;", "integer-rounding");
+        assert_rejected("cvt.rzi.sat.f32.f32 %f1, %f2;", "integer-rounding");
         // cvt.pack has its own InstrKind (CvtPack) with no lowering: it hits
         // the already-loud whole-instruction catch-all. The CvtInstr::Pack
         // rejection in lower_cvt is fail-closed insurance behind it.

@@ -203,6 +203,25 @@ pub enum MulMode {
     Wide,
 }
 
+/// Float value clamp applied to an instruction's result (PTX `.sat`/`.relu`).
+///
+/// Over the floats-as-reals model these are exact value transformations:
+/// `.sat` is `min(max(x, 0), 1)` and `.relu` is `max(x, 0)`. (The spec's
+/// `.sat` additionally flushes a NaN result to +0.0, and cvt's `.relu`
+/// canonicalizes NaN; NaN is out of model over the reals, as everywhere
+/// else in the interpreter.)
+///
+/// Lowering only sets a clamp on scalar floating-point forms; the
+/// integer `.sat`/`.relu` modifiers (wrap-avoiding integer saturation)
+/// are different operations and stay rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clamp {
+    /// `.sat`: clamp the result to [0.0, 1.0].
+    Sat,
+    /// `.relu`: clamp the result to [0.0, +inf).
+    Relu,
+}
+
 /// A lowered instruction - fully resolved with no strings
 #[derive(Debug, Clone)]
 pub enum LoweredInstr {
@@ -272,6 +291,8 @@ pub enum LoweredInstr {
         src_a: Operand,
         src_b: Operand,
         ty: ScalarType,
+        /// Float value clamp (`.sat`) applied to the result; float forms only.
+        clamp: Option<Clamp>,
     },
 
     /// Unary operation: dst = op(src)
@@ -289,6 +310,8 @@ pub enum LoweredInstr {
         src_b: Operand,
         src_c: Operand,
         ty: ScalarType,
+        /// Float value clamp (`.sat`/`.relu`) applied to the result.
+        clamp: Option<Clamp>,
     },
 
     /// Multiply-add (integer): dst = src_a * src_b + src_c
@@ -368,6 +391,9 @@ pub enum LoweredInstr {
         src: Operand,
         dst_ty: ScalarType,
         src_ty: ScalarType,
+        /// Float value clamp (`.sat`/`.relu`) applied to the converted
+        /// result; float->float conversions only.
+        clamp: Option<Clamp>,
     },
 
     // =========================================================================

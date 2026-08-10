@@ -18,7 +18,7 @@ use crate::eval::value::{RegFile, Value};
 use crate::eval::{ThreadId, WARP_SIZE};
 use crate::logging::{info, trace, warn};
 use crate::lowered::{
-    BinOp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, Operand, UnaryOp,
+    BinOp, Clamp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, Operand, UnaryOp,
 };
 use crate::symbolic::{ExprArena, ExprId, StringId};
 use crate::symbols::{ParamId, RegId, SpecialRegKind};
@@ -621,10 +621,12 @@ impl<'p> Interpreter<'p> {
                 src_a,
                 src_b,
                 ty,
+                clamp,
             } => {
                 let a = self.scalar_operand(t, pc, src_a)?;
                 let b = self.scalar_operand(t, pc, src_b)?;
                 let r = self.eval_binop(t, pc, *op, *ty, a, b)?;
+                let r = self.apply_clamp(*clamp, r);
                 self.threads[t].regs.write(*dst, Value::Scalar(r));
             }
 
@@ -639,12 +641,14 @@ impl<'p> Interpreter<'p> {
                 src_a,
                 src_b,
                 src_c,
+                clamp,
                 ..
             } => {
                 let a = self.scalar_operand(t, pc, src_a)?;
                 let b = self.scalar_operand(t, pc, src_b)?;
                 let c = self.scalar_operand(t, pc, src_c)?;
                 let r = self.arena.fma(a, b, c);
+                let r = self.apply_clamp(*clamp, r);
                 self.threads[t].regs.write(*dst, Value::Scalar(r));
             }
 
@@ -774,9 +778,11 @@ impl<'p> Interpreter<'p> {
                 src,
                 dst_ty,
                 src_ty,
+                clamp,
             } => {
                 let a = self.scalar_operand(t, pc, src)?;
                 let r = self.eval_cvt(pc, *dst_ty, *src_ty, a)?;
+                let r = self.apply_clamp(*clamp, r);
                 self.threads[t].regs.write(*dst, Value::Scalar(r));
             }
 
@@ -1515,6 +1521,30 @@ impl<'p> Interpreter<'p> {
             CmpOp::Num => self.arena.bool_val(true),
             CmpOp::Nan => self.arena.bool_val(false),
         })
+    }
+
+    /// Apply a float value clamp (`.sat`/`.relu`) to a result expression.
+    ///
+    /// Over the floats-as-reals model these are exact: `.relu` is
+    /// `max(r, 0)` and `.sat` is `min(max(r, 0), 1)`. Concrete operands
+    /// fold through the arena's min/max constant folding. The spec's
+    /// `.sat` additionally flushes a NaN result to +0.0 (and cvt's
+    /// `.relu` canonicalizes NaN); NaN is out of model over the reals,
+    /// as everywhere else in the interpreter.
+    fn apply_clamp(&mut self, clamp: Option<Clamp>, r: ExprId) -> ExprId {
+        match clamp {
+            None => r,
+            Some(Clamp::Relu) => {
+                let zero = self.arena.float(0.0);
+                self.arena.max(r, zero)
+            }
+            Some(Clamp::Sat) => {
+                let zero = self.arena.float(0.0);
+                let one = self.arena.float(1.0);
+                let low_clamped = self.arena.max(r, zero);
+                self.arena.min(low_clamped, one)
+            }
+        }
     }
 
     fn eval_cvt(

@@ -597,6 +597,154 @@ fn test_shfl_sync_idx_exchange() {
     assert_eq!(output.stats.warp_syncs, 1);
 }
 
+/// Float `.sat` clamps the result to [0, 1]; concrete operands fold all
+/// the way to the clamped constant.
+#[test]
+fn test_add_sat_f32_concrete_clamps() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .f32 %f<5>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.f32 %f1, 0f3F400000;
+    add.sat.f32 %f2, %f1, %f1;
+    st.global.f32 [%rd1], %f2;
+    mov.f32 %f3, 0fBF400000;
+    add.sat.f32 %f4, %f3, 0f3E800000;
+    st.global.f32 [%rd1+4], %f4;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![ArrayDef {
+        name: "out".to_string(),
+        base: 0x20000,
+        elem_width: 4,
+        len: 2,
+        kind: ArrayKind::Output,
+    }];
+    config.params = vec![ParamValue::ArrayPtr("out".to_string())];
+    let output = analyze_kernel(&module, None, config).unwrap();
+    // 0.75 + 0.75 = 1.5 saturates to 1.0.
+    assert_eq!(display_output(&output, "out", 0), "1");
+    // -0.75 + 0.25 = -0.5 saturates to 0.0.
+    assert_eq!(display_output(&output, "out", 1), "0");
+}
+
+/// f16 input/output arrays alongside an f32 input (elem_width 2 out).
+fn f32_in_f16_out_config(threads: u32, len: u64) -> AnalysisConfig {
+    let mut config = AnalysisConfig::new((threads, 1, 1));
+    config.arrays = vec![
+        ArrayDef {
+            name: "in".to_string(),
+            base: 0x10000,
+            elem_width: 4,
+            len,
+            kind: ArrayKind::Input,
+        },
+        ArrayDef {
+            name: "out".to_string(),
+            base: 0x20000,
+            elem_width: 2,
+            len,
+            kind: ArrayKind::Output,
+        },
+    ];
+    config.params = vec![
+        ParamValue::ArrayPtr("in".to_string()),
+        ParamValue::ArrayPtr("out".to_string()),
+    ];
+    config
+}
+
+/// nvcc's fused-ReLU epilogue `cvt.rn.relu.f16.f32` is the exact value
+/// transformation max(x, 0) on a symbolic input.
+#[test]
+fn test_cvt_relu_symbolic_is_max() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b16 %rs<2>;
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.f32 %f1, [%rd1];
+    cvt.rn.relu.f16.f32 %rs1, %f1;
+    st.global.u16 [%rd2], %rs1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let output = analyze_kernel(&module, None, f32_in_f16_out_config(1, 1)).unwrap();
+    assert_eq!(display_output(&output, "out", 0), "max(in[0], 0)");
+}
+
+/// ReLU via the fused cvt epilogue is equivalent to ReLU via an explicit
+/// max.f32 against zero (with flipped operand order): the clamp and the
+/// max are the same real function, and canon flattens max atoms.
+#[test]
+fn test_relu_epilogue_equivalent_to_explicit_max() {
+    const PROLOGUE: &str = ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b16 %rs<2>;
+    .reg .f32 %f<4>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<7>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r2, %r1, 2;
+    cvt.u64.u32 %rd3, %r2;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    shl.b32 %r3, %r1, 1;
+    cvt.u64.u32 %rd5, %r3;
+    add.s64 %rd6, %rd2, %rd5;
+";
+    let fused = wrap(&format!(
+        "{}    cvt.rn.relu.f16.f32 %rs1, %f1;
+    st.global.u16 [%rd6], %rs1;
+    ret;
+}}
+",
+        PROLOGUE
+    ));
+    let explicit = wrap(&format!(
+        "{}    mov.f32 %f2, 0f00000000;
+    max.f32 %f3, %f2, %f1;
+    cvt.rn.f16.f32 %rs1, %f3;
+    st.global.u16 [%rd6], %rs1;
+    ret;
+}}
+",
+        PROLOGUE
+    ));
+    let a = analyze_kernel(&parse(&fused), None, f32_in_f16_out_config(2, 2)).unwrap();
+    let b = analyze_kernel(&parse(&explicit), None, f32_in_f16_out_config(2, 2)).unwrap();
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
 // =========================================================================
 // Paper kernels: Harris reductions
 // =========================================================================
