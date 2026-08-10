@@ -156,7 +156,10 @@ nvcc's `selp` accumulator-init idiom both rely on this.
 - `check_output_equivalence_with(ref, opt, options)` - the per-element
   check via one shared `EquivSession`. `EquivCheckOptions`: `sample`,
   `verify_numeric` (f64 oracle per element), `recycle_terms`. Returns a
-  report with the outcome plus checked/total element counts.
+  report with the outcome, checked/total element counts, and
+  `check_time` (summed `EquivSession::check` durations only - pairing
+  and the oracle excluded; the decision-procedure time the bench and
+  CLI report).
 - `check_output_equivalence(ref, opt)` - the Default-options wrapper
   (all elements, no oracle)
 - `VcSnapshot`/`VcDump` - serde-serializable arena + output footprint, the
@@ -253,12 +256,27 @@ budget kills them, reported `Timeout` - Table 8's "with axiom" column,
   kill; inside the worker: fresh context per query, no-op error handler
   so z3 API errors surface as `(error ...)` text instead of aborting,
   soft timeout via the process-global `timeout` param) and `z3_version`.
+  The worker times the libz3 evaluation itself (empty-script warmup
+  first, so z3's lazy per-context frontend setup stays outside the
+  span) and reports it in-band (a `t:<nanoseconds>` line after the
+  handshake); `eval_smtlib2` returns it as
+  `EvalOutcome::Output { text, solve }`. Solver time is measured there
+  because the worker's fixed scaffolding - process
+  spawn/exec/link/pipes ~1.6ms plus z3 context create/destroy and
+  frontend setup ~9ms (all measured) - is several times an entire
+  polynomial-fragment solve; an outer timer measures scaffolding, not
+  z3.
 - `lib.rs` - per-element querying (`check_equivalent`; every element is
   a genuine solver query - no structural short-circuit, so identical
   sides cost a full spawn+solve, which is the point), verdict
   parsing, `Z3Counts`, `check_output_equivalence` over
   `driver::paired_elements` (the same element pairing as the decision
   procedure), and the regression tests for every invariant above.
+  Reported solve time (`Z3CheckResult::solve`) is the in-worker
+  measurement - process spawn and translation excluded; Timeout
+  verdicts report the budget itself rather than a measurement (the
+  paper's convention for timeout rows), under either delivery
+  mechanism (hard kill or z3's in-band soft cancel).
 
 ## Crate: volta_bench
 
@@ -277,7 +295,12 @@ against the reference; every corpus pair is footprint-identical).
 the decision procedure and `volta_z3` side by side (skips race-check
 benchmarks; exits nonzero if any row fails outright); benchmarks whose
 VCs contain exponentials get a second `+exp-axiom` sub-row rerun under
-`ExpMode::AdditionAxiom`. Paper Table 8 reproduction:
+`ExpMode::AdditionAxiom`. Its two timing columns cover the deciding
+work only: `Dec(s)` = summed `EquivSession::check` (pairing and the
+optional numeric oracle excluded), `Z3(s)` = in-worker libz3 solve
+time (worker spawn/exec and translation excluded; timeout elements
+count the full budget). The default commands' `VC (s)` column is the
+same `check_time` quantity. Paper Table 8 reproduction:
 `--sample 1 z3-compare all --z3-timeout 600`. Every run writes a
 `volta_common::run_log` file (`--log-dir`/`--no-log-file`).
 Memory: full-element attention wants tens of GiB warm - on small machines

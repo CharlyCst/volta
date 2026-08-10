@@ -23,7 +23,7 @@ pub use ffi::{init_worker, z3_version};
 pub use translate::{Builder, ExpMode, Unsupported, translate_root};
 
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use volta_analysis::driver::EquivCheckError;
 use volta_analysis::symbolic::{ExprArena, ExprId};
@@ -64,13 +64,23 @@ pub enum Z3Error {
     Worker(String),
 }
 
-/// One element's check: the verdict and how long the solver evaluation
-/// took. Translation time isn't included - that front-end cost is the
-/// same for both backends and isn't the thing being compared.
+/// One element's check: the verdict and the solver time.
+///
+/// `solve` is measured *inside the worker*, spanning exactly libz3's
+/// evaluation of the query text, so the worker's fixed scaffolding -
+/// process spawn/exec/dynamic-link/pipes plus z3's context and frontend
+/// setup, ~10.5ms together (measured; see `ffi::eval_in_process`) - is
+/// excluded. That scaffolding is what the outer wall clock used to
+/// report, drowning polynomial-fragment queries whose actual solve is
+/// milliseconds. Translation/query construction isn't included either -
+/// that front-end cost is the same kind of work for both backends and
+/// isn't the thing being compared. Timeout verdicts report the time
+/// budget itself rather than a measurement - the paper's convention for
+/// timeout rows.
 #[derive(Debug, Clone)]
 pub struct Z3CheckResult {
     pub verdict: Z3Verdict,
-    pub solve_secs: f64,
+    pub solve: Duration,
 }
 
 /// An `unknown` whose `(get-info :reason-unknown)` blames the time or
@@ -88,9 +98,10 @@ fn unknown_reason_is_budget(output: &str) -> bool {
 /// Check whether `a` (in `arena_a`) and `b` (in `arena_b`) are equal over
 /// the reals, using Z3 instead of `volta_analysis::canon` as the decision
 /// procedure. `timeout` bounds the solver call (`None` = no limit) - a
-/// hard bound: the query runs in a forked worker that is killed on
-/// expiry, reported as [`Z3Verdict::Timeout`]. `mode` selects the
-/// exponential encoding (see [`ExpMode`]).
+/// hard bound: the query runs in a worker subprocess that is killed on
+/// expiry, reported as [`Z3Verdict::Timeout`] with the budget as its
+/// solve time (see [`Z3CheckResult`]). `mode` selects the exponential
+/// encoding (see [`ExpMode`]).
 pub fn check_equivalent(
     arena_a: &ExprArena,
     a: ExprId,
@@ -111,33 +122,42 @@ pub fn check_equivalent(
     // it distinguishes a budget cancellation from a genuine give-up.
     query.push_str("(get-info :reason-unknown)\n");
 
-    let start = Instant::now();
-    let outcome = ffi::eval_smtlib2(&query, timeout);
-    let solve_secs = start.elapsed().as_secs_f64();
-
-    let verdict = match outcome {
-        ffi::EvalOutcome::HardTimeout => Z3Verdict::Timeout,
+    let (verdict, measured) = match ffi::eval_smtlib2(&query, timeout) {
+        // A SIGKILLed worker leaves no in-band time (and can only exist
+        // when a deadline was set); the budget substitution below is the
+        // only time a hard timeout ever reports.
+        ffi::EvalOutcome::HardTimeout => (Z3Verdict::Timeout, None),
         ffi::EvalOutcome::ChildDied(how) => return Err(Z3Error::Worker(how)),
-        ffi::EvalOutcome::Output(output) => {
-            match output.lines().map(str::trim).find(|l| !l.is_empty()) {
+        ffi::EvalOutcome::Output { text, solve } => {
+            let verdict = match text.lines().map(str::trim).find(|l| !l.is_empty()) {
                 Some("unsat") => Z3Verdict::Equivalent,
                 Some("sat") => Z3Verdict::NotEquivalent,
                 Some("unknown") | Some("timeout") => {
-                    if unknown_reason_is_budget(&output) {
+                    if unknown_reason_is_budget(&text) {
                         Z3Verdict::Timeout
                     } else {
                         Z3Verdict::Unknown
                     }
                 }
-                _ => return Err(Z3Error::UnexpectedOutput(output)),
-            }
+                _ => return Err(Z3Error::UnexpectedOutput(text)),
+            };
+            (verdict, Some(solve))
         }
     };
+    // Timeout rows report the BUDGET, not a measurement - the paper's
+    // convention for its timeout entries - so both delivery mechanisms
+    // read identically: the hard kill (no in-band time exists) and z3's
+    // own soft cancellation (an in-band time exists, but is merely
+    // "nearly the budget").
+    let solve = match (verdict, timeout) {
+        (Z3Verdict::Timeout, Some(budget)) => budget,
+        // Timeout without a configured budget only arises from the
+        // in-band path (a hard timeout requires a deadline), so a
+        // measurement is always present here.
+        _ => measured.expect("non-hard-timeout outcomes carry an in-band solve time"),
+    };
 
-    Ok(Z3CheckResult {
-        verdict,
-        solve_secs,
-    })
+    Ok(Z3CheckResult { verdict, solve })
 }
 
 /// The CLI convention for Z3 timeouts: `0` means no limit.
@@ -166,7 +186,10 @@ pub struct ElementResult {
     pub array: String,
     pub index: u64,
     pub outcome: ElementOutcome,
-    pub solve_secs: f64,
+    /// In-worker solver time (see [`Z3CheckResult`]; the budget for
+    /// timeouts); zero for elements that never reached the solver
+    /// (unsupported fragment, worker error).
+    pub solve: Duration,
 }
 
 /// Per-outcome element counts. A named struct rather than a positional
@@ -249,8 +272,14 @@ impl Z3EquivReport {
         c
     }
 
+    /// Total in-worker solver time across all elements, in seconds
+    /// (timeout elements count their budget; see [`Z3CheckResult`]).
     pub fn total_solve_secs(&self) -> f64 {
-        self.elements.iter().map(|e| e.solve_secs).sum()
+        self.elements
+            .iter()
+            .map(|e| e.solve)
+            .sum::<Duration>()
+            .as_secs_f64()
     }
 }
 
@@ -278,7 +307,7 @@ pub fn check_output_equivalence(
             n => common.len().min(n as usize),
         };
         for (index, r, o) in common.into_iter().take(limit) {
-            let (outcome, solve_secs) =
+            let (outcome, solve) =
                 match check_equivalent(&reference.arena, r, &optimized.arena, o, timeout, mode) {
                     Ok(res) => (
                         match res.verdict {
@@ -287,16 +316,18 @@ pub fn check_output_equivalence(
                             Z3Verdict::Unknown => ElementOutcome::Unknown,
                             Z3Verdict::Timeout => ElementOutcome::Timeout,
                         },
-                        res.solve_secs,
+                        res.solve,
                     ),
-                    Err(Z3Error::Unsupported(u)) => (ElementOutcome::Unsupported(u.0), 0.0),
-                    Err(e) => (ElementOutcome::Error(e.to_string()), 0.0),
+                    Err(Z3Error::Unsupported(u)) => {
+                        (ElementOutcome::Unsupported(u.0), Duration::ZERO)
+                    }
+                    Err(e) => (ElementOutcome::Error(e.to_string()), Duration::ZERO),
                 };
             elements.push(ElementResult {
                 array: name.clone(),
                 index,
                 outcome,
-                solve_secs,
+                solve,
             });
         }
     }
@@ -459,7 +490,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(res.verdict, Z3Verdict::Timeout);
-        assert!(res.solve_secs >= 2.0, "must have run to the deadline");
+        // Timeout rows report the budget itself (the paper's convention),
+        // whichever mechanism fired - the parent's hard kill or z3's own
+        // soft cancellation.
+        assert_eq!(res.solve, Duration::from_secs(2));
+    }
+
+    /// The reported solve time is the *in-worker* measurement: positive
+    /// (the solver genuinely ran) and no larger than the parent's wall
+    /// time around the whole call, which additionally pays the worker's
+    /// spawn/exec/pipe lifecycle - the overhead this measurement exists
+    /// to exclude.
+    #[test]
+    fn solve_time_is_in_worker_and_bounded_by_wall_time() {
+        let mut ar = ExprArena::new();
+        let x = ar.param_symbol("x");
+        let y = ar.param_symbol("y");
+        let lhs = ar.add(x, y);
+        let rhs = ar.add(y, x);
+        let wall_start = std::time::Instant::now();
+        let res = check_equivalent(
+            &ar,
+            lhs,
+            &ar,
+            rhs,
+            Some(Duration::from_secs(60)),
+            ExpMode::PowerBounded,
+        )
+        .unwrap();
+        let wall = wall_start.elapsed();
+        assert_eq!(res.verdict, Z3Verdict::Equivalent);
+        assert!(
+            res.solve > Duration::ZERO,
+            "in-worker solve time must be a real measurement"
+        );
+        assert!(
+            res.solve <= wall,
+            "in-worker solve time {:?} cannot exceed the parent's wall time {:?}",
+            res.solve,
+            wall
+        );
+    }
+
+    /// Diagnostic, not an assertion of environment-dependent numbers: run
+    /// with `--ignored --nocapture` to print how much of the outer
+    /// `eval_smtlib2` wall time is worker scaffolding versus in-libz3
+    /// solving for a trivial query. (Measured on the dev box: ~12.1ms
+    /// wall vs ~1.5ms solve, i.e. ~10.5ms excluded scaffolding - the
+    /// reason solve time is taken inside the worker.)
+    #[test]
+    #[ignore = "diagnostic: prints the spawn-vs-solve overhead split"]
+    fn spawn_overhead_split() {
+        let query = "(assert false)(check-sat)\n";
+        let iterations = 20;
+        let mut wall_total = Duration::ZERO;
+        let mut solve_total = Duration::ZERO;
+        for _ in 0..iterations {
+            let wall_start = std::time::Instant::now();
+            match ffi::eval_smtlib2(query, Some(Duration::from_secs(30))) {
+                ffi::EvalOutcome::Output { text, solve } => {
+                    wall_total += wall_start.elapsed();
+                    solve_total += solve;
+                    assert_eq!(text.trim(), "unsat");
+                }
+                _ => panic!("trivial query must produce output"),
+            }
+        }
+        let per = |d: Duration| d.as_secs_f64() * 1e3 / iterations as f64;
+        println!(
+            "trivial query x{}: wall {:.3}ms/call, in-worker solve {:.3}ms/call, \
+             excluded scaffolding {:.3}ms/call",
+            iterations,
+            per(wall_total),
+            per(solve_total),
+            per(wall_total - solve_total),
+        );
     }
 
     /// Budget-vs-incompleteness classification of `unknown` reasons.

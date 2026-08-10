@@ -37,13 +37,24 @@
 //! millisecond budget in `VOLTA_Z3_TIMEOUT_MS`) in the child's
 //! environment and writes the SMT-LIB2 script to its stdin; the worker
 //! reads stdin to EOF, evaluates it in-process with a fresh Z3 context,
-//! and writes the handshake line followed by the solver's textual output
-//! to stdout.
+//! and writes to stdout: the handshake line, a `t:<nanoseconds>` line
+//! carrying the in-worker solve time, and the solver's textual output.
+//! Parent and worker are always the same binary, so the protocol can
+//! change freely - there is no cross-version compatibility to keep.
+//!
+//! The `t:` line exists because a worker's fixed lifecycle dwarfs a
+//! small query's actual solving (measured on z3 4.8.12, trivial query,
+//! ~12ms outer wall): process spawn/exec/dynamic-link/pipes/reap
+//! ~1.6ms, context create/destroy ~5ms, z3's lazy per-context SMT-LIB
+//! frontend setup ~3-4.6ms. Timing the outer call reports that
+//! scaffolding, not solving; the only place solver work can be measured
+//! honestly is inside the worker, around the evaluation itself (see
+//! [`eval_in_process`] for the exact span).
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type Z3Config = *mut c_void;
 type Z3Context = *mut c_void;
@@ -98,12 +109,13 @@ pub fn init_worker() {
     if std::io::stdin().read_to_string(&mut query).is_err() {
         std::process::exit(2);
     }
-    let result = eval_in_process(&query);
+    let (result, solve) = eval_in_process(&query);
     // Handshake only after stdin was fully consumed: the parent writes
     // the whole query before reading, so neither side blocks on a full
     // pipe while the other isn't draining it.
     let mut stdout = std::io::stdout();
     let ok = writeln!(stdout, "{}", HANDSHAKE)
+        .and_then(|_| writeln!(stdout, "t:{}", solve.as_nanos()))
         .and_then(|_| stdout.write_all(result.as_bytes()))
         .and_then(|_| stdout.flush())
         .is_ok();
@@ -111,17 +123,42 @@ pub fn init_worker() {
 }
 
 /// In-process evaluation with a fresh context - runs inside the worker,
-/// where the process is ours alone.
-fn eval_in_process(query: &str) -> String {
+/// where the process is ours alone. Returns the solver's textual output
+/// plus the solve time: the span of libz3's evaluation of the query
+/// text, and nothing else.
+///
+/// The span boundaries are deliberate. Everything a worker pays that is
+/// *not* a function of the query stays outside the clock, because on
+/// this z3 (4.8.12) none of it is negligible against a small query's
+/// actual solving (measured, trivial query): process
+/// spawn/exec/link/pipes ~1.6ms, `Z3_mk_context` ~4.4ms - NOT
+/// microseconds - and the SMT-LIB frontend setup z3 lazily performs on
+/// a context's first eval, ~3-4.6ms, which the empty warmup eval below
+/// flushes before the clock starts. The warmup is an empty script
+/// rather than a dummy `(check-sat)`: zero commands cannot perturb
+/// solver state or flip z3 into its incremental core, so the measured
+/// query solves exactly as it would without the warmup. (Lazy machinery
+/// the query's own first commands trigger - ~1.4ms - stays inside the
+/// span: z3 does that work because of this query's text.)
+fn eval_in_process(query: &str) -> (String, Duration) {
     let c_query = match CString::new(query) {
         Ok(c) => c,
-        Err(_) => return "(error \"query contained a NUL byte\")".to_string(),
+        Err(_) => {
+            return (
+                "(error \"query contained a NUL byte\")".to_string(),
+                Duration::ZERO,
+            );
+        }
     };
     unsafe {
         let cfg = Z3_mk_config();
         let ctx = Z3_mk_context(cfg);
         Z3_set_error_handler(ctx, Some(ignore_errors));
+        let warmup = CString::new("").expect("empty string contains no NUL");
+        let _ = Z3_eval_smtlib2_string(ctx, warmup.as_ptr());
+        let started = Instant::now();
         let out = Z3_eval_smtlib2_string(ctx, c_query.as_ptr());
+        let solve = started.elapsed();
         let result = if out.is_null() {
             String::new()
         } else {
@@ -129,14 +166,19 @@ fn eval_in_process(query: &str) -> String {
         };
         Z3_del_context(ctx);
         Z3_del_config(cfg);
-        result
+        (result, solve)
     }
 }
 
 /// One query's fate, as observed by the parent.
 pub enum EvalOutcome {
-    /// The worker finished and this is the solver's textual output.
-    Output(String),
+    /// The worker finished: the solver's textual output plus the solve
+    /// time measured *inside the worker*, spanning exactly libz3's
+    /// evaluation of the query text (see [`eval_in_process`]). This is
+    /// the number to report as solver time: the worker's process
+    /// lifecycle and z3's context/frontend setup - which together dwarf
+    /// small queries' actual solving - are outside the span.
+    Output { text: String, solve: Duration },
     /// The deadline expired and the worker was killed - the definitive
     /// timeout signal (z3's own soft timeout is unreliable, see module
     /// docs).
@@ -220,7 +262,7 @@ pub fn eval_smtlib2(query: &str, timeout: Option<Duration>) -> EvalOutcome {
         }
         Some(text) => match child.wait() {
             Ok(status) if status.success() => match text.strip_prefix(HANDSHAKE) {
-                Some(rest) => EvalOutcome::Output(rest.trim_start_matches('\n').to_string()),
+                Some(rest) => parse_worker_payload(rest),
                 None => EvalOutcome::ChildDied(
                     "worker handshake missing - the host binary must call \
                      volta_z3::init_worker() as the first statement of main()"
@@ -233,4 +275,81 @@ pub fn eval_smtlib2(query: &str, timeout: Option<Duration>) -> EvalOutcome {
     };
     let _ = reader.join();
     outcome
+}
+
+/// Parse what follows a completed worker's handshake line: the
+/// `t:<nanoseconds>` in-worker solve time, then the solver's output.
+/// Parent and worker are always the same binary, so a malformed payload
+/// is a genuine protocol violation (reported loudly), never version
+/// skew.
+fn parse_worker_payload(rest: &str) -> EvalOutcome {
+    let payload = rest.strip_prefix('\n').unwrap_or(rest);
+    let Some((nanos, output)) = payload
+        .strip_prefix("t:")
+        .and_then(|timed| timed.split_once('\n'))
+    else {
+        return EvalOutcome::ChildDied(
+            "worker protocol error: missing solve-time line".to_string(),
+        );
+    };
+    match nanos.trim().parse::<u64>() {
+        Ok(ns) => EvalOutcome::Output {
+            text: output.to_string(),
+            solve: Duration::from_nanos(ns),
+        },
+        Err(_) => EvalOutcome::ChildDied(format!(
+            "worker protocol error: unparseable solve-time line {:?}",
+            nanos
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Diagnostic (run alone, `--ignored --nocapture`, so libz3 is
+    /// still uninitialized in this process, like it is in a fresh
+    /// worker): where does a worker's in-process evaluation time go?
+    /// Prints per-phase timings for two rounds. Measured on z3 4.8.12:
+    /// context creation costs ~4ms on EVERY round (not one-time init),
+    /// the empty warmup eval flushes ~3-4.6ms of lazy SMT-LIB frontend
+    /// setup, and only then does an eval's time track the script.
+    #[test]
+    #[ignore = "diagnostic: prints in-process phase timings"]
+    fn in_process_phase_timings() {
+        let query = CString::new("(assert false)(check-sat)\n").unwrap();
+        for round in 0..2 {
+            let t0 = Instant::now();
+            let (cfg, ctx) = unsafe {
+                let cfg = Z3_mk_config();
+                let ctx = Z3_mk_context(cfg);
+                Z3_set_error_handler(ctx, Some(ignore_errors));
+                (cfg, ctx)
+            };
+            let t_ctx = t0.elapsed();
+            // An empty first eval separates the per-context SMT-LIB
+            // frontend setup from the per-script cost (this is the
+            // warmup `eval_in_process` performs before its timed span).
+            let empty = CString::new("").unwrap();
+            let t1 = Instant::now();
+            let _ = unsafe { Z3_eval_smtlib2_string(ctx, empty.as_ptr()) };
+            let t_warmup = t1.elapsed();
+            let t2 = Instant::now();
+            let out = unsafe { Z3_eval_smtlib2_string(ctx, query.as_ptr()) };
+            let t_eval = t2.elapsed();
+            assert!(!out.is_null());
+            let t3 = Instant::now();
+            unsafe {
+                Z3_del_context(ctx);
+                Z3_del_config(cfg);
+            }
+            let t_del = t3.elapsed();
+            println!(
+                "round {}: ctx create {:?}, empty warmup eval {:?}, query eval {:?}, \
+                 ctx destroy {:?}",
+                round, t_ctx, t_warmup, t_eval, t_del
+            );
+        }
+    }
 }

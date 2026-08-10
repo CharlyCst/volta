@@ -2,6 +2,7 @@
 //! expressions (or a race/deadlock/structured-CTA error) out.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use volta_frontend::ast::{Function, Module, TopLevelItem, VarDecl};
 
@@ -175,6 +176,12 @@ pub struct EquivCheckReport {
     pub elements_checked: u64,
     /// Comparable elements in the reference footprints.
     pub elements_total: u64,
+    /// Time spent in the decision procedure itself: the summed
+    /// `EquivSession::check` calls, and nothing else. VC pairing and the
+    /// optional numeric-oracle verification are excluded, so this is the
+    /// number to put beside another backend's solver time (the paper's
+    /// tables) - it does not move when `verify_numeric` is toggled.
+    pub check_time: Duration,
 }
 
 /// Pair up the two runs' written elements for each array the caller
@@ -252,6 +259,7 @@ pub fn check_output_equivalence_with(
     let mut mismatches = Vec::new();
     let mut elements_checked = 0u64;
     let mut elements_total = 0u64;
+    let mut check_time = Duration::ZERO;
 
     for (name, common) in &paired {
         elements_total += common.len() as u64;
@@ -260,7 +268,9 @@ pub fn check_output_equivalence_with(
             n => common.len().min(n as usize),
         };
         for &(index, r, o) in common.iter().take(limit) {
+            let check_start = Instant::now();
             let equivalent = session.check(r, o)?;
+            check_time += check_start.elapsed();
             if options.verify_numeric {
                 numeric::verify_verdict(&reference.arena, r, &optimized.arena, o, equivalent)
                     .map_err(|message| EquivCheckError::Numeric {
@@ -286,6 +296,7 @@ pub fn check_output_equivalence_with(
         outcome,
         elements_checked,
         elements_total,
+        check_time,
     })
 }
 

@@ -4,6 +4,16 @@
 //! each backend can decide (Z3 also reports "unknown", "timeout", and
 //! "unsupported"), not just how fast it gets there.
 //!
+//! Both time columns measure the deciding work only, so they are
+//! comparable: the decision column is the summed canon equivalence
+//! checks (`EquivSession::check` - VC pairing and the optional
+//! `--verify-numeric` oracle excluded); the Z3 column is the in-worker
+//! libz3 solve time (query translation and the worker's fixed
+//! scaffolding excluded - process spawn/exec plus z3 context/frontend
+//! setup is ~10.5ms, several times a whole polynomial-fragment solve).
+//! Timeout elements count their full budget (the paper's convention for
+//! timeout rows).
+//!
 //! Reproduces the paper's section 6.5 / Table 8 methodology: benchmarks
 //! whose VCs contain no exponentials are decided by Z3 in milliseconds; the
 //! attention benchmarks (exponentials via softmax) come back `unknown`
@@ -33,10 +43,15 @@ pub struct Z3CompareRow {
     /// Symbolic-execution time (both kernels) - identical setup cost for
     /// both backends, included for context, not part of the comparison.
     pub exec_secs: f64,
+    /// Decision-procedure time: the summed canon equivalence checks
+    /// only (excludes VC pairing and the optional numeric oracle - see
+    /// `EquivCheckReport::check_time`).
     pub decision_secs: f64,
     pub decision_status: String,
-    /// Z3 solve time under the default exp encoding, summed across all
-    /// checked elements.
+    /// Z3 solver time under the default exp encoding, summed across all
+    /// checked elements: in-worker libz3 solve time, excluding worker
+    /// spawn/exec and translation; timeout elements count their budget
+    /// (see `volta_z3::Z3CheckResult`).
     pub z3_secs: f64,
     /// Per-outcome Z3 element counts under the default exp encoding.
     pub z3: volta_z3::Z3Counts,
@@ -128,16 +143,21 @@ pub fn compare_one(
         verify_numeric,
         recycle_terms,
     };
-    let d0 = Instant::now();
-    let decision_status =
+    let (decision_status, decision_secs) =
         match check_output_equivalence_with(&reference, &optimized, &arrays, &options) {
-            Ok(report) => match report.outcome {
-                EquivOutcome::Equivalent => "EQUIV".to_string(),
-                EquivOutcome::NotEquivalent { mismatches } => format!("DIFF({})", mismatches.len()),
-            },
+            Ok(report) => {
+                let status = match report.outcome {
+                    EquivOutcome::Equivalent => "EQUIV".to_string(),
+                    EquivOutcome::NotEquivalent { mismatches } => {
+                        format!("DIFF({})", mismatches.len())
+                    }
+                };
+                // The canon checks themselves, not the wall clock around
+                // the whole call - see the module docs on comparability.
+                (status, report.check_time.as_secs_f64())
+            }
             Err(e) => return empty_row(def, format!("decision procedure: {}", e)),
         };
-    let decision_secs = d0.elapsed().as_secs_f64();
 
     let run_z3 = |mode: ExpMode| -> Result<(f64, volta_z3::Z3Counts), String> {
         volta_z3::check_output_equivalence(

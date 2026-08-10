@@ -20,7 +20,11 @@ use crate::config::{BenchmarkCategory, BenchmarkDef, ExpectedOutcome, KernelRun}
 pub struct BenchmarkStats {
     /// Symbolic-execution wall time (both kernels), seconds
     pub exec_secs: f64,
-    /// VC-checking wall time, seconds
+    /// Decision-procedure time, seconds: the summed canon equivalence
+    /// checks only (`EquivCheckReport::check_time`) - excludes VC
+    /// pairing and the optional `--verify-numeric` oracle, so the "VC"
+    /// column reports the same quantity whether or not verification
+    /// aids are switched on.
     pub vc_secs: f64,
     /// bar.sync executions across all threads (optimized kernel if present)
     pub block_syncs: u64,
@@ -206,11 +210,10 @@ impl BenchmarkRunner {
         stats.exec_secs = exec0.elapsed().as_secs_f64();
 
         // Check the verification conditions along the reference config's
-        // declared output arrays.
+        // declared output arrays (`check_equivalence` fills in the
+        // decision-procedure time).
         let arrays = def.reference.config.output_array_names();
-        let vc0 = Instant::now();
         let outcome = self.check_equivalence(&reference, &optimized, &arrays, &mut stats)?;
-        stats.vc_secs = vc0.elapsed().as_secs_f64();
         Ok((outcome, stats))
     }
 
@@ -248,6 +251,7 @@ impl BenchmarkRunner {
             .context("checking output equivalence")?;
         stats.elements_checked = report.elements_checked;
         stats.elements_total = report.elements_total;
+        stats.vc_secs = report.check_time.as_secs_f64();
         Ok(match report.outcome {
             EquivOutcome::Equivalent => ActualOutcome::Equivalent,
             EquivOutcome::NotEquivalent { mismatches } => {

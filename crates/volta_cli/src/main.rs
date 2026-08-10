@@ -631,7 +631,17 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                     } else {
                         format!("{}/{}", report.elements_checked, report.elements_total)
                     };
-                    println!("VC check: {:.3}s  elements: {}", vc_secs, elems);
+                    // Wall clock for the whole phase; the parenthetical is
+                    // the decision procedure alone (summed canon checks -
+                    // pairing and the optional numeric oracle excluded),
+                    // the figure comparable to the z3 backend's solver
+                    // time.
+                    println!(
+                        "VC check: {:.3}s (decision procedure {:.3}s)  elements: {}",
+                        vc_secs,
+                        report.check_time.as_secs_f64(),
+                        elems
+                    );
                     match report.outcome {
                         EquivOutcome::Equivalent => {
                             println!("EQUIVALENT");
@@ -685,8 +695,11 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
             match report {
                 Ok(report) => {
                     let counts = report.counts();
+                    // Wall clock for the whole phase; the parenthetical is
+                    // in-worker solver time only (worker spawn/exec and
+                    // translation excluded; timeouts count their budget).
                     println!(
-                        "VC check: {:.3}s (z3 solve time {:.3}s)  elements: {}",
+                        "VC check: {:.3}s (z3 solver time {:.3}s)  elements: {}",
                         vc_secs,
                         report.total_solve_secs(),
                         report.elements.len()
