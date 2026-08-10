@@ -95,6 +95,13 @@ pub enum LowerError {
     // =========================================================================
     // Other Errors
     // =========================================================================
+    /// A variable's declared size or assigned placement overflows the u64
+    /// address space (e.g. `.shared .u32 A[0x4000000000000001]`, whose
+    /// byte size would otherwise release-wrap to 4). Real kernels are
+    /// nowhere near the limit, so this is a hostile or corrupt
+    /// declaration, rejected loudly instead of silently wrapped.
+    VariableSizeOverflow { what: String },
+
     /// No function body (declaration only)
     NoFunctionBody { name: String },
 
@@ -219,6 +226,10 @@ impl fmt::Display for LowerError {
                      Special registers are read-only",
                     register, instruction
                 )
+            }
+
+            Self::VariableSizeOverflow { what } => {
+                write!(f, "Variable size overflows the address space: {}", what)
             }
 
             Self::NoFunctionBody { name } => {

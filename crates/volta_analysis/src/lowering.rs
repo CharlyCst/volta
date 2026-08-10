@@ -920,7 +920,7 @@ pub fn lower_function(func: &Function, module_vars: &[VarDecl]) -> LowerResult<L
     // all static allocations. This must precede `lower_body`, which is the
     // first point that resolves shared symbols to addresses
     // (`resolve_mem_symbol`).
-    ctx.symbols.finalize_shared_layout();
+    ctx.symbols.finalize_shared_layout()?;
 
     // Third: lower instructions
     lower_body(&mut ctx, body)?;
@@ -983,12 +983,18 @@ fn collect_var_decl(ctx: &mut LoweringContext, var: &VarDecl) -> LowerResult<()>
     let ty = var.ty.scalar;
     let count = var.param_count.unwrap_or(1);
 
+    // Checked product (release-active): each dimension fits u32, but three
+    // or more hostile dimensions can wrap the u64 product, and a wrapped
+    // element count would silently pass the packer's own checked
+    // byte-size arithmetic.
     let num_elements: u64 = var
         .array_dims
         .iter()
         .filter_map(|d| *d)
-        .map(|d| d as u64)
-        .product();
+        .try_fold(1u64, |acc, d| acc.checked_mul(d as u64))
+        .ok_or_else(|| LowerError::VariableSizeOverflow {
+            what: format!("variable '{}' (array dimensions overflow)", name),
+        })?;
     let num_elements = if num_elements == 0 { 1 } else { num_elements };
     let alignment = var.align.unwrap_or(ty.size_bytes() as u32) as u64;
 
@@ -1502,28 +1508,39 @@ fn lower_parsed_instruction(
             // addresses are absolute u64s here and the generic window over
             // global is identity-mapped, so generic->global is exact (the
             // corpus's one cvta form: param pointers into global arrays).
-            // Every other form is rejected loudly. Generic addressing has
-            // no per-space windows in this model, so a generic address
-            // minted from a shared/local/const address (`cvta.<space>`,
-            // the to-generic direction) would be an absolute address in
-            // the *wrong* space, and `cvta.to.<other-space>` would bless
-            // an arbitrary value as a shared/local address. Spaceless
-            // ld/st is already rejected (`convert_space`), so no accepted
-            // instruction can consume a generic address derived from
-            // shared/local - rejecting the producers closes the loop.
+            // Every other form is rejected loudly, for two distinct
+            // reasons:
+            // - `cvta.global` (the to-generic direction over global) is
+            //   identity-compatible for the same reason, but the corpus
+            //   never emits it, so it is rejected purely to keep the
+            //   modeled instruction surface minimal.
+            // - The remaining forms have no faithful model: generic
+            //   addressing has no per-space windows here, so a generic
+            //   address minted from a shared/local/const address
+            //   (`cvta.<space>`) would be an absolute address in the
+            //   *wrong* space, and `cvta.to.<other-space>` would bless an
+            //   arbitrary value as a shared/local address. Spaceless
+            //   ld/st is already rejected (`convert_space`), so no
+            //   accepted instruction can consume a generic address
+            //   derived from shared/local - rejecting the producers
+            //   closes the loop.
             if *to_generic || *space != StateSpace::Global {
                 let form = format!(
                     "cvta{}.{}",
                     if *to_generic { "" } else { ".to" },
                     format!("{:?}", space).to_lowercase()
                 );
+                let reason = if *space == StateSpace::Global {
+                    // Necessarily the to-generic direction here.
+                    "cvta.global (global -> generic) would also be the identity, \
+                     but the corpus never uses it; only cvta.to.global is modeled"
+                } else {
+                    "only cvta.to.global is modeled (as the identity); generic \
+                     addresses have no per-space windows in this model"
+                };
                 return Err(LowerError::UnsupportedInstruction {
                     instruction: form,
-                    reason: Some(
-                        "only cvta.to.global is modeled (as the identity); generic \
-                         addresses have no per-space windows in this model"
-                            .to_string(),
-                    ),
+                    reason: Some(reason.to_string()),
                 });
             }
             let dst = ctx.resolve_dst(dst)?;
@@ -1580,8 +1597,16 @@ fn lower_parsed_instruction(
         // semantics the evaluator models are identical. The bar path's
         // restrictions (immediate id 0-15, no thread-count operand, no
         // .arrive/.red) apply unchanged.
-        ParsedInstruction::Barrier(barrier) => {
-            lower_bar(ctx, barrier.mode, &barrier.operands, predicate)?;
+        ParsedInstruction::Barrier(ast::BarrierInstr {
+            // .cta is the default scope, and .aligned only adds the
+            // compile-time all-threads-reach-this-barrier promise (see
+            // above); neither changes the runtime semantics modeled here.
+            cta: _cta,
+            aligned: _aligned,
+            mode,
+            operands,
+        }) => {
+            lower_bar(ctx, *mode, operands, predicate)?;
         }
 
         // =========================================================================

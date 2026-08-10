@@ -41,8 +41,10 @@ impl ArrayKind {
 /// A global-memory array visible to the kernel.
 ///
 /// Input arrays are pre-populated with named symbols `name[0]`, `name[1]`,
-/// ... at granule width `elem_width`. Bases must not fall in the reserved
-/// module-global region (see `symbols::MODULE_GLOBAL_BASE`).
+/// ... at granule width `elem_width`. The array's byte range must not
+/// overlap the reserved module-global window the program occupies (see
+/// `symbols::MODULE_GLOBAL_BASE`); `Interpreter::new`, which knows the
+/// program's window, rejects configs that do.
 #[derive(Debug, Clone)]
 pub struct ArrayDef {
     pub name: String,
@@ -115,6 +117,10 @@ impl AnalysisConfig {
     /// `sym:` parameter names define which values correlate (see
     /// `symbolic::SymbolRef`), so duplicate names or overlapping ranges
     /// would silently conflate distinct values.
+    ///
+    /// This checks the config against itself only; overlap with the
+    /// program's reserved module-global window needs the program and is
+    /// checked in `Interpreter::new`.
     pub fn validate(&self) -> Result<(), String> {
         // Per-array checks first, so the pairwise pass below may safely
         // form `base + size_bytes()` for every array.

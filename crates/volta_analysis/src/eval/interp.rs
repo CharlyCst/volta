@@ -21,7 +21,7 @@ use crate::lowered::{
     BinOp, Clamp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, Operand, UnaryOp,
 };
 use crate::symbolic::{ExprArena, ExprId, Real, StringId};
-use crate::symbols::{ParamId, RegId, SpecialRegKind};
+use crate::symbols::{MODULE_GLOBAL_BASE, ParamId, RegId, SpecialRegKind};
 use crate::types::ScalarTypeExt;
 
 /// Per-array output footprint: `(array name, [(element index, value)])`.
@@ -189,7 +189,12 @@ impl<'p> Interpreter<'p> {
         // that invariant and the subtraction-form `Region::contains`, any
         // access that passes `check_bounds` has `addr + width` within u64
         // range, so the byte-range loops downstream (race recording, input
-        // materialization, memory granules) can never wrap.
+        // materialization, memory granules, vector element addressing)
+        // can never wrap. The argument needs nothing from the address
+        // itself - `effective_addr` produces arbitrary, possibly wrapped
+        // u64s - only that ownership is checked before any of those loops
+        // run, which `mem_read`/`mem_write` and the whole-footprint checks
+        // at the vector/tensor-core sites guarantee.
         fn push_region(list: &mut Vec<Region>, base: u64, size: u64, what: &str) -> EvalResult<()> {
             if size > u64::MAX - base {
                 return Err(EvalError::Config {
@@ -203,6 +208,38 @@ impl<'p> Interpreter<'p> {
             Ok(())
         }
         let mut regions = MemRegions::default();
+        // Config arrays and module-scope globals share the one global
+        // region list built below. `config.validate()` keeps the arrays
+        // pairwise disjoint and the symbol-table packer keeps the module
+        // globals pairwise disjoint, so the only possible cross-family
+        // overlap is an array intersecting the reserved module-global
+        // window - reject it here to uphold the region-disjointness
+        // premise of `check_bounds` (an overlapping array would silently
+        // shadow the module global it covers). The window end cannot
+        // overflow: `declare_global_var` checks `MODULE_GLOBAL_BASE +
+        // offset + size` for every variable it places. Shared and local
+        // variables cannot collide with config arrays by construction:
+        // they are packed in their own address spaces, and `check_bounds`
+        // consults only the accessed `MemSpace`'s region list, so no
+        // check is needed for them.
+        let module_global_size = program.symbols.module_global_size();
+        if module_global_size > 0 {
+            let window_base = MODULE_GLOBAL_BASE;
+            let window_end = MODULE_GLOBAL_BASE + module_global_size;
+            for array in &config.arrays {
+                // `validate()` established `base + size_bytes()` fits.
+                let array_end = array.base + array.size_bytes();
+                if array.base < window_end && window_base < array_end {
+                    return Err(EvalError::Config {
+                        message: format!(
+                            "array '{}' ([{:#x}, {:#x})) overlaps the reserved \
+                             module-global region [{:#x}, {:#x})",
+                            array.name, array.base, array_end, window_base, window_end
+                        ),
+                    });
+                }
+            }
+        }
         for array in &config.arrays {
             push_region(&mut regions.global, array.base, array.size_bytes(), "array")?;
         }
@@ -495,11 +532,18 @@ impl<'p> Interpreter<'p> {
                     // sourced from them is handled per-op.
                     Status::Exited => {}
                     // A live lane elsewhere (different pc or mask): the
-                    // group is not ready. The paper's straight-line model is
-                    // silent on matching syncs across program points, so a
+                    // group is not ready. Requiring one shared pc is a
+                    // deliberate conservative deviation from both
+                    // authorities: the paper's syncs are unnamed ("whichever
+                    // sync instances happen to align in the dynamics are
+                    // matched", section 4.1) and the sm_70+ ISA matches
+                    // bar.warp.sync/shfl.sync instances by mask and
+                    // qualifiers, not by program point - under either,
+                    // differently-located syncs could pair. Volta matches
+                    // only at a single pc, for implementation simplicity; a
                     // group whose live lanes never converge at one pc stays
-                    // stuck and surfaces as Deadlock - the conservative
-                    // choice over cross-pc matching.
+                    // stuck and surfaces as a loud Deadlock rather than
+                    // being cross-matched.
                     _ => continue 'candidates,
                 }
             }
@@ -1134,11 +1178,16 @@ impl<'p> Interpreter<'p> {
 
     /// Compute the concrete effective address `base + offset`.
     ///
-    /// The `[reg + imm]` sum is checked, not wrapped (release-active): a
-    /// wrapped "address" would be handed to the bounds machinery as an
-    /// unrelated location. No real launch places data within an `i64`
-    /// immediate of the address-space edge, so overflow here is always a
-    /// program/config error and is reported loudly.
+    /// Hardware semantics: the register holds a 64-bit address and the
+    /// immediate is a two's-complement byte offset, so the `[reg + imm]`
+    /// sum is u64 arithmetic mod 2^64. A wrapped sum is not itself an
+    /// error - it is simply an address, and unless a declared region owns
+    /// it the ownership bounds check (`check_bounds`, subtraction-form,
+    /// wrap-proof) rejects it loudly as `OutOfBounds` in every build
+    /// profile (see `test_negative_index_wrap_is_out_of_bounds`). A
+    /// checked i64 sum here would guard the wrong boundary: it rejects
+    /// valid accesses that merely cross 2^63 (an array based just below
+    /// the sign bit) while letting genuine u64 wraps through untouched.
     pub(in crate::eval) fn effective_addr(
         &mut self,
         t: ThreadId,
@@ -1147,15 +1196,7 @@ impl<'p> Interpreter<'p> {
         offset: i64,
     ) -> EvalResult<u64> {
         let base = self.concrete_operand(t, pc, base, "memory address")?;
-        match base.checked_add(offset) {
-            Some(addr) => Ok(addr as u64),
-            None => Err(EvalError::AddressOverflow {
-                thread: t,
-                pc,
-                base,
-                offset,
-            }),
-        }
+        Ok((base as u64).wrapping_add(offset as u64))
     }
 
     /// Ownership containment: the region owning the access's *first byte*
@@ -1165,8 +1206,10 @@ impl<'p> Interpreter<'p> {
     /// `OutOfBounds` even when the trailing bytes land inside an adjacent
     /// array (the paper's §6.2 point: hardware happens to tolerate
     /// out-of-bounds shared reads, the model must not). Regions never
-    /// overlap (config validation and the symbol-table packer both
-    /// guarantee it), so the owner is unique; `find` keeps the answer
+    /// overlap - config validation keeps arrays pairwise disjoint, the
+    /// symbol-table packer keeps each space's variables disjoint, and
+    /// `Interpreter::new` rejects arrays overlapping the module-global
+    /// window - so the owner is unique; `find` keeps the answer
     /// deterministic regardless.
     fn check_bounds(
         &self,

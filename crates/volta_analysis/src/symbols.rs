@@ -293,18 +293,22 @@ pub struct GlobalVarInfo {
     pub element_ty: ScalarType,
 }
 
-/// Base address for module-scope `.global` variables. Analysis configs must
-/// not place input/output arrays at or above this address.
+/// Base address for module-scope `.global` variables. Analysis configs
+/// must not place input/output arrays overlapping the window these occupy
+/// (`[MODULE_GLOBAL_BASE, MODULE_GLOBAL_BASE + module_global_size())`);
+/// `Interpreter::new` rejects configs that do.
 pub const MODULE_GLOBAL_BASE: u64 = 0x7000_0000_0000_0000;
 
-/// Round `offset` up to the next multiple of `alignment` (a power of two).
+/// Round `offset` up to the next multiple of `alignment` (a power of two),
+/// or `None` when the rounded offset overflows u64 (checked arithmetic,
+/// release-active: packing must reject hostile sizes loudly, not wrap).
 ///
 /// Natural alignment of every lowering-assigned address rests on this:
 /// the `declare_*` functions raise the alignment to at least the element
 /// size before calling, so shared/local packing and module-global
 /// assignment (from the naturally-aligned `MODULE_GLOBAL_BASE`) always
 /// yield naturally aligned, `.align`-honoring addresses.
-fn align_up(offset: u64, alignment: u64) -> u64 {
+fn align_up(offset: u64, alignment: u64) -> Option<u64> {
     // PTX requires `.align` values to be powers of two (and every scalar
     // element size is one); the bit trick below is wrong otherwise.
     debug_assert!(
@@ -312,7 +316,18 @@ fn align_up(offset: u64, alignment: u64) -> u64 {
         "alignment {} is not a power of two",
         alignment
     );
-    (offset + alignment - 1) & !(alignment - 1)
+    Some(offset.checked_add(alignment - 1)? & !(alignment - 1))
+}
+
+/// The loud rejection for a declaration whose byte size or packed
+/// placement overflows the u64 address space. Every declare-time sum and
+/// product below is checked against this (release-active): a hostile
+/// declaration like `.shared .u32 A[0x4000000000000001]` would otherwise
+/// wrap to byte size 4 and be silently mismodeled.
+fn size_overflow(kind: &str, name: &str) -> LowerError {
+    LowerError::VariableSizeOverflow {
+        what: format!("{} '{}'", kind, name),
+    }
 }
 
 /// Symbol table built during lowering
@@ -509,8 +524,14 @@ impl SymbolTable {
             return Ok(());
         }
 
-        let offset = align_up(self.shared_mem_size, alignment);
-        let size_bytes = num_elements * elem_size;
+        let size_bytes = num_elements
+            .checked_mul(elem_size)
+            .ok_or_else(|| size_overflow("shared variable", name))?;
+        let offset = align_up(self.shared_mem_size, alignment)
+            .ok_or_else(|| size_overflow("shared variable", name))?;
+        let end = offset
+            .checked_add(size_bytes)
+            .ok_or_else(|| size_overflow("shared variable", name))?;
 
         self.shared_vars.insert(
             name.to_string(),
@@ -523,7 +544,7 @@ impl SymbolTable {
             },
         );
 
-        self.shared_mem_size = offset + size_bytes;
+        self.shared_mem_size = end;
         Ok(())
     }
 
@@ -534,8 +555,9 @@ impl SymbolTable {
     /// least 16 bytes and to every extern's declared alignment. Must be
     /// called exactly once, after all shared declarations are collected and
     /// before any shared symbol is resolved to an address; declaring shared
-    /// variables after this call panics.
-    pub fn finalize_shared_layout(&mut self) {
+    /// variables after this call panics. Errors when the window's aligned
+    /// base overflows the address space (hostile static sizes).
+    pub fn finalize_shared_layout(&mut self) -> LowerResult<()> {
         let pending = match &mut self.extern_layout {
             ExternSharedLayout::Collecting(pending) => std::mem::take(pending),
             ExternSharedLayout::Finalized { .. } => {
@@ -544,7 +566,14 @@ impl SymbolTable {
         };
 
         let alignment = pending.iter().fold(16, |a, e| a.max(e.alignment));
-        let extern_base = align_up(self.shared_mem_size, alignment);
+        let extern_base = align_up(self.shared_mem_size, alignment).ok_or_else(|| {
+            LowerError::VariableSizeOverflow {
+                what: format!(
+                    ".extern .shared window (based after {:#x} static shared bytes)",
+                    self.shared_mem_size
+                ),
+            }
+        })?;
 
         for e in pending {
             self.shared_vars.insert(
@@ -560,6 +589,7 @@ impl SymbolTable {
         }
 
         self.extern_layout = ExternSharedLayout::Finalized { extern_base };
+        Ok(())
     }
 
     /// Base offset of the dynamic (`.extern .shared`) window, or `None` if
@@ -591,8 +621,14 @@ impl SymbolTable {
 
         let elem_size = (element_ty.bits() as u64).div_ceil(8);
         let alignment = alignment.max(elem_size).max(1);
-        let offset = align_up(self.local_mem_size, alignment);
-        let size_bytes = num_elements * elem_size;
+        let size_bytes = num_elements
+            .checked_mul(elem_size)
+            .ok_or_else(|| size_overflow("local variable", name))?;
+        let offset = align_up(self.local_mem_size, alignment)
+            .ok_or_else(|| size_overflow("local variable", name))?;
+        let end = offset
+            .checked_add(size_bytes)
+            .ok_or_else(|| size_overflow("local variable", name))?;
 
         self.local_vars.insert(
             name.to_string(),
@@ -604,7 +640,7 @@ impl SymbolTable {
             },
         );
 
-        self.local_mem_size = offset + size_bytes;
+        self.local_mem_size = end;
         Ok(())
     }
 
@@ -621,8 +657,21 @@ impl SymbolTable {
 
         let elem_size = (element_ty.bits() as u64).div_ceil(8);
         let alignment = alignment.max(elem_size).max(1);
-        let offset = align_up(self.module_global_size, alignment);
-        let size_bytes = num_elements * elem_size;
+        let size_bytes = num_elements
+            .checked_mul(elem_size)
+            .ok_or_else(|| size_overflow("global variable", name))?;
+        let offset = align_up(self.module_global_size, alignment)
+            .ok_or_else(|| size_overflow("global variable", name))?;
+        let end = offset
+            .checked_add(size_bytes)
+            .ok_or_else(|| size_overflow("global variable", name))?;
+        // The variable must also fit above the reserved base:
+        // `MODULE_GLOBAL_BASE + end` is exactly the window end
+        // `Interpreter::new` computes (and the region end `push_region`
+        // re-checks), so its representability is established here once.
+        if MODULE_GLOBAL_BASE.checked_add(end).is_none() {
+            return Err(size_overflow("global variable", name));
+        }
 
         self.global_vars.insert(
             name.to_string(),
@@ -634,7 +683,7 @@ impl SymbolTable {
             },
         );
 
-        self.module_global_size = offset + size_bytes;
+        self.module_global_size = end;
         Ok(())
     }
 
@@ -696,6 +745,14 @@ impl SymbolTable {
     /// Iterate over all module-scope `.global` variables
     pub fn global_vars(&self) -> impl Iterator<Item = &GlobalVarInfo> {
         self.global_vars.values()
+    }
+
+    /// Bytes of the reserved module-global window in use: the module-scope
+    /// `.global` variables occupy `[MODULE_GLOBAL_BASE, MODULE_GLOBAL_BASE
+    /// + module_global_size())`. The window end is representable in u64
+    /// (`declare_global_var` checks it for every variable it places).
+    pub fn module_global_size(&self) -> u64 {
+        self.module_global_size
     }
 
     /// Get register name from ID (for error messages)
@@ -906,6 +963,68 @@ mod tests {
     }
 
     // =========================================================================
+    // Hostile declaration sizes: every packing sum/product is checked
+    // =========================================================================
+
+    /// The review's shape: `.shared .u32 A[0x4000000000000001]` has a byte
+    /// size of 2^64 + 4, which release-wraps to 4. Each packer entry point
+    /// must reject the overflow loudly instead (checked arithmetic is
+    /// release-active).
+    #[test]
+    fn test_hostile_element_count_rejected_per_space() {
+        let huge = 0x4000_0000_0000_0001; // * 4 bytes wraps u64 to 4
+        let mut symbols = SymbolTable::new();
+        assert!(matches!(
+            symbols.declare_shared("a", ScalarType::U32, huge, false, 4),
+            Err(LowerError::VariableSizeOverflow { .. })
+        ));
+        assert!(matches!(
+            symbols.declare_local("b", ScalarType::U32, huge, 4),
+            Err(LowerError::VariableSizeOverflow { .. })
+        ));
+        assert!(matches!(
+            symbols.declare_global_var("c", ScalarType::U32, huge, 4),
+            Err(LowerError::VariableSizeOverflow { .. })
+        ));
+    }
+
+    /// Placement overflow: a size that multiplies fine can still push the
+    /// packing cursor (or the module-global window end) past u64.
+    #[test]
+    fn test_hostile_placement_overflow_rejected() {
+        // The second variable's aligned offset + size runs off the end.
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("big", ScalarType::B8, u64::MAX - 8, false, 1)
+            .unwrap();
+        assert!(matches!(
+            symbols.declare_shared("next", ScalarType::B8, 16, false, 1),
+            Err(LowerError::VariableSizeOverflow { .. })
+        ));
+
+        // A module global whose size fits u64 but whose *address range*
+        // `MODULE_GLOBAL_BASE + end` does not.
+        let mut symbols = SymbolTable::new();
+        assert!(matches!(
+            symbols.declare_global_var("d", ScalarType::B8, 0x9000_0000_0000_0001, 1),
+            Err(LowerError::VariableSizeOverflow { .. })
+        ));
+
+        // The extern window's aligned base overflows past hostile statics.
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("big", ScalarType::B8, u64::MAX - 7, false, 1)
+            .unwrap();
+        symbols
+            .declare_shared("dyn", ScalarType::B8, 1, true, 1)
+            .unwrap();
+        assert!(matches!(
+            symbols.finalize_shared_layout(),
+            Err(LowerError::VariableSizeOverflow { .. })
+        ));
+    }
+
+    // =========================================================================
     // Shared memory layout: statics pack from 0, the extern window follows
     // =========================================================================
 
@@ -920,7 +1039,7 @@ mod tests {
         symbols
             .declare_shared("lut", ScalarType::F32, 64, false, 4)
             .unwrap();
-        symbols.finalize_shared_layout();
+        symbols.finalize_shared_layout().unwrap();
 
         let lut = symbols.get_shared_var("lut").unwrap();
         assert_eq!((lut.offset, lut.size_bytes), (0, 256));
@@ -939,7 +1058,7 @@ mod tests {
         symbols
             .declare_shared("buf", ScalarType::B8, 1, true, 16)
             .unwrap();
-        symbols.finalize_shared_layout();
+        symbols.finalize_shared_layout().unwrap();
 
         assert_eq!(symbols.get_shared_var("buf").unwrap().offset, 0);
         assert_eq!(symbols.extern_shared_base(), Some(0));
@@ -961,7 +1080,7 @@ mod tests {
         symbols
             .declare_shared("lut", ScalarType::F32, 5, false, 4)
             .unwrap();
-        symbols.finalize_shared_layout();
+        symbols.finalize_shared_layout().unwrap();
 
         assert_eq!(symbols.extern_shared_base(), Some(128));
         assert_eq!(symbols.get_shared_var("a").unwrap().offset, 128);
@@ -978,7 +1097,7 @@ mod tests {
         symbols
             .declare_shared("x", ScalarType::U32, 1, false, 4)
             .unwrap();
-        symbols.finalize_shared_layout();
+        symbols.finalize_shared_layout().unwrap();
 
         assert_eq!(symbols.extern_shared_base(), Some(16));
     }
@@ -1001,7 +1120,7 @@ mod tests {
         symbols
             .declare_shared("words", ScalarType::F32, 2, false, 4)
             .unwrap();
-        symbols.finalize_shared_layout();
+        symbols.finalize_shared_layout().unwrap();
         // pad: [0, 3); halves: aligned up to 4, [4, 14); words: up to 16.
         assert_eq!(symbols.get_shared_var("pad").unwrap().offset, 0);
         assert_eq!(symbols.get_shared_var("halves").unwrap().offset, 4);
@@ -1039,7 +1158,7 @@ mod tests {
         symbols
             .declare_shared("lut", ScalarType::F32, 64, false, 4)
             .unwrap();
-        symbols.finalize_shared_layout();
+        symbols.finalize_shared_layout().unwrap();
 
         assert_eq!(symbols.extern_shared_base(), None);
         assert_eq!(symbols.get_shared_var("lut").unwrap().offset, 0);
@@ -1049,7 +1168,7 @@ mod tests {
     #[should_panic(expected = "after finalize_shared_layout")]
     fn test_declare_shared_after_finalize_panics() {
         let mut symbols = SymbolTable::new();
-        symbols.finalize_shared_layout();
+        symbols.finalize_shared_layout().unwrap();
         let _ = symbols.declare_shared("late", ScalarType::F32, 1, false, 4);
     }
 

@@ -130,6 +130,13 @@ impl Interpreter<'_> {
             .map(|lane| ThreadId(warp_base + lane))
             .collect();
 
+        // Preconditions run before the chi-clear and stats bump below, so
+        // a rejected op provably mutates nothing (structural: every
+        // `EvalError` aborts the whole analysis today, so this is not
+        // observable, but rejection-implies-no-mutation should not rest
+        // on that).
+        self.check_warp_op_preconditions(pc, &instr, members)?;
+
         // Every warp-cooperative op is a synchronization point for its group
         // (the paper's `sync I`). The group's accesses are bracketed by
         // syncs: the sync *before* keeps the op's reads from racing with the
@@ -163,29 +170,91 @@ impl Interpreter<'_> {
                     clamp,
                 )?;
             }
-            LoweredInstr::Ldmatrix {
-                dst,
-                addr,
-                num,
-                trans,
-            } => {
-                self.exec_ldmatrix(pc, members, dst, addr, *num, *trans)?;
+            LoweredInstr::Ldmatrix { dst, addr, num, .. } => {
+                self.exec_ldmatrix(pc, members, dst, addr, *num)?;
             }
             LoweredInstr::Mma { .. } => self.exec_mma(pc, members, &instr)?,
             LoweredInstr::WmmaLoad { .. } => self.exec_wmma_load(pc, members, &instr)?,
             LoweredInstr::WmmaStore { .. } => self.exec_wmma_store(pc, members, &instr)?,
             LoweredInstr::WmmaMma { .. } => self.exec_wmma_mma(pc, members, &instr)?,
-            other => {
-                return Err(EvalError::Unsupported {
-                    pc,
-                    what: format!("warp-op dispatch for {:?}", other),
-                });
-            }
+            other => unreachable!("{:?} passed warp-op preconditions", other),
         }
 
         self.sync_warp_group(&group);
         self.advance_warp_group(members);
         Ok(())
+    }
+
+    /// Every precondition that rejects a warp op outright - the
+    /// unknown-op arm, unsupported instruction forms, and the tensor-core
+    /// ops' fully-live-warp requirement - checked from the instruction and
+    /// the live-member list alone. `execute_warp_op` runs this *before*
+    /// mutating any interpreter state (the group's chi-clear, the stats
+    /// bump), so a rejection provably changes nothing. Errors that arise
+    /// mid-execution (out-of-bounds, races, non-concrete operands, ...)
+    /// necessarily come after the chi-clear; soundness there rests on
+    /// every `EvalError` aborting the whole analysis.
+    fn check_warp_op_preconditions(
+        &self,
+        pc: InstrId,
+        instr: &LoweredInstr,
+        members: &[ThreadId],
+    ) -> EvalResult<()> {
+        match instr {
+            // Both handle exited lanes per-op (Undefined shfl source data,
+            // arrived-at-sync semantics), so a partial warp is fine.
+            LoweredInstr::BarWarpSync { .. } | LoweredInstr::ShflSync { .. } => Ok(()),
+            LoweredInstr::Ldmatrix {
+                dst, num, trans, ..
+            } => {
+                if *trans {
+                    return Err(EvalError::Unsupported {
+                        pc,
+                        what: "ldmatrix .trans".to_string(),
+                    });
+                }
+                // Covers the exited address-supplying lane in particular:
+                // lane `i*8 + r` holds row r's address in a register, and
+                // an exited lane's registers are not observable, so the
+                // row's footprint cannot be modeled.
+                self.require_live_warp(pc, members, "ldmatrix")?;
+                if dst.len() != *num as usize {
+                    return Err(EvalError::Unsupported {
+                        pc,
+                        what: format!("ldmatrix x{} with {} destination registers", num, dst.len()),
+                    });
+                }
+                Ok(())
+            }
+            LoweredInstr::Mma {
+                shape,
+                a_layout,
+                b_layout,
+                ..
+            } => {
+                if *shape != MmaShape::new(16, 8, 16) {
+                    return Err(EvalError::Unsupported {
+                        pc,
+                        what: format!("mma shape {}", shape),
+                    });
+                }
+                if (*a_layout, *b_layout) != (MmaLayout::Row, MmaLayout::Col) {
+                    return Err(EvalError::Unsupported {
+                        pc,
+                        what: "mma with non-row.col layouts".to_string(),
+                    });
+                }
+                // Every lane owns a/b/c fragment elements the product needs.
+                self.require_live_warp(pc, members, "mma.sync")
+            }
+            LoweredInstr::WmmaLoad { shape, .. }
+            | LoweredInstr::WmmaStore { shape, .. }
+            | LoweredInstr::WmmaMma { shape, .. } => self.check_wmma_shape(pc, members, *shape),
+            other => Err(EvalError::Unsupported {
+                pc,
+                what: format!("warp-op dispatch for {:?}", other),
+            }),
+        }
     }
 
     /// Reject a tensor-core cooperative op whose warp has exited lanes.
@@ -307,6 +376,9 @@ impl Interpreter<'_> {
     /// 8x8 b16 matrices. Lane `i*8 + r` supplies the address of row `r` of
     /// matrix `i`; lane `l` receives elements (row `l/4`, cols `(l%4)*2`,
     /// `(l%4)*2+1`) of each matrix as a packed pair.
+    ///
+    /// `check_warp_op_preconditions` already established: no `.trans`, all
+    /// 32 lanes live, `dst.len() == num`.
     fn exec_ldmatrix(
         &mut self,
         pc: InstrId,
@@ -314,26 +386,7 @@ impl Interpreter<'_> {
         dst: &[RegId],
         addr: &Operand,
         num: u32,
-        trans: bool,
     ) -> EvalResult<()> {
-        if trans {
-            return Err(EvalError::Unsupported {
-                pc,
-                what: "ldmatrix .trans".to_string(),
-            });
-        }
-        // Covers the exited address-supplying lane in particular: lane
-        // `i*8 + r` holds row r's address in a register, and an exited
-        // lane's registers are not observable, so the row's footprint
-        // cannot be modeled.
-        self.require_live_warp(pc, members, "ldmatrix")?;
-        if dst.len() != num as usize {
-            return Err(EvalError::Unsupported {
-                pc,
-                what: format!("ldmatrix x{} with {} destination registers", num, dst.len()),
-            });
-        }
-
         // Row addresses come from the first num*8 lanes. Each row is loaded
         // by a group of four lanes as one 16-byte access, so every row
         // address must be 16-byte aligned (see `LDMATRIX_ROW_BYTES`).
@@ -362,6 +415,9 @@ impl Interpreter<'_> {
     }
 
     /// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
+    ///
+    /// `check_warp_op_preconditions` already established: m16n8k16 shape,
+    /// row.col layouts, all 32 lanes live.
     fn exec_mma(
         &mut self,
         pc: InstrId,
@@ -369,33 +425,15 @@ impl Interpreter<'_> {
         instr: &LoweredInstr,
     ) -> EvalResult<()> {
         let LoweredInstr::Mma {
-            shape,
             dst,
             src_a,
             src_b,
             src_c,
-            a_layout,
-            b_layout,
             ..
         } = instr
         else {
             unreachable!()
         };
-
-        if *shape != MmaShape::new(16, 8, 16) {
-            return Err(EvalError::Unsupported {
-                pc,
-                what: format!("mma shape {}", shape),
-            });
-        }
-        if (*a_layout, *b_layout) != (MmaLayout::Row, MmaLayout::Col) {
-            return Err(EvalError::Unsupported {
-                pc,
-                what: "mma with non-row.col layouts".to_string(),
-            });
-        }
-        // Every lane owns a/b/c fragment elements the product needs.
-        self.require_live_warp(pc, members, "mma.sync")?;
 
         let mut a = Grid::new(16, 16);
         let mut b = Grid::new(16, 8);
@@ -422,6 +460,9 @@ impl Interpreter<'_> {
     }
 
     /// `wmma.load.{a,b,c}.sync.aligned.{row,col}.m16n16k16{.shared}.{f16,f32}`.
+    ///
+    /// `check_warp_op_preconditions` already established the m16n16k16
+    /// shape and all 32 lanes live (`check_wmma_shape`).
     fn exec_wmma_load(
         &mut self,
         pc: InstrId,
@@ -430,18 +471,17 @@ impl Interpreter<'_> {
     ) -> EvalResult<()> {
         let LoweredInstr::WmmaLoad {
             operand,
-            shape,
             layout,
             dst,
             addr,
             stride,
             elem_type,
             space,
+            ..
         } = instr
         else {
             unreachable!()
         };
-        self.check_wmma_shape(pc, members, *shape)?;
 
         let base = self.uniform_concrete(pc, members, addr, "wmma.load address")? as u64;
         let stride = self.uniform_concrete(pc, members, stride, "wmma.load stride")?;
@@ -523,6 +563,9 @@ impl Interpreter<'_> {
     }
 
     /// `wmma.store.d.sync.aligned.{row,col}.m16n16k16{.shared}.f32`.
+    ///
+    /// `check_warp_op_preconditions` already established the m16n16k16
+    /// shape and all 32 lanes live (`check_wmma_shape`).
     fn exec_wmma_store(
         &mut self,
         pc: InstrId,
@@ -530,18 +573,17 @@ impl Interpreter<'_> {
         instr: &LoweredInstr,
     ) -> EvalResult<()> {
         let LoweredInstr::WmmaStore {
-            shape,
             layout,
             src,
             addr,
             stride,
             elem_type,
             space,
+            ..
         } = instr
         else {
             unreachable!()
         };
-        self.check_wmma_shape(pc, members, *shape)?;
 
         let base = self.uniform_concrete(pc, members, addr, "wmma.store address")? as u64;
         let stride = self.uniform_concrete(pc, members, stride, "wmma.store stride")?;
@@ -564,6 +606,8 @@ impl Interpreter<'_> {
     ///
     /// The layouts describe how A/B were loaded; the fragments themselves
     /// are opaque, so the compute only needs the fragment position maps.
+    /// `check_warp_op_preconditions` already established the m16n16k16
+    /// shape and all 32 lanes live (`check_wmma_shape`).
     fn exec_wmma_mma(
         &mut self,
         pc: InstrId,
@@ -571,7 +615,6 @@ impl Interpreter<'_> {
         instr: &LoweredInstr,
     ) -> EvalResult<()> {
         let LoweredInstr::WmmaMma {
-            shape,
             dst,
             src_a,
             src_b,
@@ -581,7 +624,6 @@ impl Interpreter<'_> {
         else {
             unreachable!()
         };
-        self.check_wmma_shape(pc, members, *shape)?;
 
         let mut a = Grid::new(16, 16);
         let mut b = Grid::new(16, 16);
@@ -611,6 +653,9 @@ impl Interpreter<'_> {
     // Shared helpers
     // =====================================================================
 
+    /// Precondition of every wmma op (called from
+    /// `check_warp_op_preconditions`, before any state changes): the one
+    /// supported m16n16k16 shape, with all 32 lanes live.
     fn check_wmma_shape(
         &self,
         pc: InstrId,

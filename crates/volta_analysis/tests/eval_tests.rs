@@ -2465,6 +2465,132 @@ fn test_region_edge_exact_fit_accesses_pass() {
     assert_eq!(display_output(&output, "out", 1), "1");
 }
 
+/// A valid array in the upper half of the address space: based at
+/// 0x7FFF_FFFF_FFFF_FFF0, the +16 access lands at 2^63 - crossing the
+/// i64 sign boundary with no u64 wrap. Effective addresses are u64
+/// arithmetic mod 2^64 (as on hardware), so this is simply in bounds;
+/// the previous i64 checked sum falsely rejected it as an overflow.
+#[test]
+fn test_upper_half_address_space_access_in_bounds() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.f32 %f1, [%rd1+16];
+    st.global.f32 [%rd2], %f1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let mut config = in_out_config(1, 8);
+    config.arrays[0].base = 0x7FFF_FFFF_FFFF_FFF0;
+    let output = analyze_kernel(&module, None, config)
+        .expect("crossing 2^63 without wrapping u64 is in bounds");
+    assert_eq!(display_output(&output, "out", 0), "in[4]");
+}
+
+// =========================================================================
+// Cross-family region overlap: config arrays vs the module-global window
+// =========================================================================
+
+/// A config array overlapping the reserved module-global window is a loud
+/// setup error, not a silent shadowing: both families land in the one
+/// global region list, whose disjointness `check_bounds` relies on.
+#[test]
+fn test_array_overlapping_module_global_window_rejected() {
+    const MODULE_GLOBAL_BASE: u64 = 0x7000_0000_0000_0000;
+    let src = wrap(
+        ".global .align 4 .b32 g;
+.visible .entry k()
+{
+    ret;
+}
+",
+    );
+
+    // The probe scenario: an array based exactly at the module-global
+    // base, covering the global `g`.
+    let module = parse(&src);
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays.push(ArrayDef {
+        name: "in".to_string(),
+        base: MODULE_GLOBAL_BASE,
+        elem_width: 4,
+        len: 4,
+        kind: ArrayKind::Input,
+    });
+    let err = analyze_kernel(&module, None, config.clone()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AnalysisError::Eval(EvalError::Config { message })
+                if message.contains("module-global")
+        ),
+        "expected a module-global overlap config error, got: {}",
+        err
+    );
+
+    // Range overlap, not just base membership: an array based below the
+    // window whose tail reaches into it is rejected too.
+    config.arrays[0].base = MODULE_GLOBAL_BASE - 8;
+    let err = analyze_kernel(&module, None, config.clone()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AnalysisError::Eval(EvalError::Config { message })
+                if message.contains("module-global")
+        ),
+        "expected a module-global overlap config error, got: {}",
+        err
+    );
+
+    // Half-open boundary: an array ending exactly at the window base does
+    // not overlap and is accepted.
+    config.arrays[0].base = MODULE_GLOBAL_BASE - 16;
+    analyze_kernel(&module, None, config).expect("an array ending at the window base is disjoint");
+}
+
+// =========================================================================
+// Hostile declaration sizes: checked packing arithmetic
+// =========================================================================
+
+/// A shared declaration whose byte size overflows u64 (here via a
+/// two-dimensional element count: 2^31 * 2^31 u32 elements = 2^64 bytes)
+/// is rejected loudly at lowering; release-wrapping would silently give
+/// the variable a tiny size and mismodel every access to it.
+#[test]
+fn test_hostile_shared_declaration_size_rejected() {
+    let src = wrap(
+        ".visible .entry k()
+{
+    .shared .align 4 .u32 A[2147483648][2147483648];
+
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((1, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AnalysisError::Lower(LowerError::VariableSizeOverflow { what }) if what.contains("A")
+        ),
+        "expected a variable-size overflow error, got: {}",
+        err
+    );
+}
+
 // =========================================================================
 // cvta restriction: only cvta.to.global (the corpus form) is accepted
 // =========================================================================
@@ -2497,21 +2623,41 @@ fn test_cvta_to_global_accepted() {
     analyze_kernel(&module, None, in_out_config(1, 1)).expect("cvta.to.global is the corpus form");
 }
 
-/// Every other cvta form is rejected by name: the to-generic direction
-/// (`cvta.<space>`) would mint an absolute address in the wrong space,
-/// and `cvta.to.<other-space>` would bless an arbitrary value as a
-/// shared/local address.
+/// Every other cvta form is rejected by name, with the reason split by
+/// why: `cvta.global` (to-generic over global) is identity-compatible and
+/// rejected only because the corpus never uses it, while the shared/local
+/// forms would mint or bless addresses in the wrong space (generic
+/// addressing has no per-space windows in the model).
 #[test]
 fn test_cvta_other_forms_rejected() {
-    for (form, expect) in [
-        ("cvta.shared.u64 %rd3, %rd2;", "cvta.shared"),
-        ("cvta.to.shared.u64 %rd3, %rd1;", "cvta.to.shared"),
+    for (form, expect, reason_fragment) in [
+        ("cvta.global.u64 %rd3, %rd1;", "cvta.global", "corpus"),
+        (
+            "cvta.shared.u64 %rd3, %rd2;",
+            "cvta.shared",
+            "per-space windows",
+        ),
+        (
+            "cvta.to.shared.u64 %rd3, %rd1;",
+            "cvta.to.shared",
+            "per-space windows",
+        ),
     ] {
         let module = parse(&cvta_kernel(form));
         let err = analyze_kernel(&module, None, in_out_config(1, 1)).unwrap_err();
         match &err {
-            AnalysisError::Lower(LowerError::UnsupportedInstruction { instruction, .. }) => {
+            AnalysisError::Lower(LowerError::UnsupportedInstruction {
+                instruction,
+                reason,
+            }) => {
                 assert_eq!(instruction, expect, "wrong instruction name for {}", form);
+                assert!(
+                    reason.as_deref().unwrap_or("").contains(reason_fragment),
+                    "reason for {} should mention '{}', got: {:?}",
+                    form,
+                    reason_fragment,
+                    reason
+                );
             }
             other => panic!(
                 "expected UnsupportedInstruction for {}, got: {}",
