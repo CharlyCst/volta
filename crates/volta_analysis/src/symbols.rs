@@ -298,7 +298,20 @@ pub struct GlobalVarInfo {
 pub const MODULE_GLOBAL_BASE: u64 = 0x7000_0000_0000_0000;
 
 /// Round `offset` up to the next multiple of `alignment` (a power of two).
+///
+/// Natural alignment of every lowering-assigned address rests on this:
+/// the `declare_*` functions raise the alignment to at least the element
+/// size before calling, so shared/local packing and module-global
+/// assignment (from the naturally-aligned `MODULE_GLOBAL_BASE`) always
+/// yield naturally aligned, `.align`-honoring addresses.
 fn align_up(offset: u64, alignment: u64) -> u64 {
+    // PTX requires `.align` values to be powers of two (and every scalar
+    // element size is one); the bit trick below is wrong otherwise.
+    debug_assert!(
+        alignment.is_power_of_two(),
+        "alignment {} is not a power of two",
+        alignment
+    );
     (offset + alignment - 1) & !(alignment - 1)
 }
 
@@ -968,6 +981,55 @@ mod tests {
         symbols.finalize_shared_layout();
 
         assert_eq!(symbols.extern_shared_base(), Some(16));
+    }
+
+    /// Packing is naturally aligned in every variable space: after an
+    /// odd-sized `.b8` variable, wider variables still land on multiples of
+    /// their element size (the `declare_*` functions raise the alignment to
+    /// at least the element size before `align_up`). This is what lets the
+    /// evaluator's per-access natural-alignment checks trust
+    /// lowering-assigned shared/local/module-global addresses.
+    #[test]
+    fn test_var_packing_is_naturally_aligned() {
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("pad", ScalarType::B8, 3, false, 1)
+            .unwrap();
+        symbols
+            .declare_shared("halves", ScalarType::F16, 5, false, 2)
+            .unwrap();
+        symbols
+            .declare_shared("words", ScalarType::F32, 2, false, 4)
+            .unwrap();
+        symbols.finalize_shared_layout();
+        // pad: [0, 3); halves: aligned up to 4, [4, 14); words: up to 16.
+        assert_eq!(symbols.get_shared_var("pad").unwrap().offset, 0);
+        assert_eq!(symbols.get_shared_var("halves").unwrap().offset, 4);
+        assert_eq!(symbols.get_shared_var("words").unwrap().offset, 16);
+
+        symbols
+            .declare_local("depot", ScalarType::B8, 5, 1)
+            .unwrap();
+        symbols
+            .declare_local("spill", ScalarType::F64, 1, 8)
+            .unwrap();
+        assert_eq!(symbols.get_local_var("depot").unwrap().offset, 0);
+        assert_eq!(symbols.get_local_var("spill").unwrap().offset, 8);
+
+        symbols
+            .declare_global_var("flag", ScalarType::B8, 1, 1)
+            .unwrap();
+        symbols
+            .declare_global_var("table", ScalarType::F64, 2, 8)
+            .unwrap();
+        // MODULE_GLOBAL_BASE is itself naturally aligned for any scalar
+        // width, so the offsets' alignment carries over to the addresses.
+        assert_eq!(MODULE_GLOBAL_BASE % 16, 0);
+        assert_eq!(symbols.get_global_var("flag").unwrap().addr % 8, 0);
+        assert_eq!(
+            symbols.get_global_var("table").unwrap().addr,
+            MODULE_GLOBAL_BASE + 8
+        );
     }
 
     /// Static-only tables finalize to "no extern window".

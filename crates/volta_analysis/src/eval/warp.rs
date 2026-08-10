@@ -22,6 +22,7 @@ use crate::symbols::RegId;
 use crate::tensor_core::{
     FragmentElement, MmaLayout, MmaOperand, MmaShape, m16n8k16_f16, m16n16k16_f16,
 };
+use crate::types::ScalarTypeExt;
 
 /// A dense matrix of expressions being assembled from lane fragments.
 struct Grid {
@@ -56,6 +57,47 @@ fn elem_offset(layout: MmaLayout, row: u32, col: u32, stride: u64) -> u64 {
         MmaLayout::Col => col as u64 * stride + row as u64,
     }
 }
+
+/// `ldmatrix` row alignment. PTX ISA 9.7.14.5.15: "a group of four
+/// consecutive threads loads 16 bytes. The matrix addresses must be
+/// naturally aligned accordingly" - every 8x8 b16 matrix row is one
+/// 16-byte access, so each lane-supplied row address must be a multiple
+/// of 16.
+const LDMATRIX_ROW_BYTES: u64 = 16;
+
+/// `wmma` base-address alignment for m16n16k16, the one supported shape:
+/// the fragment size in bytes. PTX ISA 9.7.14.4.2 (Matrix Storage for
+/// WMMA, "Address Alignment"): "The starting address of each instance of
+/// the leading dimension (row or column) must be aligned with the size of
+/// the corresponding fragment in bytes"; the section's example requires
+/// "p is a multiple of 32". Every supported m16n16k16 fragment is 32
+/// bytes (a/b are eight .f16x2 registers, c/d eight .f32 registers), and
+/// the CUDA API documents the same base contract ("mptr must be a 256-bit
+/// aligned pointer").
+const WMMA_BASE_ALIGN_BYTES: u64 = 32;
+
+/// `wmma` stride granularity: the stride in *bytes* must be a multiple of
+/// 16. The ISA example goes further ("2*s is a multiple of 32", making
+/// every leading-dimension instance fragment-aligned), but nvcc's own
+/// emission does not honor that reading: bank-conflict-skewed tiles
+/// (`__shared__ half tile[..][16 + 8]`, as in the corpus's Conv2D-opt)
+/// compile to f16 strides of 24 elements = 48 bytes. What nvcc enforces
+/// is the CUDA API's stride contract - ldm "must be a multiple of 8 for
+/// __half element type or multiple of 4 for float element type", i.e. 16
+/// bytes either way - which keeps every leading-dimension instance
+/// aligned for the hardware's 16-byte row fetches. Requiring 32 here
+/// would reject valid, hardware-correct nvcc output (verified on the
+/// corpus: conv's f16 wmma ops all run at a 48-byte pitch from 32-aligned
+/// bases).
+const WMMA_STRIDE_ALIGN_BYTES: u64 = 16;
+
+/// Minimum legal `wmma.load`/`wmma.store` stride, in matrix elements. PTX
+/// ISA 9.7.14.4.3: the stride defaults to the matrix's leading dimension
+/// and "specifying a value lower than the default value results in
+/// undefined behavior"; larger values (a submatrix of a larger matrix) are
+/// fine. For m16n16k16 the leading dimension is 16 elements for every
+/// operand (a/b/c/d) and both layouts (the spec's default-stride table).
+const WMMA_MIN_STRIDE_ELEMS: i64 = 16;
 
 impl Interpreter<'_> {
     /// Execute a complete warp group blocked at `pc` with lane mask `mask`.
@@ -237,12 +279,16 @@ impl Interpreter<'_> {
             });
         }
 
-        // Row addresses come from the first num*8 lanes.
+        // Row addresses come from the first num*8 lanes. Each row is loaded
+        // by a group of four lanes as one 16-byte access, so every row
+        // address must be 16-byte aligned (see `LDMATRIX_ROW_BYTES`).
         let mut row_addr = vec![[0u64; 8]; num as usize];
         for i in 0..num as usize {
             for r in 0..8 {
                 let m = members[i * 8 + r];
-                row_addr[i][r] = self.concrete_operand(m, pc, addr, "ldmatrix row address")? as u64;
+                let a = self.concrete_operand(m, pc, addr, "ldmatrix row address")? as u64;
+                self.check_alignment(m, pc, MemSpace::Shared, a, LDMATRIX_ROW_BYTES)?;
+                row_addr[i][r] = a;
             }
         }
 
@@ -344,7 +390,9 @@ impl Interpreter<'_> {
         self.check_wmma_shape(pc, members, *shape)?;
 
         let base = self.uniform_concrete(pc, members, addr, "wmma.load address")? as u64;
-        let stride = self.uniform_concrete(pc, members, stride, "wmma.load stride")? as u64;
+        let stride = self.uniform_concrete(pc, members, stride, "wmma.load stride")?;
+        let stride =
+            self.check_wmma_addressing(pc, members[0], *space, base, stride, *elem_type)?;
 
         match operand {
             MmaOperand::A | MmaOperand::B => {
@@ -433,8 +481,8 @@ impl Interpreter<'_> {
             src,
             addr,
             stride,
+            elem_type,
             space,
-            ..
         } = instr
         else {
             unreachable!()
@@ -442,7 +490,9 @@ impl Interpreter<'_> {
         self.check_wmma_shape(pc, members, *shape)?;
 
         let base = self.uniform_concrete(pc, members, addr, "wmma.store address")? as u64;
-        let stride = self.uniform_concrete(pc, members, stride, "wmma.store stride")? as u64;
+        let stride = self.uniform_concrete(pc, members, stride, "wmma.store stride")?;
+        let stride =
+            self.check_wmma_addressing(pc, members[0], *space, base, stride, *elem_type)?;
 
         for &m in members {
             let lane = m.0 % WARP_SIZE;
@@ -526,6 +576,47 @@ impl Interpreter<'_> {
             });
         }
         Ok(())
+    }
+
+    /// Validate a `wmma.load`/`wmma.store` base address and stride against
+    /// the m16n16k16 matrix-storage rules, returning the stride for offset
+    /// arithmetic. The base must be fragment-aligned (see
+    /// `WMMA_BASE_ALIGN_BYTES`); leading-dimension instance `r` starts at
+    /// `base + r * elem_bytes * stride`, so the stride in bytes must keep
+    /// every instance 16-byte aligned (see `WMMA_STRIDE_ALIGN_BYTES`); and
+    /// a stride below the leading dimension is undefined behavior outright
+    /// (see `WMMA_MIN_STRIDE_ELEMS`).
+    fn check_wmma_addressing(
+        &self,
+        pc: InstrId,
+        lead: ThreadId,
+        space: MemSpace,
+        base: u64,
+        stride: i64,
+        elem_type: ScalarType,
+    ) -> EvalResult<u64> {
+        if stride < WMMA_MIN_STRIDE_ELEMS {
+            return Err(EvalError::WmmaStrideTooSmall {
+                pc,
+                stride,
+                minimum: WMMA_MIN_STRIDE_ELEMS as u64,
+            });
+        }
+        let stride = stride as u64;
+        self.check_alignment(lead, pc, space, base, WMMA_BASE_ALIGN_BYTES)?;
+        let row_bytes = elem_type.size_bytes() as u64 * stride;
+        if !row_bytes.is_multiple_of(WMMA_STRIDE_ALIGN_BYTES) {
+            // With `base` aligned, the first misaligned leading-dimension
+            // instance is the second one, at `base + row_bytes`.
+            return Err(EvalError::Misaligned {
+                thread: lead,
+                pc,
+                space,
+                addr: base + row_bytes,
+                required: WMMA_STRIDE_ALIGN_BYTES,
+            });
+        }
+        Ok(stride)
     }
 
     /// Resolve an operand that must be concrete and identical on every lane.

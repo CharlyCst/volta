@@ -421,6 +421,409 @@ fn test_out_of_bounds_shared_access() {
     );
 }
 
+// =========================================================================
+// Natural alignment (PTX ISA 6.4.2: "The address must be naturally aligned
+// to a multiple of the access size"; misaligned accesses are undefined
+// behavior on hardware, so the evaluator rejects them)
+// =========================================================================
+
+/// A 4-byte load at an address 2 mod 4 is misaligned.
+#[test]
+fn test_misaligned_scalar_load() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.f32 %f1, [%rd1+2];
+    st.global.f32 [%rd2], %f1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let err = analyze_kernel(&module, None, in_out_config(1, 4)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::Misaligned { required: 4, .. })
+        ),
+        "expected misaligned access, got: {}",
+        err
+    );
+}
+
+/// A 4-byte store at an address 2 mod 4 is misaligned (write side of the
+/// same chokepoint).
+#[test]
+fn test_misaligned_scalar_store() {
+    let src = wrap(
+        ".visible .entry k()
+{
+    .reg .b32 %r<3>;
+    .shared .align 4 .b8 sdata[16];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, sdata;
+    st.shared.u32 [%r2+2], %r1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((1, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::Misaligned { required: 4, .. })
+        ),
+        "expected misaligned access, got: {}",
+        err
+    );
+}
+
+/// 2-byte accesses at addresses 2 mod 4 are *naturally aligned* (natural
+/// alignment is relative to the access size, not any fixed width): the
+/// ordinary f16 access pattern must keep working.
+#[test]
+fn test_aligned_u16_access_at_2_mod_4() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b16 %rs<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.u16 %rs1, [%rd1+2];
+    st.global.u16 [%rd2+2], %rs1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![
+        ArrayDef {
+            name: "in".to_string(),
+            base: 0x10000,
+            elem_width: 2,
+            len: 4,
+            kind: ArrayKind::Input,
+        },
+        ArrayDef {
+            name: "out".to_string(),
+            base: 0x20000,
+            elem_width: 2,
+            len: 4,
+            kind: ArrayKind::Output,
+        },
+    ];
+    config.params = vec![
+        ParamValue::ArrayPtr("in".to_string()),
+        ParamValue::ArrayPtr("out".to_string()),
+    ];
+    let output = analyze_kernel(&module, None, config).expect("aligned u16 access");
+    assert_eq!(display_output(&output, "out", 1), "in[1]");
+}
+
+/// The access size of a vector load is the *total* bytes accessed
+/// (ld.v4.f32 is one 16-byte access), so an address 4 mod 16 is misaligned
+/// even though every element taken alone is 4-aligned.
+#[test]
+fn test_misaligned_vector_load() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<5>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd1+4];
+    st.global.f32 [%rd2], %f1;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let err = analyze_kernel(&module, None, in_out_config(1, 8)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::Misaligned { required: 16, .. })
+        ),
+        "expected misaligned vector access, got: {}",
+        err
+    );
+}
+
+/// The same vector load at a 16-byte boundary is legal.
+#[test]
+fn test_aligned_vector_load() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<5>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd1];
+    st.global.f32 [%rd2], %f4;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let output = analyze_kernel(&module, None, in_out_config(1, 8)).expect("aligned v4 load");
+    assert_eq!(display_output(&output, "out", 0), "in[3]");
+}
+
+/// One full-warp ldmatrix.x4 body; each lane supplies the row address
+/// `sdata + tid*16 + extra` (lane i*8+r owns row r of matrix i).
+fn ldmatrix_body(extra: u32) -> String {
+    format!(
+        ".visible .entry k()
+{{
+    .reg .b32 %r<10>;
+    .shared .align 16 .b8 sdata[1024];
+
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r2, %r1, 4;
+    mov.u32 %r3, sdata;
+    add.s32 %r4, %r3, %r2;
+    add.s32 %r4, %r4, {};
+    ldmatrix.sync.aligned.x4.m8n8.shared.b16 {{%r5, %r6, %r7, %r8}}, [%r4];
+    ret;
+}}
+",
+        extra
+    )
+}
+
+/// ldmatrix row addresses are legal at 16-byte boundaries: each 8x8 b16
+/// matrix row is fetched by four lanes as one 16-byte access.
+#[test]
+fn test_aligned_ldmatrix() {
+    let module = parse(&wrap(&ldmatrix_body(0)));
+    analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).expect("aligned ldmatrix");
+}
+
+/// A row address 8 mod 16 violates ldmatrix's 16-byte row alignment
+/// (PTX ISA 9.7.14.5.15) even though each lane's own 4-byte read would be
+/// 4-aligned.
+#[test]
+fn test_misaligned_ldmatrix_row_address() {
+    let module = parse(&wrap(&ldmatrix_body(8)));
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::Misaligned { required: 16, .. })
+        ),
+        "expected misaligned ldmatrix row, got: {}",
+        err
+    );
+}
+
+/// One full-warp wmma.load.a body with base `sdata + extra` and the given
+/// stride (in f16 elements).
+fn wmma_load_body(extra: u32, stride: u32) -> String {
+    format!(
+        ".visible .entry k()
+{{
+    .reg .b32 %r<12>;
+    .shared .align 32 .b8 sdata[2048];
+
+    mov.u32 %r1, sdata;
+    add.s32 %r1, %r1, {};
+    mov.u32 %r2, {};
+    wmma.load.a.sync.aligned.row.m16n16k16.shared.f16 \
+         {{%r3, %r4, %r5, %r6, %r7, %r8, %r9, %r10}}, [%r1], %r2;
+    ret;
+}}
+",
+        extra, stride
+    )
+}
+
+/// One full-warp wmma.store.d body with base `sdata + extra` and the given
+/// stride (in f32 elements).
+fn wmma_store_body(extra: u32, stride: u32) -> String {
+    format!(
+        ".visible .entry k()
+{{
+    .reg .b32 %r<3>;
+    .reg .f32 %f<9>;
+    .shared .align 32 .b8 sdata[4096];
+
+    mov.f32 %f1, 0f3F800000;
+    mov.f32 %f2, 0f3F800000;
+    mov.f32 %f3, 0f3F800000;
+    mov.f32 %f4, 0f3F800000;
+    mov.f32 %f5, 0f3F800000;
+    mov.f32 %f6, 0f3F800000;
+    mov.f32 %f7, 0f3F800000;
+    mov.f32 %f8, 0f3F800000;
+    mov.u32 %r1, sdata;
+    add.s32 %r1, %r1, {};
+    mov.u32 %r2, {};
+    wmma.store.d.sync.aligned.row.m16n16k16.shared.f32 \
+         [%r1], {{%f1, %f2, %f3, %f4, %f5, %f6, %f7, %f8}}, %r2;
+    ret;
+}}
+",
+        extra, stride
+    )
+}
+
+/// wmma with a 32-byte-aligned base and the default stride (16 elements)
+/// is legal, for both the f16 a-fragment load and the f32 d-fragment store.
+#[test]
+fn test_aligned_wmma_load_and_store() {
+    let module = parse(&wrap(&wmma_load_body(0, 16)));
+    analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).expect("aligned wmma.load");
+
+    let module = parse(&wrap(&wmma_store_body(0, 16)));
+    analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).expect("aligned wmma.store");
+}
+
+/// A stride *larger* than the default is explicitly allowed (a submatrix
+/// of a larger matrix) as long as it keeps rows aligned.
+#[test]
+fn test_wmma_stride_above_default_is_legal() {
+    let module = parse(&wrap(&wmma_load_body(0, 32)));
+    analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).expect("stride-32 wmma.load");
+}
+
+/// nvcc's bank-conflict skew (`__shared__ half tile[..][16 + 8]`, the
+/// corpus's Conv2D-opt) yields a 24-element f16 stride: 48 bytes, not a
+/// multiple of the 32-byte fragment size but 16-byte aligned, which is
+/// the contract nvcc actually compiles against. It must stay legal.
+#[test]
+fn test_wmma_skewed_stride_is_legal() {
+    let module = parse(&wrap(&wmma_load_body(0, 24)));
+    analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).expect("stride-24 wmma.load");
+}
+
+/// A wmma base address 8 mod 32 violates the 32-byte fragment alignment
+/// (PTX ISA 9.7.14.4.2) even though each f16 element read is 2-aligned.
+#[test]
+fn test_wmma_load_base_misaligned() {
+    let module = parse(&wrap(&wmma_load_body(8, 16)));
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::Misaligned { required: 32, .. })
+        ),
+        "expected misaligned wmma base, got: {}",
+        err
+    );
+}
+
+/// The store side enforces the same base alignment.
+#[test]
+fn test_wmma_store_base_misaligned() {
+    let module = parse(&wrap(&wmma_store_body(8, 16)));
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::Misaligned { required: 32, .. })
+        ),
+        "expected misaligned wmma store base, got: {}",
+        err
+    );
+}
+
+/// A stride below the leading dimension (16 elements for m16n16k16) is
+/// undefined behavior by itself (PTX ISA 9.7.14.4.3).
+#[test]
+fn test_wmma_stride_below_default() {
+    let module = parse(&wrap(&wmma_load_body(0, 8)));
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::WmmaStrideTooSmall {
+                stride: 8,
+                minimum: 16,
+                ..
+            })
+        ),
+        "expected wmma stride below default, got: {}",
+        err
+    );
+}
+
+/// A stride that is legal in *size* but whose byte pitch breaks the
+/// 16-byte stride granularity leaves rows past the first misaligned:
+/// 20 f16 elements = 40 bytes.
+#[test]
+fn test_wmma_stride_misaligned() {
+    let module = parse(&wrap(&wmma_load_body(0, 20)));
+    let err = analyze_kernel(&module, None, AnalysisConfig::new((32, 1, 1))).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalysisError::Eval(EvalError::Misaligned { required: 16, .. })
+        ),
+        "expected misaligned wmma stride, got: {}",
+        err
+    );
+}
+
+/// An array base that is not a multiple of the element width is rejected
+/// when the analysis is configured, not per access.
+#[test]
+fn test_config_rejects_misaligned_array_base() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![ArrayDef {
+        name: "in".to_string(),
+        base: 2,
+        elem_width: 4,
+        len: 4,
+        kind: ArrayKind::Input,
+    }];
+    config.params = vec![ParamValue::ArrayPtr("in".to_string())];
+    let err = analyze_kernel(&module, None, config).unwrap_err();
+    assert!(
+        matches!(err, AnalysisError::Eval(EvalError::Config { .. })),
+        "expected config error, got: {}",
+        err
+    );
+}
+
 /// nvcc's u16 magic-number division (Conv2D-opt's index cache): the
 /// immediate -17873 is the u16 constant 47663 = ceil(2^19/11); operands of
 /// `mul.wide.u16` must be reinterpreted as unsigned, not consumed at their

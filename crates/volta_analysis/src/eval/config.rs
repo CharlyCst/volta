@@ -123,6 +123,18 @@ impl AnalysisConfig {
                     a.name
                 ));
             }
+            // PTX requires every access to be naturally aligned (ISA
+            // 6.4.2); a base that is not a multiple of the element width
+            // would make *every* element access misaligned, so reject it
+            // once here instead of per access.
+            if a.base % a.elem_width != 0 {
+                return Err(format!(
+                    "array '{}' base address {:#x} is not a multiple of its element \
+                     width {}; every element access would be misaligned (PTX requires \
+                     naturally aligned accesses)",
+                    a.name, a.base, a.elem_width
+                ));
+            }
             for b in &self.arrays[i + 1..] {
                 if a.name == b.name {
                     return Err(format!(
@@ -223,5 +235,27 @@ mod tests {
             .params
             .push(ParamValue::SymFloat("alpha".to_string()));
         assert!(dup_sym.validate().is_err());
+    }
+
+    /// A base that is not a multiple of the element width would make every
+    /// element access misaligned (PTX ISA 6.4.2), so it is rejected once at
+    /// config time rather than per access.
+    #[test]
+    fn validate_rejects_misaligned_array_base() {
+        let mut misaligned = AnalysisConfig::new((1, 1, 1));
+        misaligned.arrays.push(array("in", 2, 4));
+        assert!(misaligned.validate().is_err());
+
+        // The same base is fine for a 2-byte-element array: natural
+        // alignment is relative to the element width, not any fixed size.
+        let mut halves = AnalysisConfig::new((1, 1, 1));
+        halves.arrays.push(ArrayDef {
+            name: "in".to_string(),
+            base: 2,
+            elem_width: 2,
+            len: 4,
+            kind: ArrayKind::Input,
+        });
+        assert_eq!(halves.validate(), Ok(()));
     }
 }

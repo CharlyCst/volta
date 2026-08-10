@@ -222,6 +222,10 @@ impl<'p> Interpreter<'p> {
                     message: format!("no module-scope .global variable named '{}'", name),
                 })?;
             let v = Value::Scalar(arena.int(*value));
+            // Analysis-setup placement, not a PTX memory instruction, so
+            // the natural-alignment rule does not apply; the address is
+            // naturally aligned anyway (`declare_global_var` packs with
+            // `align_up` from the naturally-aligned `MODULE_GLOBAL_BASE`).
             global
                 .init(var.addr, var.size_bytes, v)
                 .expect("module-global initialization cannot fail");
@@ -545,6 +549,12 @@ impl<'p> Interpreter<'p> {
 
         let mut next_pc = InstrId(pc.0 + 1);
         match &instr {
+            // Parameter reads are interpreter-internal value bindings (an
+            // `IdVec` lookup), not byte-addressed memory accesses, so the
+            // natural-alignment rule for memory instructions has nothing to
+            // apply to. Byte-addressed `.param`/`.const` accesses that do
+            // reach `Load`/`Store` are rejected as unsupported in
+            // `check_bounds`.
             LoweredInstr::LoadParam { dst, param_id } => {
                 let v = self.params[*param_id];
                 self.threads[t].regs.write(*dst, v);
@@ -572,6 +582,12 @@ impl<'p> Interpreter<'p> {
             } => {
                 let addr = self.effective_addr(t, pc, base, *offset)?;
                 let width = ty.size_bytes() as u64;
+                // The access size of a vector load is the *total* number of
+                // bytes accessed (`ld.v4.b32` is one 16-byte access, PTX
+                // ISA 6.4.2), so the whole vector's alignment is checked
+                // once here; the element-width checks in `mem_read` below
+                // are implied by it.
+                self.check_alignment(t, pc, *space, addr, dst.len() as u64 * width)?;
                 for (k, reg) in dst.iter().enumerate() {
                     let v = self.mem_read(t, pc, *space, addr + k as u64 * width, width)?;
                     let v = self.canon_loaded(t, pc, *ty, *reg, v)?;
@@ -601,6 +617,9 @@ impl<'p> Interpreter<'p> {
             } => {
                 let addr = self.effective_addr(t, pc, base, *offset)?;
                 let width = ty.size_bytes() as u64;
+                // As for `LoadVec`: a vector store's access size is the
+                // total bytes stored, checked once for the whole vector.
+                self.check_alignment(t, pc, *space, addr, src.len() as u64 * width)?;
                 for (k, reg) in src.iter().enumerate() {
                     let v = self.read_reg(t, pc, *reg)?;
                     let v = self.canon_stored(t, pc, *ty, Some(reg_bits(*reg)), v)?;
@@ -1056,6 +1075,40 @@ impl<'p> Interpreter<'p> {
         }
     }
 
+    /// Natural-alignment check. PTX ISA 6.4.2: "The address must be
+    /// naturally aligned to a multiple of the access size. If an address is
+    /// not properly aligned, the resulting behavior is undefined". A
+    /// misaligned kernel has no defined hardware semantics to model, so the
+    /// access is rejected loudly instead. Addresses are always concrete
+    /// here, so the check is a single modulo.
+    ///
+    /// `required` is the access size for scalar loads/stores (`mem_read`/
+    /// `mem_write` check every access at its granule width), the *total*
+    /// size for vector accesses (checked once at the `LoadVec`/`StoreVec`
+    /// sites; the per-element checks below them are implied), and the
+    /// row/fragment alignment for the tensor-core cooperative ops (checked
+    /// at the `ldmatrix`/`wmma` sites in `eval::warp`).
+    pub(in crate::eval) fn check_alignment(
+        &self,
+        t: ThreadId,
+        pc: InstrId,
+        space: MemSpace,
+        addr: u64,
+        required: u64,
+    ) -> EvalResult<()> {
+        if addr.is_multiple_of(required) {
+            Ok(())
+        } else {
+            Err(EvalError::Misaligned {
+                thread: t,
+                pc,
+                space,
+                addr,
+                required,
+            })
+        }
+    }
+
     fn mem_error(&self, t: ThreadId, pc: InstrId, space: MemSpace, e: MemAccessError) -> EvalError {
         match e {
             MemAccessError::Uninitialized { addr } => EvalError::UninitializedMemory {
@@ -1091,6 +1144,13 @@ impl<'p> Interpreter<'p> {
         width: u64,
     ) -> EvalResult<Value> {
         self.check_bounds(t, pc, space, addr, width)?;
+        // Every program access flows through here (scalar ld/st directly;
+        // vector and tensor-core ops per element, after their own
+        // larger-granule checks), so this is the one natural-alignment
+        // chokepoint. Param space never reaches it: `check_bounds` rejects
+        // Param/Const accesses, and `LoadParam` reads interpreter-internal
+        // parameter bindings, not byte-addressed memory.
+        self.check_alignment(t, pc, space, addr, width)?;
         let memory = match space {
             MemSpace::Global | MemSpace::Shared => {
                 self.race
@@ -1163,6 +1223,10 @@ impl<'p> Interpreter<'p> {
             }
         }
 
+        // Analysis-setup placement (not a PTX access, so no alignment check
+        // applies): each granule lands at `base + i*elem_width`, naturally
+        // aligned because `AnalysisConfig::validate` requires every array
+        // base to be a multiple of its element width.
         let mut any = false;
         for (elem_addr, elem_width, index, array_sid) in missing {
             let value = match array_sid {
@@ -1192,6 +1256,8 @@ impl<'p> Interpreter<'p> {
         value: Value,
     ) -> EvalResult<()> {
         self.check_bounds(t, pc, space, addr, width)?;
+        // See `mem_read`: the write-side natural-alignment chokepoint.
+        self.check_alignment(t, pc, space, addr, width)?;
         let memory = match space {
             MemSpace::Global | MemSpace::Shared => {
                 self.race
