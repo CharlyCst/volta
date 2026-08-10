@@ -559,6 +559,7 @@ impl<'p> Interpreter<'p> {
             } => {
                 let addr = self.effective_addr(t, pc, base, *offset)?;
                 let v = self.mem_read(t, pc, *space, addr, ty.size_bytes() as u64)?;
+                let v = self.canon_loaded(t, pc, *ty, *dst, v)?;
                 self.threads[t].regs.write(*dst, v);
             }
 
@@ -573,6 +574,7 @@ impl<'p> Interpreter<'p> {
                 let width = ty.size_bytes() as u64;
                 for (k, reg) in dst.iter().enumerate() {
                     let v = self.mem_read(t, pc, *space, addr + k as u64 * width, width)?;
+                    let v = self.canon_loaded(t, pc, *ty, *reg, v)?;
                     self.threads[t].regs.write(*reg, v);
                 }
             }
@@ -586,6 +588,7 @@ impl<'p> Interpreter<'p> {
             } => {
                 let addr = self.effective_addr(t, pc, base, *offset)?;
                 let v = self.operand_value(t, pc, src)?;
+                let v = self.canon_stored(t, pc, *ty, operand_reg_bits(src), v)?;
                 self.mem_write(t, pc, *space, addr, ty.size_bytes() as u64, v)?;
             }
 
@@ -600,12 +603,21 @@ impl<'p> Interpreter<'p> {
                 let width = ty.size_bytes() as u64;
                 for (k, reg) in src.iter().enumerate() {
                     let v = self.read_reg(t, pc, *reg)?;
+                    let v = self.canon_stored(t, pc, *ty, Some(reg_bits(*reg)), v)?;
                     self.mem_write(t, pc, *space, addr + k as u64 * width, width, v)?;
                 }
             }
 
-            LoweredInstr::Mov { dst, src, .. } => {
+            LoweredInstr::Mov { dst, src, ty } => {
                 let v = self.operand_value(t, pc, src)?;
+                // Rebind the value at the mov's own type: `mov.u32 %r, -1`
+                // must leave the same canonical constant in `%r` as
+                // `not.b32 %r, 0` (consumers see the type-canonical value,
+                // not the source operand's producer-typed rendering).
+                let v = match v {
+                    Value::Scalar(e) => Value::Scalar(self.canon_operand(*ty, e)),
+                    pair @ Value::Pair(_, _) => pair,
+                };
                 self.threads[t].regs.write(*dst, v);
             }
 
@@ -1230,6 +1242,14 @@ impl<'p> Interpreter<'p> {
             return Ok(self.arena.int(r));
         }
 
+        // One operand concrete, the other symbolic: reinterpret the
+        // concrete side at the instruction type before building the node,
+        // so `add.u32 %r, %sym, -1` and a chain that produced 4294967295
+        // build identical expressions (the register/immediate rendering
+        // is the producer's, not this instruction's).
+        let a = self.canon_operand(ty, a);
+        let b = self.canon_operand(ty, b);
+
         Ok(match op {
             BinOp::Add => self.arena.add(a, b),
             BinOp::Sub => self.arena.sub(a, b),
@@ -1419,23 +1439,130 @@ impl<'p> Interpreter<'p> {
         })
     }
 
-    /// Reinterpret a concrete operand as canonical for `ty`. Registers hold
-    /// values canonicalized by their *producing* instruction, so a value
-    /// written as signed may be consumed as unsigned (or vice versa): nvcc
-    /// emits `mul.wide.u16 %r, %rs, -17873` where the immediate is really
-    /// the u16 magic constant 47663. Symbolic operands pass through
-    /// unchanged.
+    /// Reinterpret a concrete operand as canonical for `ty`. Registers and
+    /// memory granules hold values canonicalized by their *producing*
+    /// instruction, so a value written as signed may be consumed as
+    /// unsigned (or vice versa): nvcc emits `mul.wide.u16 %r, %rs, -17873`
+    /// where the immediate is really the u16 magic constant 47663. Every
+    /// consumer that gives a concrete integer a type of its own re-reads
+    /// the value through this (mov, cvt sources, wide/hi multiplies,
+    /// binops with a symbolic side; loads and stores go through
+    /// [`Self::canon_loaded`]/[`Self::canon_stored`]). Symbolic operands
+    /// pass through unchanged, as do float and bool constants (a
+    /// `mov.b32 %r, %f` bit-move must not coerce the float to an int).
     fn canon_operand(&mut self, ty: ScalarType, e: ExprId) -> ExprId {
-        if ty.is_float() {
+        if ty.is_float() || ty.is_predicate() {
             return e;
         }
-        if let Some(c) = self.arena.as_i64(e) {
+        if let Some(c) = self.arena.as_int_const(e) {
             let canon = canon_int(c, ty.bits().min(64), ty.is_signed_int());
             if canon != c {
                 return self.arena.int(canon);
             }
         }
         e
+    }
+
+    /// Canonicalize a value crossing a store boundary. Memory holds bit
+    /// patterns: a concrete integer is reduced to the unsigned low bits of
+    /// the store type (`st.u8` of 300 stores 44); sign/zero extension is
+    /// the *load*'s job (see [`Self::canon_loaded`]). Floats, packed
+    /// pairs, and `Undefined` pass through unchanged.
+    ///
+    /// A *symbolic* integer stored below its source register's width would
+    /// need a truncation node we deliberately do not model, so that store
+    /// is a loud error rather than a silently unsound pass-through.
+    /// Equal-width symbolic stores are exact and pass through (an f16 half
+    /// stored from a 16-bit register via `st.u16` - the corpus's only
+    /// symbolic sub-word stores).
+    fn canon_stored(
+        &mut self,
+        t: ThreadId,
+        pc: InstrId,
+        ty: ScalarType,
+        src_reg_bits: Option<u32>,
+        v: Value,
+    ) -> EvalResult<Value> {
+        if ty.is_float() || ty.is_predicate() {
+            return Ok(v);
+        }
+        let Value::Scalar(e) = v else {
+            return Ok(v); // packed f16 pairs
+        };
+        if let Some(c) = self.arena.as_int_const(e) {
+            let canon = canon_int(c, ty.bits().min(64), false);
+            return Ok(if canon == c {
+                v
+            } else {
+                Value::Scalar(self.arena.int(canon))
+            });
+        }
+        if let Some(reg_bits) = src_reg_bits
+            && ty.bits() < reg_bits
+            && !self.arena.is_undefined(e)
+            && !self.arena.is_concrete(e)
+        {
+            return Err(EvalError::Unsupported {
+                pc,
+                what: format!(
+                    "symbolic value stored at sub-register width \
+                     ({}-bit store of a {}-bit register, thread {})",
+                    ty.bits(),
+                    reg_bits,
+                    t
+                ),
+            });
+        }
+        Ok(v)
+    }
+
+    /// Canonicalize a value crossing a load boundary: `ld` extends the
+    /// memory pattern to the destination register per the *load type* -
+    /// sign-extension for `.s8`/`.s16`/..., zero-extension for unsigned
+    /// and bits types (the ISA's ld extension rules) - so `ld.s8` of the
+    /// byte 0xFF yields -1 while `ld.u8` yields 255. Floats, packed
+    /// pairs, and `Undefined` pass through unchanged.
+    ///
+    /// A *symbolic* scalar loaded at a type narrower than the destination
+    /// register would need an extension node we deliberately do not model:
+    /// loud error. Equal-width symbolic loads are exact and pass through
+    /// (f16 halves loaded into 16-bit registers).
+    fn canon_loaded(
+        &mut self,
+        t: ThreadId,
+        pc: InstrId,
+        ty: ScalarType,
+        dst: RegId,
+        v: Value,
+    ) -> EvalResult<Value> {
+        if ty.is_float() || ty.is_predicate() {
+            return Ok(v);
+        }
+        let Value::Scalar(e) = v else {
+            return Ok(v); // packed f16 pairs
+        };
+        if let Some(c) = self.arena.as_int_const(e) {
+            let canon = canon_int(c, ty.bits().min(64), ty.is_signed_int());
+            return Ok(if canon == c {
+                v
+            } else {
+                Value::Scalar(self.arena.int(canon))
+            });
+        }
+        let dst_bits = reg_bits(dst);
+        if ty.bits() < dst_bits && !self.arena.is_undefined(e) && !self.arena.is_concrete(e) {
+            return Err(EvalError::Unsupported {
+                pc,
+                what: format!(
+                    "symbolic value loaded at sub-register width \
+                     ({}-bit load into a {}-bit register, thread {})",
+                    ty.bits(),
+                    dst_bits,
+                    t
+                ),
+            });
+        }
+        Ok(v)
     }
 
     /// Widening product: operands are reinterpreted at the source type, and
@@ -1559,24 +1686,44 @@ impl<'p> Interpreter<'p> {
         if dst_ty.is_float() && src_ty.is_float() {
             return Ok(a);
         }
-        if dst_ty.is_float() {
-            return Ok(self.arena.to_float(a));
-        }
         if src_ty.is_float() {
             return Err(EvalError::Unsupported {
                 pc,
                 what: format!("cvt float->int ({:?} -> {:?})", src_ty, dst_ty),
             });
         }
-        // Integer-to-integer: renormalize concrete values to the destination
-        // width; symbolic integers pass through (they are data, not
-        // addresses, so width games cannot occur in a structured-CTA).
-        if let Some(c) = self.arena.as_i64(a) {
+        // Integer source: cvt reads its source at the *source* format
+        // first (ISA Table 15: "extension ... follows the source format"),
+        // so a register canonicalized unsigned by its producer (`and.b32`
+        // leaving 4294967288) reads as -8 under `cvt.s64.s32`. Symbolic
+        // integers pass through (they are data, not addresses, so width
+        // games cannot occur in a structured-CTA).
+        let a = self.canon_operand(src_ty, a);
+        if dst_ty.is_float() {
+            return Ok(self.arena.to_float(a));
+        }
+        // ... then the result is renormalized at the destination width.
+        if let Some(c) = self.arena.as_int_const(a) {
             let bits = dst_ty.bits().min(64);
             let r = canon_int(c, bits, dst_ty.is_signed_int());
             return Ok(self.arena.int(r));
         }
         Ok(a)
+    }
+}
+
+/// Bit width of a register's storage class.
+fn reg_bits(reg: RegId) -> u32 {
+    (reg.class.size_bytes() * 8) as u32
+}
+
+/// Bit width of the register behind `op`, if it is a register operand.
+/// Immediates and special registers resolve to concrete values, which
+/// never trip the symbolic sub-register-width store policy.
+fn operand_reg_bits(op: &Operand) -> Option<u32> {
+    match op {
+        Operand::Reg(r) => Some(reg_bits(*r)),
+        _ => None,
     }
 }
 

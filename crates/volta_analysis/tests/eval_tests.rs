@@ -484,6 +484,271 @@ fn test_mul_hi_u32_negative_operand() {
     assert_eq!(display_output(&output, "out", 0), "1");
 }
 
+/// Output-only config: one `out` array of `len` `elem_width`-byte
+/// elements, passed as the kernel's single parameter.
+fn out_only_config(elem_width: u64, len: u64) -> AnalysisConfig {
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![ArrayDef {
+        name: "out".to_string(),
+        base: 0x20000,
+        elem_width,
+        len,
+        kind: ArrayKind::Output,
+    }];
+    config.params = vec![ParamValue::ArrayPtr("out".to_string())];
+    config
+}
+
+/// A byte-element global scratch array (kind Input, so it is never
+/// compared as an output) plus a u32 `out` array.
+fn u8_scratch_config() -> AnalysisConfig {
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![
+        ArrayDef {
+            name: "scratch".to_string(),
+            base: 0x30000,
+            elem_width: 1,
+            len: 8,
+            kind: ArrayKind::Input,
+        },
+        ArrayDef {
+            name: "out".to_string(),
+            base: 0x20000,
+            elem_width: 4,
+            len: 2,
+            kind: ArrayKind::Output,
+        },
+    ];
+    config.params = vec![
+        ParamValue::ArrayPtr("scratch".to_string()),
+        ParamValue::ArrayPtr("out".to_string()),
+    ];
+    config
+}
+
+/// Value-boundary canonicalization: `mov.u32 %r, -1` and `not.b32 %r, 0`
+/// leave the same hardware value in the register, so both kernels must
+/// export the same canonical constant (this was a false DIFF: the mov
+/// side exported -1, the not side 4294967295).
+#[test]
+fn test_mov_neg1_equivalent_to_not_zero() {
+    let mov_kernel = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    mov.u32 %r1, -1;
+    st.global.u32 [%rd1], %r1;
+    ret;
+}
+",
+    );
+    let not_kernel = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    not.b32 %r1, 0;
+    st.global.u32 [%rd1], %r1;
+    ret;
+}
+",
+    );
+    let a = analyze_kernel(&parse(&mov_kernel), None, out_only_config(4, 1)).unwrap();
+    let b = analyze_kernel(&parse(&not_kernel), None, out_only_config(4, 1)).unwrap();
+    assert_eq!(display_output(&a, "out", 0), "4294967295");
+    assert_eq!(display_output(&b, "out", 0), "4294967295");
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
+/// `st.u8` keeps only the low byte of the stored value (hardware chops
+/// 300 to 44); `ld.u8` zero-extends it back.
+#[test]
+fn test_store_u8_truncates_to_low_bits() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    mov.u32 %r1, 44;
+    add.s32 %r2, %r1, 256;
+    st.global.u8 [%rd1], %r2;
+    ld.global.u8 %r3, [%rd1];
+    st.global.u32 [%rd2], %r3;
+    ret;
+}
+",
+    );
+    let output = analyze_kernel(&parse(&src), None, u8_scratch_config()).unwrap();
+    assert_eq!(display_output(&output, "out", 0), "44");
+}
+
+/// `ld.s8` sign-extends the memory byte per the load type: the byte 0xFF
+/// reads back as -1, and storing that at 32-bit width exports the
+/// canonical unsigned pattern 4294967295 - the same constant a kernel
+/// that stores -1 directly exports.
+#[test]
+fn test_load_s8_sign_extends() {
+    let via_byte = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    mov.u32 %r1, 255;
+    st.global.u8 [%rd1], %r1;
+    ld.global.s8 %r2, [%rd1];
+    st.global.s32 [%rd2], %r2;
+    ret;
+}
+",
+    );
+    let direct = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd2, [k_param_1];
+    mov.u32 %r1, -1;
+    st.global.u32 [%rd2], %r1;
+    ret;
+}
+",
+    );
+    let a = analyze_kernel(&parse(&via_byte), None, u8_scratch_config()).unwrap();
+    let b = analyze_kernel(&parse(&direct), None, u8_scratch_config()).unwrap();
+    assert_eq!(display_output(&a, "out", 0), "4294967295");
+    assert_eq!(display_output(&b, "out", 0), "4294967295");
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
+/// cvt reads its source at the *source* format (ISA Table 15: extension
+/// follows the source format): `and.b32` leaves the unsigned-canonical
+/// 4294967288 in the register, and `cvt.s64.s32` must reinterpret it as
+/// the s32 -8 before widening; mirrored, `cvt.u64.u32` of a `sub.s32`
+/// result -8 must widen the u32 reading 4294967288.
+#[test]
+fn test_cvt_reinterprets_at_source_format() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    mov.u32 %r1, -5;
+    and.b32 %r2, %r1, -4;
+    cvt.s64.s32 %rd2, %r2;
+    st.global.s64 [%rd1], %rd2;
+    mov.u32 %r3, 3;
+    sub.s32 %r4, %r3, 11;
+    cvt.u64.u32 %rd3, %r4;
+    st.global.u64 [%rd1+8], %rd3;
+    ret;
+}
+",
+    );
+    let output = analyze_kernel(&parse(&src), None, out_only_config(8, 2)).unwrap();
+    // (-5 & -4) at 32 bits is 0xFFFFFFF8; sign-extended through s32: -8.
+    assert_eq!(display_output(&output, "out", 0), "-8");
+    // 3 - 11 = -8; zero-extended through u32: 4294967288.
+    assert_eq!(display_output(&output, "out", 1), "4294967288");
+}
+
+/// A symbolic value stored below its source register's width would need
+/// a truncation node we do not model: loud error, not silent nonsense.
+#[test]
+fn test_symbolic_sub_register_store_rejected() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.u32 %r1, [%rd1];
+    st.global.u8 [%rd2], %r1;
+    ret;
+}
+",
+    );
+    let err = analyze_kernel(&parse(&src), None, in_out_config(1, 1)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AnalysisError::Eval(EvalError::Unsupported { what, .. })
+                if what.contains("symbolic value stored")
+        ),
+        "expected symbolic sub-register store rejection, got: {}",
+        err
+    );
+}
+
+/// A symbolic scalar loaded at a type narrower than the destination
+/// register would need an extension node we do not model: loud error.
+#[test]
+fn test_symbolic_sub_register_load_rejected() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    ld.global.s8 %r1, [%rd1];
+    st.global.u32 [%rd2], %r1;
+    ret;
+}
+",
+    );
+    // The byte array serves as the kernel's input here: loading one of
+    // its symbolic elements at s8 into a 32-bit register would need an
+    // extension.
+    let err = analyze_kernel(&parse(&src), None, u8_scratch_config()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AnalysisError::Eval(EvalError::Unsupported { what, .. })
+                if what.contains("symbolic value loaded")
+        ),
+        "expected symbolic sub-register load rejection, got: {}",
+        err
+    );
+}
+
 /// Branching on input data violates structured-CTA.
 #[test]
 fn test_symbolic_branch_rejected() {

@@ -886,6 +886,18 @@ impl ExprArena {
         }
     }
 
+    /// Try to read an integer constant. Unlike [`Self::as_i64`] this does
+    /// not coerce float or bool constants: value-boundary canonicalization
+    /// (`mov`/`ld`/`st`/`cvt` reinterpreting concrete integers at the
+    /// instruction type) must leave bit-moved floats (`mov.b32 %r, %f`)
+    /// untouched.
+    pub fn as_int_const(&self, id: ExprId) -> Option<i64> {
+        match self.node(id) {
+            ExprNode::IntConst(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// Try to evaluate as a concrete u64.
     pub fn as_u64(&self, id: ExprId) -> Option<u64> {
         match self.node(id) {
