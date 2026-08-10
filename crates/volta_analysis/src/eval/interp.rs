@@ -185,14 +185,22 @@ impl<'p> Interpreter<'p> {
             });
         }
         for info in program.symbols.shared_vars() {
-            let size = if info.is_extern {
-                config.dynamic_shared_bytes
-            } else {
-                info.size_bytes
-            };
+            if info.is_extern {
+                // Every extern name aliases the one dynamic window; a single
+                // region for it is added below.
+                continue;
+            }
             regions.shared.push(Region {
                 base: info.offset,
-                size,
+                size: info.size_bytes,
+            });
+        }
+        // The dynamic (`.extern .shared`) window: based after all static
+        // allocations, sized by the launch configuration.
+        if let Some(base) = program.symbols.extern_shared_base() {
+            regions.shared.push(Region {
+                base,
+                size: config.dynamic_shared_bytes,
             });
         }
         for var in program.symbols.local_vars() {

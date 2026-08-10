@@ -896,6 +896,13 @@ pub fn lower_function(func: &Function, module_vars: &[VarDecl]) -> LowerResult<L
     // Second: collect function-level declarations
     collect_declarations(&mut ctx, &func.params, body)?;
 
+    // Place the extern-shared window now that every static `.shared`
+    // declaration is known: the CUDA ABI bases the dynamic segment after
+    // all static allocations. This must precede `lower_body`, which is the
+    // first point that resolves shared symbols to addresses
+    // (`resolve_mem_symbol`).
+    ctx.symbols.finalize_shared_layout();
+
     // Third: lower instructions
     lower_body(&mut ctx, body)?;
 
@@ -4398,6 +4405,75 @@ mod tests {
     // Exhaustive-lowering policy tests: unmodeled modifiers/forms error
     // loudly (naming the modifier), and the modeled forms still lower.
     // =========================================================================
+
+    // =========================================================================
+    // Shared memory layout through lower_function: module-level externs are
+    // collected before function-body statics, but the extern window must be
+    // placed after all statics (CUDA ABI).
+    // =========================================================================
+
+    /// Parse `src` as a full module and lower its entry, passing module-level
+    /// variable declarations through as the driver does.
+    fn lower_module_src(src: &str) -> LoweredProgram {
+        use volta_frontend::ascii::AsAscii;
+        use volta_frontend::parse::Parser;
+
+        let ascii = src.as_bytes().as_ascii_slice().expect("ascii source");
+        let module = Parser::new(ascii)
+            .parse_module()
+            .unwrap_or_else(|e| panic!("parse error: {:?}", e.error));
+        let vars: Vec<ast::VarDecl> = module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ast::TopLevelItem::Variable(v) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        let func = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ast::TopLevelItem::Entry(f) => Some(f),
+                _ => None,
+            })
+            .expect("kernel not found");
+        lower_function(func, &vars).expect("lowering failed")
+    }
+
+    #[test]
+    fn test_extern_shared_window_follows_static_shared() {
+        let program = lower_module_src(
+            ".version 8.0\n.target sm_80\n.address_size 64\n\n\
+             .extern .shared .align 16 .b8 buf[];\n\
+             .visible .entry k()\n{\n\
+             .reg .b32 %r<4>;\n\
+             .shared .align 4 .f32 lut[64];\n\
+             ret;\n}\n",
+        );
+        // The static packs from 0; the extern window is disjoint, after it.
+        let lut = program.symbols.get_shared_var("lut").unwrap();
+        assert_eq!((lut.offset, lut.size_bytes), (0, 256));
+        let buf = program.symbols.get_shared_var("buf").unwrap();
+        assert!(buf.is_extern);
+        assert_eq!(buf.offset, 256);
+        assert_eq!(program.symbols.extern_shared_base(), Some(256));
+    }
+
+    /// Extern-only modules (every extern-shared kernel in the corpus) keep
+    /// the window at offset 0: behavior identical to before the fix.
+    #[test]
+    fn test_extern_only_shared_window_at_zero() {
+        let program = lower_module_src(
+            ".version 8.0\n.target sm_80\n.address_size 64\n\n\
+             .extern .shared .align 16 .b8 buf[];\n\
+             .visible .entry k()\n{\n\
+             .reg .b32 %r<4>;\n\
+             ret;\n}\n",
+        );
+        assert_eq!(program.symbols.get_shared_var("buf").unwrap().offset, 0);
+        assert_eq!(program.symbols.extern_shared_base(), Some(0));
+    }
 
     /// Parse and lower a kernel whose body is `body`, with a standard set of
     /// registers declared.

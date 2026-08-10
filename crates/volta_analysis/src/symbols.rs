@@ -246,6 +246,32 @@ pub struct SharedMemInfo {
     pub is_extern: bool,
 }
 
+/// A `.extern .shared` declaration recorded during collection, before it can
+/// be placed. All extern shared names alias the one dynamic-shared window,
+/// and the CUDA ABI bases that window *after* every static `.shared`
+/// allocation - which are not all known yet when the extern is declared
+/// (module-level declarations are collected before function-body ones). So
+/// declaration only records the request; `finalize_shared_layout` assigns
+/// the offset.
+#[derive(Debug, Clone)]
+struct PendingExternShared {
+    name: String,
+    element_ty: ScalarType,
+    /// Declared alignment, already raised to the element size.
+    alignment: u64,
+}
+
+/// Placement state of the `.extern .shared` (dynamic shared) window.
+#[derive(Debug, Clone)]
+enum ExternSharedLayout {
+    /// Declarations are still being collected; extern variables are recorded
+    /// here, unplaced, and are absent from `shared_vars`.
+    Collecting(Vec<PendingExternShared>),
+    /// All static declarations are known; every extern variable is present
+    /// in `shared_vars` at offset `extern_base`.
+    Finalized { extern_base: u64 },
+}
+
 /// Information about a function-scope local memory allocation (e.g. the
 /// `__local_depot` stack array nvcc emits for spilled locals).
 #[derive(Debug, Clone)]
@@ -271,6 +297,11 @@ pub struct GlobalVarInfo {
 /// not place input/output arrays at or above this address.
 pub const MODULE_GLOBAL_BASE: u64 = 0x7000_0000_0000_0000;
 
+/// Round `offset` up to the next multiple of `alignment` (a power of two).
+fn align_up(offset: u64, alignment: u64) -> u64 {
+    (offset + alignment - 1) & !(alignment - 1)
+}
+
 /// Symbol table built during lowering
 #[derive(Debug, Clone)]
 pub struct SymbolTable {
@@ -291,12 +322,17 @@ pub struct SymbolTable {
     /// Label name → instruction PC
     labels: HashMap<String, InstrId>,
 
-    /// Shared memory allocations
+    /// Shared memory allocations. Extern variables only appear here once
+    /// `finalize_shared_layout` has placed them.
     shared_vars: HashMap<String, SharedMemInfo>,
-    /// Total static shared memory size
+    /// Total static shared memory size (packing cursor for statics). The
+    /// dynamic extern window begins at `extern_shared_base()`, at or after
+    /// this offset.
     shared_mem_size: u64,
     /// Has extern shared memory
     has_extern_shared: bool,
+    /// Placement state of the `.extern .shared` window
+    extern_layout: ExternSharedLayout,
 
     /// Function-scope local memory allocations (per-thread space)
     local_vars: HashMap<String, LocalMemInfo>,
@@ -321,6 +357,7 @@ impl SymbolTable {
             shared_vars: HashMap::new(),
             shared_mem_size: 0,
             has_extern_shared: false,
+            extern_layout: ExternSharedLayout::Collecting(Vec::new()),
             local_vars: HashMap::new(),
             local_mem_size: 0,
             global_vars: HashMap::new(),
@@ -422,7 +459,13 @@ impl SymbolTable {
         Ok(())
     }
 
-    /// Declare shared memory variable
+    /// Declare shared memory variable.
+    ///
+    /// Static variables are packed at increasing offsets in declaration
+    /// order. Extern (`.extern .shared`) variables are only *recorded* here:
+    /// they all alias the one dynamic-shared window, which the CUDA ABI
+    /// bases after every static allocation, so their offset cannot be known
+    /// until `finalize_shared_layout` runs.
     pub fn declare_shared(
         &mut self,
         name: &str,
@@ -431,19 +474,30 @@ impl SymbolTable {
         is_extern: bool,
         alignment: u64,
     ) -> LowerResult<()> {
+        if matches!(self.extern_layout, ExternSharedLayout::Finalized { .. }) {
+            panic!("declare_shared({name}) after finalize_shared_layout");
+        }
+
         self.reserve_name(name, SymbolKind::SharedVariable)?;
 
-        // Align offset
         let elem_size = (element_ty.bits() as u64).div_ceil(8);
         let alignment = alignment.max(elem_size);
-        let offset = (self.shared_mem_size + alignment - 1) & !(alignment - 1);
 
-        let size_bytes = if is_extern {
+        if is_extern {
             self.has_extern_shared = true;
-            0 // Size determined at runtime
-        } else {
-            num_elements * elem_size
-        };
+            let ExternSharedLayout::Collecting(pending) = &mut self.extern_layout else {
+                unreachable!("state checked above");
+            };
+            pending.push(PendingExternShared {
+                name: name.to_string(),
+                element_ty,
+                alignment,
+            });
+            return Ok(());
+        }
+
+        let offset = align_up(self.shared_mem_size, alignment);
+        let size_bytes = num_elements * elem_size;
 
         self.shared_vars.insert(
             name.to_string(),
@@ -452,12 +506,64 @@ impl SymbolTable {
                 offset,
                 size_bytes,
                 element_ty,
-                is_extern,
+                is_extern: false,
             },
         );
 
         self.shared_mem_size = offset + size_bytes;
         Ok(())
+    }
+
+    /// Place the `.extern .shared` window and enter the finalized state.
+    ///
+    /// All extern shared declarations alias one dynamic window that the CUDA
+    /// ABI bases immediately after every static allocation, aligned to at
+    /// least 16 bytes and to every extern's declared alignment. Must be
+    /// called exactly once, after all shared declarations are collected and
+    /// before any shared symbol is resolved to an address; declaring shared
+    /// variables after this call panics.
+    pub fn finalize_shared_layout(&mut self) {
+        let pending = match &mut self.extern_layout {
+            ExternSharedLayout::Collecting(pending) => std::mem::take(pending),
+            ExternSharedLayout::Finalized { .. } => {
+                panic!("finalize_shared_layout called twice")
+            }
+        };
+
+        let alignment = pending.iter().fold(16, |a, e| a.max(e.alignment));
+        let extern_base = align_up(self.shared_mem_size, alignment);
+
+        for e in pending {
+            self.shared_vars.insert(
+                e.name.clone(),
+                SharedMemInfo {
+                    name: e.name,
+                    offset: extern_base,
+                    size_bytes: 0, // Size supplied at launch (dynamic shared bytes)
+                    element_ty: e.element_ty,
+                    is_extern: true,
+                },
+            );
+        }
+
+        self.extern_layout = ExternSharedLayout::Finalized { extern_base };
+    }
+
+    /// Base offset of the dynamic (`.extern .shared`) window, or `None` if
+    /// the kernel declares no extern shared memory. The window spans from
+    /// this base for however many dynamic shared bytes the launch supplies.
+    ///
+    /// Panics if `finalize_shared_layout` has not run: before then no
+    /// placement exists to report.
+    pub fn extern_shared_base(&self) -> Option<u64> {
+        match self.extern_layout {
+            ExternSharedLayout::Finalized { extern_base } => {
+                self.has_extern_shared.then_some(extern_base)
+            }
+            ExternSharedLayout::Collecting(_) => {
+                panic!("extern_shared_base read before finalize_shared_layout")
+            }
+        }
     }
 
     /// Declare a function-scope local memory variable (per-thread space)
@@ -472,7 +578,7 @@ impl SymbolTable {
 
         let elem_size = (element_ty.bits() as u64).div_ceil(8);
         let alignment = alignment.max(elem_size).max(1);
-        let offset = (self.local_mem_size + alignment - 1) & !(alignment - 1);
+        let offset = align_up(self.local_mem_size, alignment);
         let size_bytes = num_elements * elem_size;
 
         self.local_vars.insert(
@@ -502,7 +608,7 @@ impl SymbolTable {
 
         let elem_size = (element_ty.bits() as u64).div_ceil(8);
         let alignment = alignment.max(elem_size).max(1);
-        let offset = (self.module_global_size + alignment - 1) & !(alignment - 1);
+        let offset = align_up(self.module_global_size, alignment);
         let size_bytes = num_elements * elem_size;
 
         self.global_vars.insert(
@@ -607,7 +713,11 @@ impl SymbolTable {
         self.params_ordered.get(id)
     }
 
-    /// Get total static shared memory size
+    /// Get total *static* shared memory size. The dynamic (`.extern
+    /// .shared`) window is not included: it begins at `extern_shared_base()`
+    /// and its size is only known at launch (dynamic shared bytes), so any
+    /// capacity accounting for a kernel with extern shared memory must use
+    /// `extern_shared_base() + dynamic bytes` as the end of shared memory.
     pub fn shared_mem_size(&self) -> u64 {
         self.shared_mem_size
     }
@@ -780,6 +890,112 @@ mod tests {
         // Try to declare same shared var again
         let result = symbols.declare_shared("smem", ScalarType::F32, 128, false, 4);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Shared memory layout: statics pack from 0, the extern window follows
+    // =========================================================================
+
+    /// The bug shape: an extern declared *before* the statics (module-level
+    /// declarations are collected first) must still be placed after them.
+    #[test]
+    fn test_extern_shared_placed_after_statics() {
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("buf", ScalarType::B8, 1, true, 16)
+            .unwrap();
+        symbols
+            .declare_shared("lut", ScalarType::F32, 64, false, 4)
+            .unwrap();
+        symbols.finalize_shared_layout();
+
+        let lut = symbols.get_shared_var("lut").unwrap();
+        assert_eq!((lut.offset, lut.size_bytes), (0, 256));
+        let buf = symbols.get_shared_var("buf").unwrap();
+        assert!(buf.is_extern);
+        assert_eq!(buf.offset, 256);
+        assert_eq!(symbols.extern_shared_base(), Some(256));
+        assert_eq!(symbols.shared_mem_size(), 256);
+    }
+
+    /// With no statics the extern window stays at offset 0 (the pre-fix
+    /// placement for every extern-only kernel in the corpus).
+    #[test]
+    fn test_extern_only_shared_base_zero() {
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("buf", ScalarType::B8, 1, true, 16)
+            .unwrap();
+        symbols.finalize_shared_layout();
+
+        assert_eq!(symbols.get_shared_var("buf").unwrap().offset, 0);
+        assert_eq!(symbols.extern_shared_base(), Some(0));
+        assert_eq!(symbols.shared_mem_size(), 0);
+    }
+
+    /// All extern declarations alias one buffer: same base for every name,
+    /// aligned to the largest declared alignment (at least 16).
+    #[test]
+    fn test_extern_shared_common_base_and_alignment() {
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("a", ScalarType::B8, 1, true, 4)
+            .unwrap();
+        symbols
+            .declare_shared("b", ScalarType::B8, 1, true, 128)
+            .unwrap();
+        // 20 bytes of statics; the window rounds up to the 128 boundary.
+        symbols
+            .declare_shared("lut", ScalarType::F32, 5, false, 4)
+            .unwrap();
+        symbols.finalize_shared_layout();
+
+        assert_eq!(symbols.extern_shared_base(), Some(128));
+        assert_eq!(symbols.get_shared_var("a").unwrap().offset, 128);
+        assert_eq!(symbols.get_shared_var("b").unwrap().offset, 128);
+    }
+
+    /// Even a byte-aligned extern window is based at a 16-byte boundary.
+    #[test]
+    fn test_extern_shared_base_min_16_alignment() {
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("buf", ScalarType::B8, 1, true, 1)
+            .unwrap();
+        symbols
+            .declare_shared("x", ScalarType::U32, 1, false, 4)
+            .unwrap();
+        symbols.finalize_shared_layout();
+
+        assert_eq!(symbols.extern_shared_base(), Some(16));
+    }
+
+    /// Static-only tables finalize to "no extern window".
+    #[test]
+    fn test_finalize_without_externs() {
+        let mut symbols = SymbolTable::new();
+        symbols
+            .declare_shared("lut", ScalarType::F32, 64, false, 4)
+            .unwrap();
+        symbols.finalize_shared_layout();
+
+        assert_eq!(symbols.extern_shared_base(), None);
+        assert_eq!(symbols.get_shared_var("lut").unwrap().offset, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "after finalize_shared_layout")]
+    fn test_declare_shared_after_finalize_panics() {
+        let mut symbols = SymbolTable::new();
+        symbols.finalize_shared_layout();
+        let _ = symbols.declare_shared("late", ScalarType::F32, 1, false, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "before finalize_shared_layout")]
+    fn test_extern_base_before_finalize_panics() {
+        let symbols = SymbolTable::new();
+        let _ = symbols.extern_shared_base();
     }
 
     #[test]

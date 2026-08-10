@@ -170,6 +170,150 @@ fn test_shared_exchange_without_barrier_races() {
     );
 }
 
+/// A store through the `.extern .shared` window must not be visible through
+/// a static `.shared` variable: the CUDA ABI places the dynamic segment
+/// after all static allocations, so `buf` and `lut` are disjoint. The `lut`
+/// read is therefore undefined and surfaces as `UndefinedOutput` when it
+/// reaches the output array (with the two aliased at shared offset 0 it
+/// would instead read back the 42 stored through `buf`).
+#[test]
+fn test_extern_shared_store_invisible_through_static_shared() {
+    let src = wrap(
+        ".extern .shared .align 16 .b8 buf[];
+.visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<3>;
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<2>;
+    .shared .align 4 .f32 lut[64];
+
+    ld.param.u64 %rd1, [k_param_1];
+    mov.u32 %r1, buf;
+    mov.f32 %f1, 0f42280000;
+    st.shared.f32 [%r1], %f1;
+    mov.u32 %r2, lut;
+    ld.shared.f32 %f2, [%r2];
+    st.global.f32 [%rd1], %f2;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let mut config = in_out_config(1, 1);
+    config.dynamic_shared_bytes = 16;
+    let err = analyze_kernel(&module, None, config).unwrap_err();
+    assert!(
+        matches!(err, AnalysisError::Eval(EvalError::UndefinedOutput { .. })),
+        "expected undefined output (buf and lut must not alias), got: {}",
+        err
+    );
+}
+
+/// Unsynchronized accesses to the extern window from one thread and to a
+/// static `.shared` variable from another are not a race: the regions are
+/// disjoint. With the extern window wrongly aliased at offset 0 this
+/// reported a false write-write race.
+#[test]
+fn test_extern_vs_static_shared_no_false_race() {
+    let src = wrap(
+        ".extern .shared .align 16 .b8 buf[];
+.visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<4>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    .shared .align 4 .f32 lut[64];
+
+    ld.param.u64 %rd1, [k_param_1];
+    mov.u32 %r1, %tid.x;
+    setp.eq.s32 %p1, %r1, 0;
+    setp.eq.s32 %p2, %r1, 1;
+    mov.u32 %r2, buf;
+    mov.f32 %f1, 0f42280000;
+@%p1 st.shared.f32 [%r2], %f1;
+    mov.u32 %r3, lut;
+    mov.f32 %f2, 0f40E00000;
+@%p2 st.shared.f32 [%r3], %f2;
+@%p2 ld.shared.f32 %f3, [%r3];
+@%p2 st.global.f32 [%rd1], %f3;
+    ret;
+}
+",
+    );
+    let module = parse(&src);
+    let mut config = in_out_config(2, 1);
+    config.dynamic_shared_bytes = 16;
+    let output = analyze_kernel(&module, None, config)
+        .expect("disjoint extern/static shared accesses must not race");
+    assert_eq!(display_output(&output, "out", 0), "7");
+}
+
+/// Extern-only kernels are unchanged by extern-window placement: the window
+/// still starts at shared offset 0, a store/load roundtrip works, the
+/// missing-size launch error still fires, and dynamic_shared_bytes still
+/// bounds the window.
+#[test]
+fn test_extern_only_shared_placement_and_bounds() {
+    let body = ".extern .shared .align 16 .b8 buf[];
+.visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<3>;
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_1];
+    mov.u32 %r1, buf;
+    mov.f32 %f1, 0f42280000;
+    st.shared.f32 [%r1OFFSET], %f1;
+    ld.shared.f32 %f2, [%r1];
+    st.global.f32 [%rd1], %f2;
+    ret;
+}
+";
+    // In-bounds roundtrip at buf[0].
+    let src = wrap(&body.replace("OFFSET", ""));
+    let module = parse(&src);
+    let mut config = in_out_config(1, 1);
+    config.dynamic_shared_bytes = 16;
+    let output = analyze_kernel(&module, None, config).expect("in-bounds extern access");
+    assert_eq!(display_output(&output, "out", 0), "42");
+
+    // Without dynamic_shared_bytes the launch is rejected.
+    let module = parse(&src);
+    let err = analyze_kernel(&module, None, in_out_config(1, 1)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AnalysisError::Eval(EvalError::Config { message })
+                if message.contains("dynamic_shared_bytes")
+        ),
+        "expected missing dynamic_shared_bytes error, got: {}",
+        err
+    );
+
+    // A store ending one byte past the window end is out of bounds.
+    let src = wrap(&body.replace("OFFSET", "+16"));
+    let module = parse(&src);
+    let mut config = in_out_config(1, 1);
+    config.dynamic_shared_bytes = 16;
+    let err = analyze_kernel(&module, None, config).unwrap_err();
+    assert!(
+        matches!(err, AnalysisError::Eval(EvalError::OutOfBounds { .. })),
+        "expected out-of-bounds, got: {}",
+        err
+    );
+}
+
 /// Threads waiting on different barrier ids never fire: deadlock.
 #[test]
 fn test_mismatched_barriers_deadlock() {
