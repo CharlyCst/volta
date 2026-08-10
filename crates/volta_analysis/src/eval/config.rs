@@ -154,7 +154,17 @@ impl AnalysisConfig {
             }
         }
         let mut sym_names = std::collections::BTreeSet::new();
-        for value in &self.params {
+        for (i, value) in self.params.iter().enumerate() {
+            // NaN denotes no real number: it cannot enter the analysis
+            // model (the infinities can - they are running-max/min seeds).
+            if let ParamValue::Float(v) = value
+                && v.is_nan()
+            {
+                return Err(format!(
+                    "parameter {} is NaN; NaN is outside the analysis model (reals)",
+                    i
+                ));
+            }
             if let ParamValue::SymFloat(name) = value {
                 if name.is_empty() {
                     return Err("sym: parameter name is empty".to_string());
@@ -235,6 +245,21 @@ mod tests {
             .params
             .push(ParamValue::SymFloat("alpha".to_string()));
         assert!(dup_sym.validate().is_err());
+    }
+
+    /// NaN float parameters are rejected at validation: NaN denotes no
+    /// real number, so it has no place in the reals model. The infinities
+    /// are fine (running-max/min seeds).
+    #[test]
+    fn validate_rejects_nan_float_param() {
+        let mut nan = AnalysisConfig::new((1, 1, 1));
+        nan.params.push(ParamValue::Float(f64::NAN));
+        let err = nan.validate().unwrap_err();
+        assert!(err.contains("NaN"), "unexpected message: {}", err);
+
+        let mut inf = AnalysisConfig::new((1, 1, 1));
+        inf.params.push(ParamValue::Float(f64::NEG_INFINITY));
+        assert_eq!(inf.validate(), Ok(()));
     }
 
     /// A base that is not a multiple of the element width would make every

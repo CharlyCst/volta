@@ -78,6 +78,11 @@ pub enum LowerError {
         reason: &'static str,
     },
 
+    /// A float immediate whose bit pattern is a NaN. The analysis model is
+    /// the reals (extended with the infinities); NaN denotes no real
+    /// number, so the literal is rejected at lowering.
+    NanLiteral,
+
     /// Invalid branch target
     InvalidBranchTarget { target: String },
 
@@ -194,6 +199,10 @@ impl fmt::Display for LowerError {
                      Reason: {}",
                     operand, instruction, reason
                 )
+            }
+
+            Self::NanLiteral => {
+                write!(f, "NaN literal is outside the analysis model (reals)")
             }
 
             Self::InvalidBranchTarget { target } => {

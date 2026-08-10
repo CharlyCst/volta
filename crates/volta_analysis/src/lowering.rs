@@ -311,7 +311,17 @@ impl LoweringContext {
             }
             AstOperand::ImmInt(val) => Ok(Operand::ImmI64(*val)),
             AstOperand::ImmUInt(val) => Ok(Operand::ImmU64(*val)),
-            AstOperand::ImmFloat(val) => Ok(Operand::ImmF64(*val)),
+            AstOperand::ImmFloat(val) => {
+                // A NaN bit pattern (e.g. 0f7FC00000) denotes no real
+                // number: reject it here, the analysis model's ingestion
+                // point for float literals. The infinities pass through
+                // (running-max/min seeds like 0fFF800000 are how real
+                // kernels start their reductions).
+                if val.is_nan() {
+                    return Err(LowerError::NanLiteral);
+                }
+                Ok(Operand::ImmF64(*val))
+            }
             AstOperand::Symbol(name) => {
                 let name_str = name.to_string();
                 // Check if it's a shared/local/global memory symbol

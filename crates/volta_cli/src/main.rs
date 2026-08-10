@@ -761,7 +761,9 @@ const DUMP_MAGIC: &[u8; 8] = b"VOLTAVCD";
 // variants, which shifts the bincode variant tags of every later variant.
 // The equally never-produced ToInt variant was then removed within the same
 // unreleased format revision; its tag shift rides the same 2.0 (no build
-// that wrote the intermediate layout ever shipped).
+// that wrote the intermediate layout ever shipped). FloatConst(f64) then
+// became RealConst(Real) - exact rationals on the wire - within the same
+// unreleased revision, riding the same 2.0 for the same reason.
 const DUMP_MAJOR: u16 = 2;
 const DUMP_MINOR: u16 = 0;
 

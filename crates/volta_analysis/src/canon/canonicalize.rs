@@ -97,8 +97,8 @@ impl Session {
                 let p = self.arena.const_poly(Coeff::from_int(*v));
                 Ok(RatV::from_rat(self.arena.rat_poly(p)))
             }
-            ExprNode::FloatConst(v) => {
-                let p = self.arena.const_poly(Coeff::from_f64(*v)?);
+            ExprNode::RealConst(v) => {
+                let p = self.arena.const_poly(Coeff::from_real(v)?);
                 Ok(RatV::from_rat(self.arena.rat_poly(p)))
             }
             ExprNode::BoolConst(b) => {

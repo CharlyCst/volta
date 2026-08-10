@@ -92,9 +92,18 @@ to its subsystem:
 ### Symbolic Expressions (`symbolic.rs`)
 
 Arena-allocated: nodes live in an `ExprArena`, referenced by copyable `ExprId`
-handles. Constructors constant-fold eagerly.
+handles. Constructors constant-fold eagerly - **exactly**: float constants
+are `Real`s (arbitrary-precision rationals via `rug`, boxed, plus
+`NegInf`/`PosInf`; NaN is rejected at every f64 ingestion point -
+`Real::from_f64`/`arena.float_from_f64` are fallible, NaN literals are a
+lowering error, NaN params a config validation error), so the fold algebra
+and canon's rational algebra coincide by construction. Folds are exact on
+ℚ (div/rcp only for nonzero divisors - `x/0` stays unfolded and canon
+errors loudly); ±inf folds only the unambiguous extended-real forms
+(max/min absorption, neg, inf±finite, inf·nonzero), undefined forms
+(inf−inf, 0·inf, anything/0) build unfolded nodes.
 
-- **Atoms**: `IntConst`, `FloatConst`, `BoolConst`, `Symbol(SymbolId)`, `ParamSymbol(StringId)`, `InputElement { array, index }`, `Undefined`
+- **Atoms**: `IntConst`, `RealConst(Real)`, `BoolConst`, `Symbol(SymbolId)`, `ParamSymbol(StringId)`, `InputElement { array, index }`, `Undefined`
 - Symbol identity is typed (`SymbolRef`: `Param`/`Element`/`Machine`,
   disjoint namespaces; one mapping in `ExprNode::symbol_ref`). Identity
   comes only from launch-config names - PTX-source names are scoped and
@@ -238,8 +247,9 @@ budget kills them, reported `Timeout` - Table 8's "with axiom" column,
   is left to the solver, so timings measure Z3, not the translator
   (`max`/`min` are `ite` case splits, not opaque atoms; no
   canonicalization, no structural short-circuit). The translation owns
-  fidelity/transport only: exact binary-rational float literals (same
-  reading as `canon`/`numeric`), user symbols as an injection of the
+  fidelity/transport only: exact rational literals straight from
+  `RealConst` (same reading as `canon`/`numeric`; the infinities are
+  loud `Unsupported`), user symbols as an injection of the
   typed `SymbolRef` namespaces (`|p!name|` params, `|e!array[i]|`
   elements - a param named `t0`/`e` cannot capture generated names),
   memoized `let`-bound DAG sharing (query text linear in the arena;

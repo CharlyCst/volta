@@ -1524,3 +1524,340 @@ fn test_red1_wrong_input_not_equivalent() {
         EquivOutcome::NotEquivalent { .. }
     ));
 }
+
+// =========================================================================
+// Exact real-constant folding: the fold algebra and canon's algebra are
+// one algebra, so the same real-model value folds to the same constant
+// regardless of which instructions computed it.
+// =========================================================================
+
+/// One-input/one-output f32 config over `in`/`out` (single thread).
+fn one_elem_config() -> AnalysisConfig {
+    in_out_config(1, 1)
+}
+
+/// `div.rn.f32 d, 1.0, 3.0` and `rcp.approx.f32 d, 3.0` now fold to the
+/// same exact rational 1/3, so kernels using either spelling are
+/// equivalent. Under the old f64 folds, the division folded to
+/// rational-of-fl(1/3) while rcp stayed symbolic and canonicalized to
+/// exactly 1/3 - the same value under two different constants.
+#[test]
+fn test_div_by_three_equivalent_to_rcp_of_three() {
+    let div_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<5>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.f32 %f1, [%rd1];
+    div.rn.f32 %f2, 0f3F800000, 0f40400000;
+    mul.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+",
+    );
+    let rcp_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<5>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.f32 %f1, [%rd1];
+    mov.f32 %f2, 0f40400000;
+    rcp.approx.f32 %f3, %f2;
+    mul.f32 %f4, %f1, %f3;
+    st.global.f32 [%rd2], %f4;
+    ret;
+}
+",
+    );
+    let a = analyze_kernel(&parse(&div_src), None, one_elem_config()).unwrap();
+    let b = analyze_kernel(&parse(&rcp_src), None, one_elem_config()).unwrap();
+    // Both fold to the exact rational 1/3.
+    assert_eq!(display_output(&a, "out", 0), "(in[0] * 1/3)");
+    assert_eq!(display_output(&b, "out", 0), "(in[0] * 1/3)");
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
+/// `sum / N` vs the strength-reduced `t = 1.0 / N; sum * t` at concrete
+/// N = 768: 1/768 is not dyadic, so the old fold rounded `t` to fl(1/768)
+/// and reported a false DIFF; the exact fold makes them equivalent.
+#[test]
+fn test_div_by_n_equivalent_to_mul_by_computed_reciprocal() {
+    let div_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.f32 %f1, [%rd1];
+    div.rn.f32 %f2, %f1, 0f44400000;
+    st.global.f32 [%rd2], %f2;
+    ret;
+}
+",
+    );
+    let recip_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0,
+    .param .u64 k_param_1
+)
+{
+    .reg .f32 %f<5>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    ld.param.u64 %rd2, [k_param_1];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.f32 %f1, [%rd1];
+    div.rn.f32 %f2, 0f3F800000, 0f44400000;
+    mul.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+",
+    );
+    let a = analyze_kernel(&parse(&div_src), None, one_elem_config()).unwrap();
+    let b = analyze_kernel(&parse(&recip_src), None, one_elem_config()).unwrap();
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
+/// f64 in/out config for the double-precision constant tests.
+fn f64_out_config() -> AnalysisConfig {
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![ArrayDef {
+        name: "out".to_string(),
+        base: 0x20000,
+        elem_width: 8,
+        len: 1,
+        kind: ArrayKind::Output,
+    }];
+    config.params = vec![ParamValue::ArrayPtr("out".to_string())];
+    config
+}
+
+/// Concrete fma folds exactly as mul-then-add: one algebra, no fused
+/// rounding (the old f64 folds could disagree between the two spellings).
+#[test]
+fn test_concrete_fma_equivalent_to_mul_add() {
+    let fma_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .f64 %fd<5>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.f64 %fd1, 0d3FB999999999999A;
+    mov.f64 %fd2, 0d3FC999999999999A;
+    mov.f64 %fd3, 0d3FD3333333333333;
+    fma.rn.f64 %fd4, %fd1, %fd2, %fd3;
+    st.global.f64 [%rd1], %fd4;
+    ret;
+}
+",
+    );
+    let mul_add_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .f64 %fd<6>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.f64 %fd1, 0d3FB999999999999A;
+    mov.f64 %fd2, 0d3FC999999999999A;
+    mov.f64 %fd3, 0d3FD3333333333333;
+    mul.f64 %fd4, %fd1, %fd2;
+    add.f64 %fd5, %fd4, %fd3;
+    st.global.f64 [%rd1], %fd5;
+    ret;
+}
+",
+    );
+    let a = analyze_kernel(&parse(&fma_src), None, f64_out_config()).unwrap();
+    let b = analyze_kernel(&parse(&mul_add_src), None, f64_out_config()).unwrap();
+    assert!(matches!(check_equiv(&a, &b), EquivOutcome::Equivalent));
+}
+
+/// The model-faithful direction: a kernel that adds 0.1 + 0.2 at runtime
+/// computes the exact rational sum, which is NOT the pre-rounded literal
+/// 0d3FD3333333333334 (the f64 the hardware would produce). The old f64
+/// fold rounded the runtime sum and wrongly equated the two.
+#[test]
+fn test_runtime_sum_differs_from_prerounded_literal() {
+    let sum_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .f64 %fd<4>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.f64 %fd1, 0d3FB999999999999A;
+    mov.f64 %fd2, 0d3FC999999999999A;
+    add.f64 %fd3, %fd1, %fd2;
+    st.global.f64 [%rd1], %fd3;
+    ret;
+}
+",
+    );
+    let literal_src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .f64 %fd<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.f64 %fd1, 0d3FD3333333333334;
+    st.global.f64 [%rd1], %fd1;
+    ret;
+}
+",
+    );
+    let a = analyze_kernel(&parse(&sum_src), None, f64_out_config()).unwrap();
+    let b = analyze_kernel(&parse(&literal_src), None, f64_out_config()).unwrap();
+    assert!(matches!(
+        check_equiv(&a, &b),
+        EquivOutcome::NotEquivalent { .. }
+    ));
+}
+
+/// A NaN literal (0f7FC00000) is rejected at lowering: NaN denotes no
+/// real number, so it cannot enter the analysis model.
+#[test]
+fn test_nan_literal_rejected_at_lowering() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.f32 %f1, 0f7FC00000;
+    st.global.f32 [%rd1], %f1;
+    ret;
+}
+",
+    );
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![ArrayDef {
+        name: "out".to_string(),
+        base: 0x20000,
+        elem_width: 4,
+        len: 1,
+        kind: ArrayKind::Output,
+    }];
+    config.params = vec![ParamValue::ArrayPtr("out".to_string())];
+    let err = analyze_kernel(&parse(&src), None, config).unwrap_err();
+    assert!(
+        matches!(err, AnalysisError::Lower(_)),
+        "expected lowering rejection of the NaN literal, got: {}",
+        err
+    );
+    assert!(
+        err.to_string().contains("NaN literal"),
+        "unexpected message: {}",
+        err
+    );
+}
+
+/// A NaN float parameter is a config validation error.
+#[test]
+fn test_nan_float_param_rejected() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .f32 k_param_0
+)
+{
+    ret;
+}
+",
+    );
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.params = vec![ParamValue::Float(f64::NAN)];
+    let err = analyze_kernel(&parse(&src), None, config).unwrap_err();
+    assert!(
+        matches!(&err, AnalysisError::Eval(EvalError::Config { message }) if message.contains("NaN")),
+        "expected NaN config validation error, got: {}",
+        err
+    );
+}
+
+/// `0.0 / 0.0` no longer mints a NaN: the division stays a symbolic node
+/// and the decision procedure errors loudly on the formally-zero
+/// denominator when the element is checked.
+#[test]
+fn test_zero_over_zero_is_a_loud_equivalence_error() {
+    let src = wrap(
+        ".visible .entry k(
+    .param .u64 k_param_0
+)
+{
+    .reg .f32 %f<3>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [k_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    div.rn.f32 %f2, 0f00000000, 0f00000000;
+    st.global.f32 [%rd1], %f2;
+    ret;
+}
+",
+    );
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![ArrayDef {
+        name: "out".to_string(),
+        base: 0x20000,
+        elem_width: 4,
+        len: 1,
+        kind: ArrayKind::Output,
+    }];
+    config.params = vec![ParamValue::ArrayPtr("out".to_string())];
+    let a = analyze_kernel(&parse(&src), None, config.clone()).unwrap();
+    // The output expression is the unfolded division, not a constant.
+    assert_eq!(display_output(&a, "out", 0), "(0 / 0)");
+    let b = analyze_kernel(&parse(&src), None, config).unwrap();
+    let arrays: Vec<String> = a.outputs.iter().map(|(n, _)| n.clone()).collect();
+    let err = check_output_equivalence(&a, &b, &arrays).unwrap_err();
+    assert!(
+        err.to_string().contains("division"),
+        "expected a division-by-zero equivalence error, got: {}",
+        err
+    );
+}

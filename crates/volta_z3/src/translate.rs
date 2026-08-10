@@ -18,11 +18,12 @@
 //! What the translation still owns (fidelity and transport, not
 //! reasoning):
 //!
-//! - **Exact literals**: a `FloatConst` renders as its exact binary
-//!   rational (`m/2^k` from the bit pattern), the same reading `canon`
-//!   and the numeric oracle use - shortest-decimal rendering would
-//!   silently reinterpret `0.1f64` as 1/10 and let the backends reach
-//!   opposite verdicts on the same VC.
+//! - **Exact literals**: a `RealConst` renders as its exact rational
+//!   (`p/q` - the arena stores exact rationals, the same reading `canon`
+//!   and the numeric oracle use); shortest-decimal rendering of the old
+//!   f64 constants would silently reinterpret `0.1f64` as 1/10 and let
+//!   the backends reach opposite verdicts on the same VC. The infinities
+//!   have no SMT real image and are refused loudly.
 //! - **DAG sharing**: `ExprArena` is a DAG (the softmax row-max is
 //!   shared by every term), so each compound node is bound to a `let`
 //!   variable once per side, memoized by `ExprId`. Text stays linear in
@@ -58,7 +59,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use volta_analysis::symbolic::{ExprArena, ExprId, ExprNode};
+use volta_analysis::symbolic::{ExprArena, ExprId, ExprNode, Real};
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("unsupported by the Z3 backend: {0}")]
@@ -193,52 +194,35 @@ fn escape(name: &str) -> String {
     name.replace('\\', "\\\\").replace('|', "\\|")
 }
 
-/// Exact decimal rendering of `m * 2^k` (little-endian digit doubling; k
-/// is at most 1074, so this is at most ~350k digit operations).
-fn shift_decimal(m: u64, k: u32) -> String {
-    let mut digits: Vec<u8> = m.to_string().bytes().rev().map(|b| b - b'0').collect();
-    for _ in 0..k {
-        let mut carry = 0u8;
-        for d in digits.iter_mut() {
-            let v = *d * 2 + carry;
-            *d = v % 10;
-            carry = v / 10;
+/// Exact SMT real literal for a `Real` constant: the rational rendered as
+/// an integer or an exact fraction, negation outside (see the module docs
+/// for why not the shortest decimal). The infinities have no real image
+/// and are refused loudly, exactly as non-finite f64 constants were.
+fn real_literal(v: &Real) -> Result<String, Unsupported> {
+    let q = match v {
+        Real::NegInf | Real::PosInf => {
+            return Err(Unsupported(format!(
+                "non-finite float constant {}",
+                v.to_f64()
+            )));
         }
-        if carry > 0 {
-            digits.push(carry);
-        }
-    }
-    digits.iter().rev().map(|d| (d + b'0') as char).collect()
-}
-
-/// Exact SMT real literal for a finite f64: the binary value `m * 2^e`
-/// from the bit pattern, rendered as an integer or an exact fraction
-/// (see the module docs for why not the shortest decimal).
-fn real_literal(v: f64) -> Result<String, Unsupported> {
-    if !v.is_finite() {
-        return Err(Unsupported(format!("non-finite float constant {}", v)));
-    }
-    if v == 0.0 {
-        // Covers -0.0 too: over the reals they are the same number.
+        Real::Rational(q) => q,
+    };
+    // rug's canonical form: reduced, denominator positive, sign on the
+    // numerator. Render the magnitude and put the negation outside.
+    let numer = q.numer().to_string();
+    if numer == "0" {
         return Ok("0.0".to_string());
     }
-    let bits = v.to_bits();
-    let negative = (bits >> 63) == 1;
-    let biased = ((bits >> 52) & 0x7ff) as i64;
-    let frac = bits & ((1u64 << 52) - 1);
-    let (mut m, mut e) = if biased == 0 {
-        (frac, -1074i64)
-    } else {
-        (frac | (1u64 << 52), biased - 1075)
+    let (negative, digits) = match numer.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, numer.as_str()),
     };
-    while m & 1 == 0 && e < 0 {
-        m >>= 1;
-        e += 1;
-    }
-    let body = if e >= 0 {
-        format!("{}.0", shift_decimal(m, e as u32))
+    let denom = q.denom();
+    let body = if *denom == 1 {
+        format!("{}.0", digits)
     } else {
-        format!("(/ {}.0 {}.0)", m, shift_decimal(1, (-e) as u32))
+        format!("(/ {}.0 {}.0)", digits, denom)
     };
     Ok(if negative {
         format!("(- {})", body)
@@ -291,7 +275,7 @@ fn translate_uncached(
 
     match arena.node(id) {
         ExprNode::IntConst(v) => Ok(int_literal(*v)),
-        ExprNode::FloatConst(v) => real_literal(*v),
+        ExprNode::RealConst(v) => real_literal(v),
         ExprNode::BoolConst(v) => Ok(if *v { "1.0" } else { "0.0" }.to_string()),
 
         ExprNode::ParamSymbol(sid) => Ok(bld.declare(quote_param(arena.string(*sid)))),

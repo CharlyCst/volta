@@ -96,7 +96,8 @@ fn eval_inner(
     let ev = |e: ExprId, memo: &mut HashMap<ExprId, f64>| eval_memo(arena, e, seed, memo);
     let v = match arena.node(id) {
         ExprNode::IntConst(v) => *v as f64,
-        ExprNode::FloatConst(v) => *v,
+        // Rounding conversion: the oracle is approximate by nature.
+        ExprNode::RealConst(v) => v.to_f64(),
         ExprNode::BoolConst(b) => *b as i64 as f64,
         ExprNode::ParamSymbol(_) | ExprNode::InputElement { .. } | ExprNode::Symbol(_) => {
             let sym = arena

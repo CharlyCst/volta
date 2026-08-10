@@ -1,13 +1,16 @@
 //! Exact rational coefficients.
 //!
-//! Every f64 constant is an exact rational (mantissa x 2^exponent), so
-//! coefficient arithmetic is exact: cancellation in the decision procedure
-//! never depends on floating-point rounding. Numerator/denominator are kept
-//! reduced in i128; kernel constants are small powers of two (0.125, 1.0,
-//! 1e-5 has denominator 2^79), so i128 has ample headroom. Overflow is a
-//! reported error, not a panic.
+//! Expression constants arrive as exact [`Real`] rationals (the evaluator
+//! folds in the same exact algebra), so coefficient arithmetic is exact:
+//! cancellation in the decision procedure never depends on floating-point
+//! rounding. Numerator/denominator are kept reduced in i128; kernel
+//! constants are small powers of two (0.125, 1.0, 1e-5 has denominator
+//! 2^79), so i128 has ample headroom. Overflow is a reported error, not a
+//! panic.
 
 use std::fmt;
+
+use crate::symbolic::Real;
 
 /// A reduced rational: `num / den` with `den > 0`, gcd(num, den) = 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,35 +69,19 @@ impl Coeff {
         }
     }
 
-    /// Exact conversion from f64 (every finite f64 is `m * 2^e`).
-    pub fn from_f64(v: f64) -> Result<Coeff, CoeffError> {
-        if !v.is_finite() {
-            return Err(CoeffError::NonFinite(v));
-        }
-        if v == 0.0 {
-            return Ok(Coeff::ZERO);
-        }
-        let bits = v.to_bits();
-        let sign: i128 = if bits >> 63 == 1 { -1 } else { 1 };
-        let biased_exp = ((bits >> 52) & 0x7ff) as i64;
-        let frac = bits & ((1u64 << 52) - 1);
-        // value = mantissa * 2^exp
-        let (mantissa, exp) = if biased_exp == 0 {
-            (frac as i128, -1074i64) // subnormal
-        } else {
-            ((frac | (1 << 52)) as i128, biased_exp - 1075)
-        };
-        if exp >= 0 {
-            if exp > 70 {
-                return Err(CoeffError::Overflow); // mantissa(53b) << 70 hits i128 limits
+    /// Exact conversion from a [`Real`] constant: the rational's
+    /// numerator/denominator must fit i128 (they are already reduced with
+    /// a positive denominator - rug's canonical form); an infinity is the
+    /// same loud non-finite error a non-finite f64 used to be.
+    pub fn from_real(v: &Real) -> Result<Coeff, CoeffError> {
+        match v {
+            Real::Rational(q) => {
+                let num = q.numer().to_i128().ok_or(CoeffError::Overflow)?;
+                let den = q.denom().to_i128().ok_or(CoeffError::Overflow)?;
+                debug_assert!(den > 0);
+                Ok(Coeff { num, den })
             }
-            Ok(Coeff::reduced(sign * (mantissa << exp), 1))
-        } else {
-            let shift = -exp;
-            if shift > 120 {
-                return Err(CoeffError::Overflow);
-            }
-            Ok(Coeff::reduced(sign * mantissa, 1i128 << shift))
+            Real::NegInf | Real::PosInf => Err(CoeffError::NonFinite(v.to_f64())),
         }
     }
 
@@ -167,27 +154,43 @@ impl fmt::Display for Coeff {
 mod tests {
     use super::*;
 
+    fn coeff_of(v: f64) -> Result<Coeff, CoeffError> {
+        Coeff::from_real(&Real::from_f64(v).unwrap())
+    }
+
     #[test]
     fn test_f64_exact() {
-        assert_eq!(Coeff::from_f64(0.125).unwrap(), Coeff::reduced(1, 8));
-        assert_eq!(Coeff::from_f64(-1.0).unwrap(), Coeff::MINUS_ONE);
-        assert_eq!(Coeff::from_f64(0.0).unwrap(), Coeff::ZERO);
+        assert_eq!(coeff_of(0.125).unwrap(), Coeff::reduced(1, 8));
+        assert_eq!(coeff_of(-1.0).unwrap(), Coeff::MINUS_ONE);
+        assert_eq!(coeff_of(0.0).unwrap(), Coeff::ZERO);
         // 1e-5 is NOT 1/100000 in binary; conversion must be bit-exact.
-        let c = Coeff::from_f64(1e-5).unwrap();
+        let c = coeff_of(1e-5).unwrap();
         assert_eq!(c.to_f64(), 1e-5);
         assert_ne!(c, Coeff::reduced(1, 100000));
     }
 
     #[test]
     fn test_non_finite() {
-        assert!(Coeff::from_f64(f64::INFINITY).is_err());
-        assert!(Coeff::from_f64(f64::NAN).is_err());
+        // NaN cannot even construct a `Real`; the infinities reach
+        // `from_real` and fail there, as non-finite f64s used to.
+        assert!(coeff_of(f64::INFINITY).is_err());
+        assert!(coeff_of(f64::NEG_INFINITY).is_err());
+    }
+
+    /// A fold-produced rational that does not fit i128 is the same loud
+    /// overflow error as before (the fold algebra is arbitrary-precision,
+    /// canon's hot path deliberately stays i128).
+    #[test]
+    fn test_overflow_from_wide_rational() {
+        let huge = rug::Rational::from(rug::Integer::from(1) << 200u32);
+        let r = Real::Rational(Box::new(huge));
+        assert_eq!(Coeff::from_real(&r), Err(CoeffError::Overflow));
     }
 
     #[test]
     fn test_arithmetic() {
-        let half = Coeff::from_f64(0.5).unwrap();
-        let quarter = Coeff::from_f64(0.25).unwrap();
+        let half = coeff_of(0.5).unwrap();
+        let quarter = coeff_of(0.25).unwrap();
         assert_eq!(half.mul(&half).unwrap(), quarter);
         assert_eq!(quarter.add(&quarter).unwrap(), half);
         assert_eq!(half.add(&half.neg()).unwrap(), Coeff::ZERO);

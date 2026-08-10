@@ -695,7 +695,7 @@ mod tests {
         // paper's plain-mode `unknown`s), so a NotEquivalent assert with
         // the base declared would only ever see Unknown.
         let mut ar_b = ExprArena::new();
-        let approx = ar_b.float(2.718281828459045);
+        let approx = ar_b.float_from_f64(2.718281828459045).unwrap();
         assert_eq!(check(&ar, e_sym, &ar_b, approx), Z3Verdict::NotEquivalent);
     }
 
@@ -728,7 +728,7 @@ mod tests {
         // x * 0.5 == x / 2 over the reals.
         let mut ar_a = ExprArena::new();
         let x = ar_a.param_symbol("x");
-        let half = ar_a.float(0.5);
+        let half = ar_a.float_from_f64(0.5).unwrap();
         let lhs = ar_a.mul(x, half);
         let mut ar_b = ExprArena::new();
         let x = ar_b.param_symbol("x");
@@ -742,7 +742,7 @@ mod tests {
         // 0.1f64 as exactly 1/10 and proved these "equivalent".
         let mut ar_c = ExprArena::new();
         let x = ar_c.param_symbol("x");
-        let tenth = ar_c.float(0.1);
+        let tenth = ar_c.float_from_f64(0.1).unwrap();
         let lhs = ar_c.mul(x, tenth);
         let mut ar_d = ExprArena::new();
         let x = ar_d.param_symbol("x");
@@ -754,9 +754,9 @@ mod tests {
     #[test]
     fn negative_zero_equals_zero() {
         let mut ar_a = ExprArena::new();
-        let nz = ar_a.float(-0.0);
+        let nz = ar_a.float_from_f64(-0.0).unwrap();
         let mut ar_b = ExprArena::new();
-        let z = ar_b.float(0.0);
+        let z = ar_b.float_from_f64(0.0).unwrap();
         assert_eq!(check(&ar_a, nz, &ar_b, z), Z3Verdict::Equivalent);
     }
 
@@ -823,7 +823,7 @@ mod tests {
         let one = ar_a.int(1);
         let lhs = ar_a.exp(one);
         let mut ar_b = ExprArena::new();
-        let rhs = ar_b.float(2.718281828459045);
+        let rhs = ar_b.float_from_f64(2.718281828459045).unwrap();
         assert_eq!(check(&ar_a, lhs, &ar_b, rhs), Z3Verdict::NotEquivalent);
     }
 
@@ -919,7 +919,7 @@ mod tests {
         let x = ar.param_symbol("x");
         let d = ar.sub(x, x);
         let mut zr = ExprArena::new();
-        let zero = zr.float(0.0);
+        let zero = zr.float_from_f64(0.0).unwrap();
         assert_eq!(
             check_equivalent(&ar, d, &zr, zero, None, ExpMode::PowerBounded)
                 .unwrap()
@@ -935,7 +935,7 @@ mod tests {
         // unknown regardless.)
         let q = ar.div(x, x);
         let mut on = ExprArena::new();
-        let one = on.float(1.0);
+        let one = on.float_from_f64(1.0).unwrap();
         assert_eq!(
             check_equivalent(&ar, q, &on, one, None, ExpMode::PowerBounded)
                 .unwrap()
@@ -955,12 +955,12 @@ mod tests {
     fn negative_literals_unify_with_negated_positives() {
         let mut ar_a = ExprArena::new();
         let x = ar_a.param_symbol("x");
-        let neg_tenth = ar_a.float(-0.1);
+        let neg_tenth = ar_a.float_from_f64(-0.1).unwrap();
         let lhs = ar_a.add(x, neg_tenth);
 
         let mut ar_b = ExprArena::new();
         let x = ar_b.param_symbol("x");
-        let tenth = ar_b.float(0.1);
+        let tenth = ar_b.float_from_f64(0.1).unwrap();
         let rhs = ar_b.sub(x, tenth);
 
         let res = check_equivalent(&ar_a, lhs, &ar_b, rhs, None, ExpMode::PowerBounded).unwrap();
@@ -970,13 +970,13 @@ mod tests {
         // (x - 0.1) is the literal 0.
         let mut ar_c = ExprArena::new();
         let x = ar_c.param_symbol("x");
-        let neg_tenth = ar_c.float(-0.1);
+        let neg_tenth = ar_c.float_from_f64(-0.1).unwrap();
         let sum = ar_c.add(x, neg_tenth);
-        let tenth = ar_c.float(0.1);
+        let tenth = ar_c.float_from_f64(0.1).unwrap();
         let diff = ar_c.sub(x, tenth);
         let zero_expr = ar_c.sub(sum, diff);
         let mut zr = ExprArena::new();
-        let zero = zr.float(0.0);
+        let zero = zr.float_from_f64(0.0).unwrap();
         assert_eq!(
             check_equivalent(&ar_c, zero_expr, &zr, zero, None, ExpMode::PowerBounded)
                 .unwrap()

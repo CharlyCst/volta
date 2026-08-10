@@ -32,6 +32,265 @@ impl fmt::Display for SymbolId {
     }
 }
 
+// =========================================================================
+// Exact real constants
+// =========================================================================
+
+/// A NaN bit pattern tried to enter the analysis model. The model is the
+/// mathematical reals (extended with ±infinity for running-max/min seeds);
+/// NaN denotes no real number, so every f64 ingestion point rejects it
+/// loudly instead of silently minting an unsound constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NanError;
+
+impl fmt::Display for NanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NaN is outside the analysis model (reals)")
+    }
+}
+
+impl std::error::Error for NanError {}
+
+/// An exact extended-real constant: an arbitrary-precision rational, or one
+/// of the two infinities (used only as running-max/min seeds by real
+/// kernels). There is no NaN: [`Real::from_f64`] rejects it at every
+/// ingestion point.
+///
+/// Every finite f64 is a dyadic rational (`m * 2^e`) and converts exactly,
+/// so constant folding over `Real` is exact and coincides with the decision
+/// procedure's rational algebra by construction - the same real-model
+/// expression folds to the same constant regardless of fold order.
+///
+/// The rational is boxed so `ExprNode` keeps its small pre-rational size
+/// (arenas are GiB-scale, and most nodes are not constants); the box also
+/// gives the enum a pointer niche, making `Real` itself pointer-sized.
+///
+/// The variant order (`NegInf < Rational < PosInf`) gives the derived `Ord`
+/// the extended-real total order; `rug::Rational`'s own `Ord` is numeric.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum Real {
+    NegInf,
+    Rational(Box<rug::Rational>),
+    PosInf,
+}
+
+impl Real {
+    /// Exact conversion. Every finite f64 converts to the exact rational it
+    /// denotes; the infinities map to the extended-real infinities; NaN is
+    /// an error (see [`NanError`]).
+    pub fn from_f64(v: f64) -> Result<Real, NanError> {
+        if v.is_nan() {
+            return Err(NanError);
+        }
+        if v == f64::INFINITY {
+            return Ok(Real::PosInf);
+        }
+        if v == f64::NEG_INFINITY {
+            return Ok(Real::NegInf);
+        }
+        let q = rug::Rational::from_f64(v).expect("every finite f64 is an exact rational");
+        Ok(Real::Rational(Box::new(q)))
+    }
+
+    /// Exact conversion from an integer (no rounding, unlike `v as f64`).
+    pub fn from_i64(v: i64) -> Real {
+        Real::Rational(Box::new(rug::Rational::from(v)))
+    }
+
+    pub fn zero() -> Real {
+        Real::from_i64(0)
+    }
+
+    pub fn one() -> Real {
+        Real::from_i64(1)
+    }
+
+    /// Nearest-f64 approximation (rounding; for the numeric oracle,
+    /// diagnostics, and integer coercion parity - never for folding).
+    pub fn to_f64(&self) -> f64 {
+        match self {
+            Real::NegInf => f64::NEG_INFINITY,
+            Real::Rational(q) => q.to_f64(),
+            Real::PosInf => f64::INFINITY,
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        matches!(self, Real::Rational(q) if q.cmp0() == std::cmp::Ordering::Equal)
+    }
+
+    pub fn is_one(&self) -> bool {
+        matches!(self, Real::Rational(q) if **q == 1)
+    }
+
+    pub fn is_neg_inf(&self) -> bool {
+        matches!(self, Real::NegInf)
+    }
+
+    pub fn is_pos_inf(&self) -> bool {
+        matches!(self, Real::PosInf)
+    }
+
+    /// Sign as -1 / 0 / +1 (the infinities are signed; only the rational
+    /// zero has sign 0).
+    fn sign(&self) -> i32 {
+        match self {
+            Real::NegInf => -1,
+            Real::Rational(q) => match q.cmp0() {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            },
+            Real::PosInf => 1,
+        }
+    }
+
+    fn rational(q: rug::Rational) -> Real {
+        Real::Rational(Box::new(q))
+    }
+
+    // ---------------------------------------------------------------------
+    // Total operations
+    // ---------------------------------------------------------------------
+
+    pub fn neg(&self) -> Real {
+        match self {
+            Real::NegInf => Real::PosInf,
+            Real::Rational(q) => Real::rational(rug::Rational::from(-&**q)),
+            Real::PosInf => Real::NegInf,
+        }
+    }
+
+    pub fn abs(&self) -> Real {
+        match self {
+            Real::NegInf | Real::PosInf => Real::PosInf,
+            Real::Rational(q) => Real::rational(rug::Rational::from(q.abs_ref())),
+        }
+    }
+
+    /// Extended-real maximum (total: the infinities absorb/yield exactly).
+    pub fn max(&self, other: &Real) -> Real {
+        if self >= other {
+            self.clone()
+        } else {
+            other.clone()
+        }
+    }
+
+    /// Extended-real minimum (total).
+    pub fn min(&self, other: &Real) -> Real {
+        if self <= other {
+            self.clone()
+        } else {
+            other.clone()
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Partial operations: exact and total on the rationals, defined on the
+    // unambiguous extended-real forms, `None` on the undefined forms
+    // (inf - inf, 0 * inf, inf / inf, anything / 0). A `None` means the
+    // caller must build the symbolic node unfolded, so the decision
+    // procedure fails loudly if the undefined form ever reaches a VC.
+    // ---------------------------------------------------------------------
+
+    pub fn try_add(&self, other: &Real) -> Option<Real> {
+        use Real::*;
+        match (self, other) {
+            (Rational(a), Rational(b)) => Some(Real::rational(rug::Rational::from(&**a + &**b))),
+            (PosInf, NegInf) | (NegInf, PosInf) => None, // inf - inf
+            (PosInf, _) | (_, PosInf) => Some(PosInf),
+            (NegInf, _) | (_, NegInf) => Some(NegInf),
+        }
+    }
+
+    pub fn try_sub(&self, other: &Real) -> Option<Real> {
+        use Real::*;
+        match (self, other) {
+            (Rational(a), Rational(b)) => Some(Real::rational(rug::Rational::from(&**a - &**b))),
+            (PosInf, PosInf) | (NegInf, NegInf) => None, // inf - inf
+            (PosInf, _) | (_, NegInf) => Some(PosInf),
+            (NegInf, _) | (_, PosInf) => Some(NegInf),
+        }
+    }
+
+    pub fn try_mul(&self, other: &Real) -> Option<Real> {
+        use Real::*;
+        match (self, other) {
+            (Rational(a), Rational(b)) => Some(Real::rational(rug::Rational::from(&**a * &**b))),
+            _ => {
+                // At least one infinity: 0 * inf is undefined, otherwise
+                // the sign rules apply (inf * nonzero, including inf * inf).
+                let s = self.sign() * other.sign();
+                match s {
+                    0 => None,
+                    s if s > 0 => Some(PosInf),
+                    _ => Some(NegInf),
+                }
+            }
+        }
+    }
+
+    /// Division: exact for a nonzero rational divisor. Division by zero and
+    /// every form involving an infinity stay unfolded (the infinities fold
+    /// only through the max/min/neg/add/mul table above).
+    pub fn try_div(&self, other: &Real) -> Option<Real> {
+        use Real::*;
+        match (self, other) {
+            (Rational(a), Rational(b)) => {
+                if b.cmp0() == std::cmp::Ordering::Equal {
+                    None
+                } else {
+                    Some(Real::rational(rug::Rational::from(&**a / &**b)))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Reciprocal: exact for a nonzero rational; zero and the infinities
+    /// stay unfolded (see [`Real::try_div`]).
+    pub fn try_recip(&self) -> Option<Real> {
+        match self {
+            Real::Rational(q) if q.cmp0() != std::cmp::Ordering::Equal => {
+                Some(Real::rational(rug::Rational::from(q.recip_ref())))
+            }
+            _ => None,
+        }
+    }
+
+    /// Fused multiply-add `a * b + c`, defined exactly when multiplying
+    /// then adding is - by construction, `fma` folds iff `mul` + `add`
+    /// fold, and to the same value.
+    pub fn try_fma(&self, b: &Real, c: &Real) -> Option<Real> {
+        self.try_mul(b)?.try_add(c)
+    }
+}
+
+impl fmt::Display for Real {
+    /// Prints the denoted number. Values that round-trip through f64
+    /// exactly (every constant ingested from source does) print exactly as
+    /// the old f64 constants did ("42", "0.1", "-2.5"); everything else -
+    /// reachable only through exact folds, e.g. 1/3 from `div` - prints as
+    /// the exact "p/q".
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Real::NegInf => write!(f, "-inf"),
+            Real::PosInf => write!(f, "inf"),
+            Real::Rational(q) => {
+                let d = q.to_f64();
+                if d.is_finite() && Real::from_f64(d).as_ref() == Ok(self) {
+                    write!(f, "{}", d)
+                } else {
+                    write!(f, "{}", q)
+                }
+            }
+        }
+    }
+}
+
 /// The identity of a symbolic atom, shared by every backend that must
 /// agree on which symbols are equal (canon, the numeric oracle,
 /// `volta_z3`). Only launch-config names carry identity - PTX-source
@@ -80,8 +339,9 @@ pub enum ExprNode {
     // =====================================================================
     /// Integer constant
     IntConst(i64),
-    /// Floating-point constant (treated as real)
-    FloatConst(f64),
+    /// Exact real constant (see [`Real`]): every float constant is stored
+    /// as the exact rational (or infinity) it denotes, never as an f64.
+    RealConst(Real),
     /// Boolean constant (for predicates)
     BoolConst(bool),
     /// Machine-generated symbolic variable: a fresh unknown with no
@@ -212,7 +472,7 @@ impl ExprNode {
     pub fn for_each_child(&self, mut f: impl FnMut(ExprId)) {
         match self {
             ExprNode::IntConst(_)
-            | ExprNode::FloatConst(_)
+            | ExprNode::RealConst(_)
             | ExprNode::BoolConst(_)
             | ExprNode::Symbol(_)
             | ExprNode::ParamSymbol(_)
@@ -404,9 +664,17 @@ impl ExprArena {
         self.push(ExprNode::IntConst(v))
     }
 
-    /// Create a floating-point constant node.
-    pub fn float(&mut self, v: f64) -> ExprId {
-        self.push(ExprNode::FloatConst(v))
+    /// Create an exact real constant node.
+    pub fn real(&mut self, v: Real) -> ExprId {
+        self.push(ExprNode::RealConst(v))
+    }
+
+    /// Create a real constant node from an f64, converting exactly.
+    /// Fallible: NaN has no place in the reals model (see [`NanError`]) -
+    /// every f64 ingestion point must go through this and propagate the
+    /// error loudly.
+    pub fn float_from_f64(&mut self, v: f64) -> Result<ExprId, NanError> {
+        Ok(self.real(Real::from_f64(v)?))
     }
 
     /// Create a boolean constant node.
@@ -449,39 +717,43 @@ impl ExprArena {
     // Arithmetic builders (with eager constant folding)
     // =================================================================
 
-    /// Addition with constant folding.
+    /// Addition with constant folding (exact on rationals; the defined
+    /// extended-real forms fold, `inf + -inf` builds the node so canon
+    /// fails loudly if it reaches a VC).
     pub fn add(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = x.wrapping_add(*y);
                 return self.int(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
-                let r = *x + *y;
-                return self.float(r);
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                if let Some(r) = x.try_add(y) {
+                    return self.real(r);
+                }
             }
             (ExprNode::IntConst(0), _) => return b,
             (_, ExprNode::IntConst(0)) => return a,
-            (ExprNode::FloatConst(x), _) if *x == 0.0 => return b,
-            (_, ExprNode::FloatConst(y)) if *y == 0.0 => return a,
+            (ExprNode::RealConst(x), _) if x.is_zero() => return b,
+            (_, ExprNode::RealConst(y)) if y.is_zero() => return a,
             _ => {}
         }
         self.push(ExprNode::Add(a, b))
     }
 
-    /// Subtraction with constant folding.
+    /// Subtraction with constant folding (exact; see [`ExprArena::add`]).
     pub fn sub(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = x.wrapping_sub(*y);
                 return self.int(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
-                let r = *x - *y;
-                return self.float(r);
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                if let Some(r) = x.try_sub(y) {
+                    return self.real(r);
+                }
             }
             (_, ExprNode::IntConst(0)) => return a,
-            (_, ExprNode::FloatConst(y)) if *y == 0.0 => return a,
+            (_, ExprNode::RealConst(y)) if y.is_zero() => return a,
             _ => {}
         }
         self.push(ExprNode::Sub(a, b))
@@ -499,34 +771,48 @@ impl ExprArena {
                 let r = x.wrapping_mul(*y);
                 return self.int(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
-                let r = *x * *y;
-                return self.float(r);
+            // Exact on rationals and the signed inf * nonzero forms;
+            // a concrete 0 * inf builds the node unfolded (the arm below
+            // must not annihilate it to 0).
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                if let Some(r) = x.try_mul(y) {
+                    return self.real(r);
+                }
             }
             (ExprNode::IntConst(0), _) | (_, ExprNode::IntConst(0)) => return self.int(0),
-            (ExprNode::FloatConst(x), _) if *x == 0.0 => return self.float(0.0),
-            (_, ExprNode::FloatConst(y)) if *y == 0.0 => return self.float(0.0),
+            (ExprNode::RealConst(x), _) if x.is_zero() => return self.real(Real::zero()),
+            (_, ExprNode::RealConst(y)) if y.is_zero() => return self.real(Real::zero()),
             (ExprNode::IntConst(1), _) => return b,
             (_, ExprNode::IntConst(1)) => return a,
-            (ExprNode::FloatConst(x), _) if *x == 1.0 => return b,
-            (_, ExprNode::FloatConst(y)) if *y == 1.0 => return a,
+            (ExprNode::RealConst(x), _) if x.is_one() => return b,
+            (_, ExprNode::RealConst(y)) if y.is_one() => return a,
             _ => {}
         }
         self.push(ExprNode::Mul(a, b))
     }
 
-    /// Division with constant folding.
+    /// Division with constant folding: exact for a nonzero concrete
+    /// divisor (`1.0 / 3.0` folds to the exact rational 1/3, consistent
+    /// with `rcp` and with canon's field model). Any `x / 0` builds the
+    /// node unfolded - canon then errors loudly on the formally-zero
+    /// denominator, replacing the old silent NaN mint.
     pub fn div(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) if *y != 0 => {
                 let r = x.wrapping_div(*y);
                 return self.int(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
-                let r = *x / *y;
-                return self.float(r);
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                if let Some(r) = x.try_div(y) {
+                    return self.real(r);
+                }
             }
-            (ExprNode::IntConst(0), _) => return self.int(0),
+            (ExprNode::IntConst(0), d)
+                if !matches!(d, ExprNode::IntConst(0))
+                    && !matches!(d, ExprNode::RealConst(y) if y.is_zero()) =>
+            {
+                return self.int(0);
+            }
             (_, ExprNode::IntConst(1)) => return a,
             _ => {}
         }
@@ -545,11 +831,17 @@ impl ExprArena {
         self.push(ExprNode::Rem(a, b))
     }
 
-    /// Negation with constant folding.
+    /// Negation with constant folding (total on the extended reals).
     pub fn neg(&mut self, a: ExprId) -> ExprId {
-        match *self.node(a) {
-            ExprNode::IntConst(x) => return self.int(-x),
-            ExprNode::FloatConst(x) => return self.float(-x),
+        match self.node(a) {
+            ExprNode::IntConst(x) => {
+                let r = -x;
+                return self.int(r);
+            }
+            ExprNode::RealConst(x) => {
+                let r = x.neg();
+                return self.real(r);
+            }
             _ => {}
         }
         self.push(ExprNode::Neg(a))
@@ -570,25 +862,33 @@ impl ExprArena {
         self.push(ExprNode::Sqrt(a))
     }
 
-    /// Reciprocal: 1/a
+    /// Reciprocal: 1/a. A nonzero concrete rational folds to its exact
+    /// reciprocal (consistent with `div` and with canon's field model:
+    /// `rcp.approx.f32` of 3.0 and `div.rn.f32` of 1.0/3.0 now fold to
+    /// the same constant); `rcp(0)` and the infinities stay symbolic.
     pub fn rcp(&mut self, a: ExprId) -> ExprId {
+        if let ExprNode::RealConst(x) = self.node(a)
+            && let Some(r) = x.try_recip()
+        {
+            return self.real(r);
+        }
         self.push(ExprNode::Rcp(a))
     }
 
-    /// Maximum with constant folding.
-    /// `max(-inf, x) = x`: running-max chains start at -INFINITY.
+    /// Maximum with constant folding (exact and total on the extended
+    /// reals). `max(-inf, x) = x`: running-max chains start at -INFINITY.
     pub fn max(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = *x.max(y);
                 return self.int(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
-                let r = x.max(*y);
-                return self.float(r);
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                let r = x.max(y);
+                return self.real(r);
             }
-            (ExprNode::FloatConst(x), _) if *x == f64::NEG_INFINITY => return b,
-            (_, ExprNode::FloatConst(y)) if *y == f64::NEG_INFINITY => return a,
+            (ExprNode::RealConst(x), _) if x.is_neg_inf() => return b,
+            (_, ExprNode::RealConst(y)) if y.is_neg_inf() => return a,
             _ => {}
         }
         if a == b {
@@ -597,20 +897,20 @@ impl ExprArena {
         self.push(ExprNode::Max(a, b))
     }
 
-    /// Minimum with constant folding.
-    /// `min(inf, x) = x`: running-min chains start at INFINITY.
+    /// Minimum with constant folding (exact and total on the extended
+    /// reals). `min(inf, x) = x`: running-min chains start at INFINITY.
     pub fn min(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = *x.min(y);
                 return self.int(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
-                let r = x.min(*y);
-                return self.float(r);
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                let r = x.min(y);
+                return self.real(r);
             }
-            (ExprNode::FloatConst(x), _) if *x == f64::INFINITY => return b,
-            (_, ExprNode::FloatConst(y)) if *y == f64::INFINITY => return a,
+            (ExprNode::RealConst(x), _) if x.is_pos_inf() => return b,
+            (_, ExprNode::RealConst(y)) if y.is_pos_inf() => return a,
             _ => {}
         }
         if a == b {
@@ -624,19 +924,25 @@ impl ExprArena {
         self.push(ExprNode::Abs(a))
     }
 
-    /// Fused multiply-add with constant folding: a * b + c
+    /// Fused multiply-add with constant folding: a * b + c, exact in the
+    /// rationals - `fma(a, b, c)` folds iff `mul` then `add` would, and to
+    /// the same value, so the fused and written-out forms cannot diverge.
     /// (`fma(0, b, c) = c` over the reals; see `mul` for why.)
     pub fn fma(&mut self, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
-        if let (ExprNode::FloatConst(x), ExprNode::FloatConst(y), ExprNode::FloatConst(z)) =
+        if let (ExprNode::RealConst(x), ExprNode::RealConst(y), ExprNode::RealConst(z)) =
             (self.node(a), self.node(b), self.node(c))
         {
-            let r = x.mul_add(*y, *z);
-            return self.float(r);
+            return match x.try_fma(y, z) {
+                Some(r) => self.real(r),
+                // An undefined extended-real form (0 * inf, inf - inf):
+                // build the node unfolded, skipping the zero identity below.
+                None => self.push(ExprNode::Fma(a, b, c)),
+            };
         }
         let zero_a = matches!(self.node(a), ExprNode::IntConst(0))
-            || matches!(self.node(a), ExprNode::FloatConst(x) if *x == 0.0);
+            || matches!(self.node(a), ExprNode::RealConst(x) if x.is_zero());
         let zero_b = matches!(self.node(b), ExprNode::IntConst(0))
-            || matches!(self.node(b), ExprNode::FloatConst(y) if *y == 0.0);
+            || matches!(self.node(b), ExprNode::RealConst(y) if y.is_zero());
         if zero_a || zero_b {
             return c;
         }
@@ -745,32 +1051,48 @@ impl ExprArena {
     // Comparison builders (with eager constant folding)
     // =================================================================
 
-    /// Equal with constant folding.
+    /// Equal with constant folding (exact rational comparison; over the
+    /// extended reals equality of concrete constants is decidable, unlike
+    /// IEEE where `-0.0 == 0.0` and NaN muddy it - both are out of model).
     pub fn eq(&mut self, a: ExprId, b: ExprId) -> ExprId {
-        if let (ExprNode::IntConst(x), ExprNode::IntConst(y)) = (self.node(a), self.node(b)) {
-            let r = *x == *y;
-            return self.bool_val(r);
+        match (self.node(a), self.node(b)) {
+            (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
+                let r = *x == *y;
+                return self.bool_val(r);
+            }
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                let r = x == y;
+                return self.bool_val(r);
+            }
+            _ => {}
         }
         self.push(ExprNode::Eq(a, b))
     }
 
-    /// Not-equal with constant folding.
+    /// Not-equal with constant folding (exact; see [`ExprArena::eq`]).
     pub fn ne(&mut self, a: ExprId, b: ExprId) -> ExprId {
-        if let (ExprNode::IntConst(x), ExprNode::IntConst(y)) = (self.node(a), self.node(b)) {
-            let r = *x != *y;
-            return self.bool_val(r);
+        match (self.node(a), self.node(b)) {
+            (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
+                let r = *x != *y;
+                return self.bool_val(r);
+            }
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
+                let r = x != y;
+                return self.bool_val(r);
+            }
+            _ => {}
         }
         self.push(ExprNode::Ne(a, b))
     }
 
-    /// Less-than with constant folding.
+    /// Less-than with constant folding (exact extended-real order).
     pub fn lt(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = *x < *y;
                 return self.bool_val(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
                 let r = *x < *y;
                 return self.bool_val(r);
             }
@@ -779,14 +1101,14 @@ impl ExprArena {
         self.push(ExprNode::Lt(a, b))
     }
 
-    /// Less-or-equal with constant folding.
+    /// Less-or-equal with constant folding (exact extended-real order).
     pub fn le(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = *x <= *y;
                 return self.bool_val(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
                 let r = *x <= *y;
                 return self.bool_val(r);
             }
@@ -795,14 +1117,14 @@ impl ExprArena {
         self.push(ExprNode::Le(a, b))
     }
 
-    /// Greater-than with constant folding.
+    /// Greater-than with constant folding (exact extended-real order).
     pub fn gt(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = *x > *y;
                 return self.bool_val(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
                 let r = *x > *y;
                 return self.bool_val(r);
             }
@@ -811,14 +1133,14 @@ impl ExprArena {
         self.push(ExprNode::Gt(a, b))
     }
 
-    /// Greater-or-equal with constant folding.
+    /// Greater-or-equal with constant folding (exact extended-real order).
     pub fn ge(&mut self, a: ExprId, b: ExprId) -> ExprId {
         match (self.node(a), self.node(b)) {
             (ExprNode::IntConst(x), ExprNode::IntConst(y)) => {
                 let r = *x >= *y;
                 return self.bool_val(r);
             }
-            (ExprNode::FloatConst(x), ExprNode::FloatConst(y)) => {
+            (ExprNode::RealConst(x), ExprNode::RealConst(y)) => {
                 let r = *x >= *y;
                 return self.bool_val(r);
             }
@@ -864,10 +1186,12 @@ impl ExprArena {
     // Conversions
     // =================================================================
 
-    /// Convert to float (from int), with constant folding.
+    /// Convert to float (from int), with constant folding. The fold is
+    /// exact (an i64 converts to the rational it denotes, not to the
+    /// nearest f64), matching canon's identity treatment of `ToFloat`.
     pub fn to_float(&mut self, a: ExprId) -> ExprId {
         if let ExprNode::IntConst(v) = *self.node(a) {
-            return self.float(v as f64);
+            return self.real(Real::from_i64(v));
         }
         self.push(ExprNode::ToFloat(a))
     }
@@ -876,11 +1200,14 @@ impl ExprArena {
     // Query methods
     // =================================================================
 
-    /// Try to evaluate as a concrete i64.
+    /// Try to evaluate as a concrete i64. Real constants coerce through
+    /// the nearest f64 with `as` semantics (truncating, saturating) - the
+    /// pre-rational behavior; a real used as an integer is degenerate and
+    /// never exact anyway.
     pub fn as_i64(&self, id: ExprId) -> Option<i64> {
         match self.node(id) {
             ExprNode::IntConst(v) => Some(*v),
-            ExprNode::FloatConst(v) => Some(*v as i64),
+            ExprNode::RealConst(v) => Some(v.to_f64() as i64),
             ExprNode::BoolConst(b) => Some(if *b { 1 } else { 0 }),
             _ => None,
         }
@@ -898,21 +1225,24 @@ impl ExprArena {
         }
     }
 
-    /// Try to evaluate as a concrete u64.
+    /// Try to evaluate as a concrete u64 (see [`Self::as_i64`] for the
+    /// real-constant coercion).
     pub fn as_u64(&self, id: ExprId) -> Option<u64> {
         match self.node(id) {
             ExprNode::IntConst(v) => Some(*v as u64),
-            ExprNode::FloatConst(v) => Some(*v as u64),
+            ExprNode::RealConst(v) => Some(v.to_f64() as u64),
             ExprNode::BoolConst(b) => Some(if *b { 1 } else { 0 }),
             _ => None,
         }
     }
 
-    /// Try to evaluate as a concrete f64.
+    /// Try to evaluate as a concrete f64 (rounding: real constants are
+    /// exact rationals; this is a diagnostic approximation, never fold
+    /// input).
     pub fn as_f64(&self, id: ExprId) -> Option<f64> {
         match self.node(id) {
             ExprNode::IntConst(v) => Some(*v as f64),
-            ExprNode::FloatConst(v) => Some(*v),
+            ExprNode::RealConst(v) => Some(v.to_f64()),
             _ => None,
         }
     }
@@ -926,11 +1256,11 @@ impl ExprArena {
         }
     }
 
-    /// Check if this is a concrete value (int, float, or bool constant).
+    /// Check if this is a concrete value (int, real, or bool constant).
     pub fn is_concrete(&self, id: ExprId) -> bool {
         matches!(
             self.node(id),
-            ExprNode::IntConst(_) | ExprNode::FloatConst(_) | ExprNode::BoolConst(_)
+            ExprNode::IntConst(_) | ExprNode::RealConst(_) | ExprNode::BoolConst(_)
         )
     }
 
@@ -962,7 +1292,7 @@ impl ExprArena {
     fn fmt_expr_inner(&self, id: ExprId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node(id) {
             ExprNode::IntConst(v) => write!(f, "{}", v),
-            ExprNode::FloatConst(v) => write!(f, "{}", v),
+            ExprNode::RealConst(v) => write!(f, "{}", v),
             ExprNode::BoolConst(b) => write!(f, "{}", b),
             ExprNode::Symbol(sid) => write!(f, "{}", sid),
             ExprNode::ParamSymbol(sid) => write!(f, "{}", self.string(*sid)),
@@ -1252,7 +1582,7 @@ fn structurally_equal_inner(
     use ExprNode::*;
     match (a_arena.node(a), b_arena.node(b)) {
         (IntConst(x), IntConst(y)) => x == y,
-        (FloatConst(x), FloatConst(y)) => x == y,
+        (RealConst(x), RealConst(y)) => x == y,
         (BoolConst(x), BoolConst(y)) => x == y,
         (Symbol(x), Symbol(y)) => x == y,
         (ParamSymbol(x), ParamSymbol(y)) => a_arena.string(*x) == b_arena.string(*y),
@@ -1448,8 +1778,8 @@ mod tests {
         assert_eq!(arena.as_i64(e), Some(3));
 
         // 10.0 / 2.0 = 5.0
-        let a = arena.float(10.0);
-        let b = arena.float(2.0);
+        let a = arena.float_from_f64(10.0).unwrap();
+        let b = arena.float_from_f64(2.0).unwrap();
         let e = arena.div(a, b);
         assert_eq!(arena.as_f64(e), Some(5.0));
     }
@@ -1461,8 +1791,11 @@ mod tests {
         let a = arena.int(42);
         assert_eq!(arena.node(a), &ExprNode::IntConst(42));
 
-        let b = arena.float(2.5);
-        assert!(matches!(arena.node(b), ExprNode::FloatConst(v) if (*v - 2.5).abs() < 1e-10));
+        let b = arena.float_from_f64(2.5).unwrap();
+        assert_eq!(
+            arena.node(b),
+            &ExprNode::RealConst(Real::from_f64(2.5).unwrap())
+        );
 
         let c = arena.bool_val(true);
         assert_eq!(arena.node(c), &ExprNode::BoolConst(true));
@@ -1497,7 +1830,7 @@ mod tests {
         assert!(arena.is_concrete(i));
         assert!(!arena.is_undefined(i));
 
-        let f = arena.float(2.5);
+        let f = arena.float_from_f64(2.5).unwrap();
         assert_eq!(arena.as_f64(f), Some(2.5));
         assert!(arena.is_concrete(f));
 
@@ -1549,6 +1882,264 @@ mod tests {
         // Should contain " + 1" and parentheses
         assert!(s.contains(" + "));
         assert!(s.contains("1"));
+    }
+
+    // ---------------------------------------------------------------
+    // Exact real folding
+    // ---------------------------------------------------------------
+
+    fn real_of(arena: &mut ExprArena, v: f64) -> ExprId {
+        arena.float_from_f64(v).unwrap()
+    }
+
+    fn real_const(arena: &ExprArena, e: ExprId) -> &Real {
+        match arena.node(e) {
+            ExprNode::RealConst(r) => r,
+            other => panic!("expected RealConst, got {:?}", other),
+        }
+    }
+
+    /// Division and reciprocal fold to the same exact rational: the fold
+    /// algebra and canon's field algebra coincide by construction. Under
+    /// the old f64 folds, `1.0 / 3.0` folded to rational-of-fl(1/3) while
+    /// `rcp(3.0)` stayed symbolic and canonicalized to exactly 1/3 - the
+    /// same value under two constants, flipping verdicts.
+    #[test]
+    fn div_and_rcp_fold_to_the_same_exact_rational() {
+        let mut ar = ExprArena::new();
+        let one = real_of(&mut ar, 1.0);
+        let three = real_of(&mut ar, 3.0);
+        let d = ar.div(one, three);
+        let three2 = real_of(&mut ar, 3.0);
+        let r = ar.rcp(three2);
+        let third = Real::Rational(Box::new(rug::Rational::from((1, 3))));
+        assert_eq!(real_const(&ar, d), &third);
+        assert_eq!(real_const(&ar, r), &third);
+        // And distinct from the f64 approximation of 1/3.
+        assert_ne!(real_const(&ar, d), &Real::from_f64(1.0 / 3.0).unwrap());
+    }
+
+    /// fma folds exactly as mul-then-add (one algebra, no fused rounding).
+    #[test]
+    fn fma_folds_exactly_as_mul_plus_add() {
+        let mut ar = ExprArena::new();
+        let (a, b, c) = (
+            real_of(&mut ar, 0.1),
+            real_of(&mut ar, 0.2),
+            real_of(&mut ar, 0.3),
+        );
+        let fused = ar.fma(a, b, c);
+        let prod = ar.mul(a, b);
+        let spelled = ar.add(prod, c);
+        assert_eq!(real_const(&ar, fused), real_const(&ar, spelled));
+        // The old f64 folds disagreed: mul_add rounds once, mul+add twice.
+        assert_ne!(
+            real_const(&ar, fused),
+            &Real::from_f64(0.1f64.mul_add(0.2, 0.3)).unwrap()
+        );
+    }
+
+    /// The exact sum of two f64 constants is not the f64 the hardware
+    /// would produce: `0.1 + 0.2` folds to the exact rational sum, which
+    /// differs from the literal 0.30000000000000004 (0d3FD3333333333334).
+    #[test]
+    fn addition_is_exact_not_rounded() {
+        let mut ar = ExprArena::new();
+        let a = real_of(&mut ar, 0.1);
+        let b = real_of(&mut ar, 0.2);
+        let sum = ar.add(a, b);
+        assert_ne!(
+            real_const(&ar, sum),
+            &Real::from_f64(0.1 + 0.2).unwrap(),
+            "the exact sum must not equal the rounded f64 sum"
+        );
+        let exact = Real::from_f64(0.1)
+            .unwrap()
+            .try_add(&Real::from_f64(0.2).unwrap())
+            .unwrap();
+        assert_eq!(real_const(&ar, sum), &exact);
+    }
+
+    /// x / 0 (including 0 / 0) builds the node unfolded instead of minting
+    /// a NaN or folding to 0; canon then errors loudly on the formally
+    /// zero denominator.
+    #[test]
+    fn division_by_concrete_zero_stays_symbolic() {
+        let mut ar = ExprArena::new();
+        let z1 = real_of(&mut ar, 0.0);
+        let z2 = real_of(&mut ar, 0.0);
+        let e = ar.div(z1, z2);
+        assert!(matches!(ar.node(e), ExprNode::Div(_, _)));
+
+        let one = real_of(&mut ar, 1.0);
+        let z3 = real_of(&mut ar, 0.0);
+        let e = ar.div(one, z3);
+        assert!(matches!(ar.node(e), ExprNode::Div(_, _)));
+
+        let iz1 = ar.int(0);
+        let iz2 = ar.int(0);
+        let e = ar.div(iz1, iz2);
+        assert!(matches!(ar.node(e), ExprNode::Div(_, _)));
+
+        // 0 / symbolic still folds (canon's field model gives 0 too).
+        let iz = ar.int(0);
+        let s = ar.symbol();
+        let e = ar.div(iz, s);
+        assert_eq!(ar.as_i64(e), Some(0));
+
+        // rcp(0) stays symbolic as well.
+        let z4 = real_of(&mut ar, 0.0);
+        let e = ar.rcp(z4);
+        assert!(matches!(ar.node(e), ExprNode::Rcp(_)));
+    }
+
+    /// The extended-real fold table: the unambiguous forms fold, the
+    /// undefined forms (inf - inf, 0 * inf, inf / inf, x / 0) build nodes.
+    #[test]
+    fn extended_real_folds() {
+        let mut ar = ExprArena::new();
+        let pinf = real_of(&mut ar, f64::INFINITY);
+        let ninf = real_of(&mut ar, f64::NEG_INFINITY);
+        let two = real_of(&mut ar, 2.0);
+        let neg3 = real_of(&mut ar, -3.0);
+        let zero = real_of(&mut ar, 0.0);
+
+        // inf +/- finite, neg, abs.
+        let e = ar.add(pinf, two);
+        assert!(real_const(&ar, e).is_pos_inf());
+        let e = ar.sub(ninf, two);
+        assert!(real_const(&ar, e).is_neg_inf());
+        let e = ar.neg(pinf);
+        assert!(real_const(&ar, e).is_neg_inf());
+
+        // inf * nonzero follows the sign rules.
+        let e = ar.mul(pinf, neg3);
+        assert!(real_const(&ar, e).is_neg_inf());
+        let e = ar.mul(ninf, neg3);
+        assert!(real_const(&ar, e).is_pos_inf());
+
+        // Undefined forms stay unfolded.
+        let e = ar.add(pinf, ninf);
+        assert!(matches!(ar.node(e), ExprNode::Add(_, _)));
+        let e = ar.sub(pinf, pinf);
+        assert!(matches!(ar.node(e), ExprNode::Sub(_, _)));
+        let e = ar.mul(zero, pinf);
+        assert!(matches!(ar.node(e), ExprNode::Mul(_, _)));
+        let e = ar.fma(zero, pinf, two);
+        assert!(matches!(ar.node(e), ExprNode::Fma(_, _, _)));
+        let e = ar.div(pinf, pinf);
+        assert!(matches!(ar.node(e), ExprNode::Div(_, _)));
+        let e = ar.div(two, pinf);
+        assert!(matches!(ar.node(e), ExprNode::Div(_, _)));
+        let e = ar.rcp(pinf);
+        assert!(matches!(ar.node(e), ExprNode::Rcp(_)));
+
+        // Comparisons use the extended-real total order.
+        let e = ar.lt(ninf, two);
+        assert_eq!(ar.as_bool(e), Some(true));
+        let e = ar.ge(pinf, two);
+        assert_eq!(ar.as_bool(e), Some(true));
+        let e = ar.le(ninf, ninf);
+        assert_eq!(ar.as_bool(e), Some(true));
+        let e = ar.lt(ninf, ninf);
+        assert_eq!(ar.as_bool(e), Some(false));
+    }
+
+    /// Max/min: concrete pairs fold totally; the running-max/min seeds
+    /// (-inf for max, +inf for min) still absorb against symbolic values.
+    #[test]
+    fn max_min_absorption_and_exact_folds() {
+        let mut ar = ExprArena::new();
+        let ninf = real_of(&mut ar, f64::NEG_INFINITY);
+        let pinf = real_of(&mut ar, f64::INFINITY);
+        let two = real_of(&mut ar, 2.0);
+        let x = ar.symbol();
+
+        let e = ar.max(ninf, x);
+        assert_eq!(e, x);
+        let e = ar.max(x, ninf);
+        assert_eq!(e, x);
+        let e = ar.min(pinf, x);
+        assert_eq!(e, x);
+        let e = ar.min(x, pinf);
+        assert_eq!(e, x);
+
+        let e = ar.max(ninf, two);
+        assert_eq!(real_const(&ar, e), &Real::from_f64(2.0).unwrap());
+        let e = ar.max(pinf, two);
+        assert!(real_const(&ar, e).is_pos_inf());
+        let e = ar.min(ninf, two);
+        assert!(real_const(&ar, e).is_neg_inf());
+
+        let e = ar.max(x, x);
+        assert_eq!(e, x);
+    }
+
+    /// Concrete real eq/ne now fold (exact comparisons; previously only
+    /// integers folded and a concrete float `setp.eq` guard failed as
+    /// not-concrete).
+    #[test]
+    fn real_eq_ne_fold() {
+        let mut ar = ExprArena::new();
+        let a = real_of(&mut ar, 1.5);
+        let b = real_of(&mut ar, 1.5);
+        let c = real_of(&mut ar, 2.5);
+        let e = ar.eq(a, b);
+        assert_eq!(ar.as_bool(e), Some(true));
+        let e = ar.eq(a, c);
+        assert_eq!(ar.as_bool(e), Some(false));
+        let e = ar.ne(a, c);
+        assert_eq!(ar.as_bool(e), Some(true));
+    }
+
+    /// NaN is rejected at every ingestion point.
+    #[test]
+    fn nan_is_rejected() {
+        assert_eq!(Real::from_f64(f64::NAN), Err(NanError));
+        let mut ar = ExprArena::new();
+        assert!(ar.float_from_f64(f64::NAN).is_err());
+        assert!(
+            ar.float_from_f64(f64::from_bits(0x7FF8_0000_0000_0000))
+                .is_err()
+        );
+    }
+
+    /// to_float folds exactly: a large i64 becomes the rational it
+    /// denotes, not the nearest f64 (canon treats ToFloat as identity, so
+    /// the eager fold must be exact too).
+    #[test]
+    fn to_float_is_exact() {
+        let mut ar = ExprArena::new();
+        let big = ar.int(i64::MAX);
+        let f = ar.to_float(big);
+        let exact = Real::from_i64(i64::MAX);
+        assert_eq!(real_const(&ar, f), &exact);
+        assert_ne!(exact, Real::from_f64(i64::MAX as f64).unwrap());
+    }
+
+    /// Display: integers print bare, f64-representable dyadics print in
+    /// f64's shortest form, exact non-representable rationals print p/q.
+    #[test]
+    fn real_display() {
+        let mut ar = ExprArena::new();
+        let e = real_of(&mut ar, 42.0);
+        assert_eq!(ar.display_expr(e), "42");
+        let e = real_of(&mut ar, 0.0);
+        assert_eq!(ar.display_expr(e), "0");
+        let e = real_of(&mut ar, -0.0);
+        assert_eq!(ar.display_expr(e), "0");
+        let e = real_of(&mut ar, 0.1);
+        assert_eq!(ar.display_expr(e), "0.1");
+        let e = real_of(&mut ar, -2.5);
+        assert_eq!(ar.display_expr(e), "-2.5");
+        let e = real_of(&mut ar, f64::INFINITY);
+        assert_eq!(ar.display_expr(e), "inf");
+        let e = real_of(&mut ar, f64::NEG_INFINITY);
+        assert_eq!(ar.display_expr(e), "-inf");
+        let one = real_of(&mut ar, 1.0);
+        let three = real_of(&mut ar, 3.0);
+        let e = ar.div(one, three);
+        assert_eq!(ar.display_expr(e), "1/3");
     }
 
     /// `validate` accepts every arena the constructors can build...

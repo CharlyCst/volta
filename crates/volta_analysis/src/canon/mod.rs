@@ -215,7 +215,7 @@ mod tests {
         let na = ar.neg(a);
         let ena = ar.exp(na);
         let prod = ar.mul(ea, ena);
-        let one = ar.float(1.0);
+        let one = ar.float_from_f64(1.0).unwrap();
         assert!(check(&ar, prod, one));
     }
 
@@ -225,9 +225,9 @@ mod tests {
         let mut ar = ExprArena::new();
         let a = ar.param_symbol("a");
         let aa = ar.add(a, a);
-        let eighth = ar.float(0.125);
+        let eighth = ar.float_from_f64(0.125).unwrap();
         let e1 = ar.mul(eighth, aa);
-        let quarter = ar.float(0.25);
+        let quarter = ar.float_from_f64(0.25).unwrap();
         let e2 = ar.mul(quarter, a);
         assert!(check(&ar, e1, e2));
     }
@@ -309,8 +309,8 @@ mod tests {
         }
 
         // Online: running max m_j, d = d*e^{m_prev - m} + e^{x_j - m}
-        let neg_inf = ar.float(f64::NEG_INFINITY);
-        let zero = ar.float(0.0);
+        let neg_inf = ar.float_from_f64(f64::NEG_INFINITY).unwrap();
+        let zero = ar.float_from_f64(0.0).unwrap();
         let (mut m_prev, mut d_online) = (neg_inf, zero);
         for &x in &xs {
             let m = ar.max(m_prev, x);
@@ -379,7 +379,7 @@ mod chain_perf_tests {
         // A K-step fma accumulator chain must canonicalize in O(K) term ops.
         let mut ar = ExprArena::new();
         let k = 1000u32;
-        let mut acc = ar.float(0.0);
+        let mut acc = ar.float_from_f64(0.0).unwrap();
         for i in 0..k {
             let a = ar.param_symbol(format!("A[{}]", i));
             let b = ar.param_symbol(format!("B[{}]", i));

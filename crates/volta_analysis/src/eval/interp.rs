@@ -20,7 +20,7 @@ use crate::logging::{info, trace, warn};
 use crate::lowered::{
     BinOp, Clamp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, Operand, UnaryOp,
 };
-use crate::symbolic::{ExprArena, ExprId, StringId};
+use crate::symbolic::{ExprArena, ExprId, Real, StringId};
 use crate::symbols::{ParamId, RegId, SpecialRegKind};
 use crate::types::ScalarTypeExt;
 
@@ -153,7 +153,14 @@ impl<'p> Interpreter<'p> {
         for value in &config.params {
             let v = match value {
                 ParamValue::Int(v) => Value::Scalar(arena.int(*v)),
-                ParamValue::Float(v) => Value::Scalar(arena.float(*v)),
+                // Exact ingestion; NaN was rejected by `config.validate()`
+                // above, but the conversion stays fallible so a bypassing
+                // caller still fails loudly.
+                ParamValue::Float(v) => {
+                    Value::Scalar(arena.float_from_f64(*v).map_err(|e| EvalError::Config {
+                        message: format!("float parameter: {}", e),
+                    })?)
+                }
                 ParamValue::SymFloat(name) => Value::Scalar(arena.param_symbol(name.clone())),
                 ParamValue::ArrayPtr(name) => {
                     let array = config.array(name).ok_or_else(|| EvalError::Config {
@@ -934,7 +941,15 @@ impl<'p> Interpreter<'p> {
             }
             Operand::ImmI64(v) => Ok(Value::Scalar(self.arena.int(*v))),
             Operand::ImmU64(v) => Ok(Value::Scalar(self.arena.int(*v as i64))),
-            Operand::ImmF64(v) => Ok(Value::Scalar(self.arena.float(*v))),
+            // Exact ingestion. Lowering rejects NaN literals, so this only
+            // fails if an unvetted immediate slips past it - loudly.
+            Operand::ImmF64(v) => match self.arena.float_from_f64(*v) {
+                Ok(e) => Ok(Value::Scalar(e)),
+                Err(err) => Err(EvalError::Unsupported {
+                    pc,
+                    what: format!("float immediate: {}", err),
+                }),
+            },
         }
     }
 
@@ -1728,12 +1743,12 @@ impl<'p> Interpreter<'p> {
         match clamp {
             None => r,
             Some(Clamp::Relu) => {
-                let zero = self.arena.float(0.0);
+                let zero = self.arena.real(Real::zero());
                 self.arena.max(r, zero)
             }
             Some(Clamp::Sat) => {
-                let zero = self.arena.float(0.0);
-                let one = self.arena.float(1.0);
+                let zero = self.arena.real(Real::zero());
+                let one = self.arena.real(Real::one());
                 let low_clamped = self.arena.max(r, zero);
                 self.arena.min(low_clamped, one)
             }
