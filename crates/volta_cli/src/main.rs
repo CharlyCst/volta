@@ -5,17 +5,17 @@
 //! - `volta analyze <file>` - Symbolically execute one kernel
 //! - `volta compare <file1> <file2>` - Check two kernels for equivalence
 
-use std::io;
-use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use bincode::Options;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use volta_analysis::driver::{
     EquivCheckOptions, EquivOutcome, VcDump, VcSnapshot, analyze_kernel,
-    check_output_equivalence_with, write_op_counts,
+    check_output_equivalence_with,
+    vc_dump::{read_vc_dump, write_vc_dump},
+    write_op_counts,
 };
 use volta_analysis::equiv::DEFAULT_RECYCLE_TERMS;
 use volta_analysis::eval::{AnalysisConfig, AnalysisOutput, ArrayDef, ArrayKind, ParamValue};
@@ -201,6 +201,11 @@ struct CompareArgs {
     #[arg(long, default_value_t = DEFAULT_RECYCLE_TERMS)]
     recycle_terms: usize,
 
+    /// Run the solve phase N times (fresh session each; verdict from
+    /// iteration 1, later iterations must agree). Decision backend only.
+    #[arg(long, default_value_t = NonZeroUsize::MIN)]
+    iterations: NonZeroUsize,
+
     /// Skip the per-instruction-kind execution profile (shown by default)
     #[arg(long = "no-profile", action = clap::ArgAction::SetFalse, default_value_t = true)]
     profile: bool,
@@ -255,7 +260,7 @@ fn main() -> ExitCode {
         .filter_level(cli.log_level.into())
         .format_timestamp(None)
         .format_target(false)
-        .target(env_logger::Target::Pipe(log.tee(io::stderr())))
+        .target(env_logger::Target::Pipe(log.tee(std::io::stderr())))
         .init();
 
     let code = match cli.command {
@@ -500,13 +505,16 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
     if args.exp_axiom && !matches!(args.backend, BackendArg::Z3) {
         eprintln!("note: --exp-axiom only affects --backend z3");
     }
+    if args.iterations.get() > 1 && matches!(args.backend, BackendArg::Z3) {
+        eprintln!("note: --iterations only affects --backend decision");
+    }
 
     let (reference, optimized, exec_secs): (AnalysisOutput, AnalysisOutput, Option<f64>) =
         if let Some(dump_path) = &args.from_dump {
             if args.file1.is_some() || args.file2.is_some() {
                 eprintln!("note: --from-dump ignores FILE1/FILE2 and the launch-config flags");
             }
-            let dump = match load_dump(dump_path) {
+            let dump = match read_vc_dump(dump_path) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("error: failed to read dump {}: {}", dump_path.display(), e);
@@ -589,7 +597,7 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                     reference: VcSnapshot::from_output(reference),
                     optimized: VcSnapshot::from_output(optimized),
                 };
-                if let Err(e) = write_dump(&dump, dump_path) {
+                if let Err(e) = write_vc_dump(dump_path, &dump) {
                     eprintln!("error: failed to write dump {}: {}", dump_path.display(), e);
                     return ExitCode::FAILURE;
                 }
@@ -618,6 +626,7 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                 sample: args.sample,
                 verify_numeric: args.verify_numeric,
                 recycle_terms: args.recycle_terms,
+                iterations: args.iterations,
             };
             let vc_start = Instant::now();
             let report =
@@ -639,9 +648,20 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                     println!(
                         "VC check: {:.3}s (decision procedure {:.3}s)  elements: {}",
                         vc_secs,
-                        report.check_time.as_secs_f64(),
+                        report.check_time().as_secs_f64(),
                         elems
                     );
+                    if report.check_iters.len() > 1 {
+                        let per_iter: Vec<String> = report
+                            .check_iters
+                            .iter()
+                            .map(|d| format!("{:.3}", d.as_secs_f64()))
+                            .collect();
+                        println!(
+                            "  decision procedure iterations (s): [{}]",
+                            per_iter.join(", ")
+                        );
+                    }
                     match report.outcome {
                         EquivOutcome::Equivalent => {
                             println!("EQUIVALENT");
@@ -747,91 +767,6 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
     }
 }
 
-/// 12-byte header (magic + format version) written ahead of the bincode
-/// payload. Reloading checks it before decoding, so a truncated/foreign
-/// file fails with a clear message instead of a bincode parse deep in the
-/// stream; bumping the trailing digit rejects old dumps after a
-/// `VcDump`-layout change.
-const DUMP_MAGIC: &[u8; 8] = b"VOLTAVCD";
-/// Dump format version, semver-style: bump `DUMP_MINOR` for
-/// backwards-compatible additions (older files stay loadable), bump
-/// `DUMP_MAJOR` and reset minor for breaking changes (e.g. any change to
-/// `ExprNode`'s bincode layout).
-// 2.0: removed the never-produced SignExtend/ZeroExtend/Truncate ExprNode
-// variants, which shifts the bincode variant tags of every later variant.
-// The equally never-produced ToInt variant was then removed within the same
-// unreleased format revision; its tag shift rides the same 2.0 (no build
-// that wrote the intermediate layout ever shipped). FloatConst(f64) then
-// became RealConst(Real) - exact rationals on the wire - within the same
-// unreleased revision, riding the same 2.0 for the same reason.
-const DUMP_MAJOR: u16 = 2;
-const DUMP_MINOR: u16 = 0;
-
-fn write_dump(dump: &VcDump, path: &Path) -> io::Result<()> {
-    let file = std::fs::File::create(path)?;
-    let mut writer = io::BufWriter::new(file);
-    writer.write_all(DUMP_MAGIC)?;
-    writer.write_all(&DUMP_MAJOR.to_le_bytes())?;
-    writer.write_all(&DUMP_MINOR.to_le_bytes())?;
-    // `serialize_into` uses fixint little-endian; `load_dump` must decode
-    // with a matching `with_fixint_encoding()` (bincode's `options()`
-    // default is varint, which would not round-trip).
-    bincode::serialize_into(&mut writer, dump).map_err(io::Error::other)?;
-    writer.flush()
-}
-
-fn load_dump(path: &Path) -> io::Result<VcDump> {
-    let file = std::fs::File::open(path)?;
-    // Cap decode allocations at the file size, so a crafted length prefix
-    // can't make bincode try to allocate (e.g.) a terabyte before it ever
-    // reads that many bytes.
-    let file_len = file.metadata()?.len();
-    let mut reader = io::BufReader::new(file);
-
-    let mut header = [0u8; 12];
-    reader.read_exact(&mut header).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not a volta VC dump (file is shorter than the header)",
-            )
-        } else {
-            e
-        }
-    })?;
-    if &header[..8] != DUMP_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a volta VC dump (bad magic)",
-        ));
-    }
-    let major = u16::from_le_bytes([header[8], header[9]]);
-    let minor = u16::from_le_bytes([header[10], header[11]]);
-    if major != DUMP_MAJOR || minor > DUMP_MINOR {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported dump version {}.{} (this build reads {}.0 through {}.{})",
-                major, minor, DUMP_MAJOR, DUMP_MAJOR, DUMP_MINOR
-            ),
-        ));
-    }
-
-    let dump: VcDump = bincode::options()
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .with_limit(file_len)
-        .deserialize_from(&mut reader)
-        .map_err(io::Error::other)?;
-    dump.validate().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("dump is corrupt or from an incompatible version: {}", e),
-        )
-    })?;
-    Ok(dump)
-}
-
 /// Load and parse a module, reporting errors nicely.
 fn load_module(file: &Path) -> Result<Module, ExitCode> {
     let mut files = FileCache::new();
@@ -933,7 +868,6 @@ fn print_module_summary(module: &Module) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use volta_analysis::symbolic::ExprArena;
     use volta_z3::Z3Counts;
 
     fn counts(equivalent: usize, not_equivalent: usize, unknown: usize) -> Z3Counts {
@@ -983,132 +917,5 @@ mod tests {
             }),
             Z3Verdict::OnlyUndecided { undecided: 7 }
         );
-    }
-
-    /// A dump written by `write_dump` reloads to an identical structure via
-    /// `load_dump` - the fixint round-trip and the magic header together.
-    /// The arena deliberately contains the `Real` constants most at risk
-    /// on the wire: a fold-produced non-dyadic rational (1/3 - no f64
-    /// denotes it), both infinities, the smallest positive subnormal, and
-    /// a -0.0 ingestion (which normalizes to the rational zero). The
-    /// round-trip must be byte-exact - re-serializing the loaded dump
-    /// reproduces the original file bit for bit, so any verdict computed
-    /// from the reloaded VCs equals the original's.
-    #[test]
-    fn dump_round_trips() {
-        let mut arena = ExprArena::new();
-        let x = arena.param_symbol("x");
-        let one = arena.int(1);
-        let sum = arena.add(x, one);
-        let one_f = arena.float_from_f64(1.0).unwrap();
-        let three_f = arena.float_from_f64(3.0).unwrap();
-        let third = arena.div(one_f, three_f);
-        let pos_inf = arena.float_from_f64(f64::INFINITY).unwrap();
-        let neg_inf = arena.float_from_f64(f64::NEG_INFINITY).unwrap();
-        let subnormal = arena.float_from_f64(f64::from_bits(1)).unwrap();
-        let neg_zero = arena.float_from_f64(-0.0).unwrap();
-        let specials = [third, pos_inf, neg_inf, subnormal, neg_zero];
-        let outputs: Vec<(String, Vec<(u64, volta_analysis::symbolic::ExprId)>)> = vec![(
-            "out".to_string(),
-            [(0, sum), (1, x)]
-                .into_iter()
-                .chain(specials.iter().enumerate().map(|(i, &e)| (2 + i as u64, e)))
-                .collect(),
-        )];
-        let dump = VcDump {
-            reference: VcSnapshot {
-                arena: arena.clone(),
-                outputs: outputs.clone(),
-            },
-            optimized: VcSnapshot { arena, outputs },
-        };
-
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("volta_cli_dump_test_{}.vcdump", std::process::id()));
-        let path2 = dir.join(format!(
-            "volta_cli_dump_test_rt_{}.vcdump",
-            std::process::id()
-        ));
-        write_dump(&dump, &path).expect("write_dump");
-        let loaded = load_dump(&path).expect("load_dump");
-        write_dump(&loaded, &path2).expect("write_dump (reloaded)");
-        let original_bytes = std::fs::read(&path).expect("read original dump");
-        let rewritten_bytes = std::fs::read(&path2).expect("read rewritten dump");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&path2);
-
-        assert_eq!(
-            original_bytes, rewritten_bytes,
-            "round-trip must be byte-exact"
-        );
-        assert_eq!(
-            loaded.reference.outputs, dump.reference.outputs,
-            "reference footprint survived the round-trip"
-        );
-        assert_eq!(loaded.optimized.outputs, dump.optimized.outputs);
-        for &e in &specials {
-            assert_eq!(
-                loaded.reference.arena.node(e),
-                dump.reference.arena.node(e),
-                "special constant survived the round-trip"
-            );
-        }
-    }
-
-    /// `load_dump` on a corrupt file yields the given `InvalidData` error
-    /// containing `needle` - never `Ok`, never a panic. (`VcDump` isn't
-    /// `Debug`, so we can't use `expect_err`.)
-    fn assert_load_rejects(bytes: &[u8], tag: &str, needle: &str) {
-        let path =
-            std::env::temp_dir().join(format!("volta_cli_{}_{}.bin", tag, std::process::id()));
-        std::fs::write(&path, bytes).unwrap();
-        let result = load_dump(&path);
-        let _ = std::fs::remove_file(&path);
-        match result {
-            Ok(_) => panic!("{}: corrupt dump was accepted", tag),
-            Err(e) => {
-                assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{}: error kind", tag);
-                assert!(
-                    e.to_string().contains(needle),
-                    "{}: message {:?} lacks {:?}",
-                    tag,
-                    e.to_string(),
-                    needle
-                );
-            }
-        }
-    }
-
-    /// A file without the magic header is rejected cleanly (not decoded).
-    #[test]
-    fn load_dump_rejects_bad_magic() {
-        assert_load_rejects(
-            b"not a volta dump at all, definitely",
-            "badmagic",
-            "not a volta VC dump",
-        );
-    }
-
-    /// A file shorter than the 12-byte header is rejected with the header
-    /// message rather than a raw EOF.
-    #[test]
-    fn load_dump_rejects_short_file() {
-        assert_load_rejects(b"VOLTA", "short", "shorter than the header");
-    }
-
-    /// Semver acceptance: same-major newer-minor files (written by a
-    /// future backwards-compatible writer) and other-major files are both
-    /// refused by this reader with a version message.
-    #[test]
-    fn load_dump_rejects_unsupported_versions() {
-        let mut newer_minor = Vec::from(*DUMP_MAGIC);
-        newer_minor.extend_from_slice(&DUMP_MAJOR.to_le_bytes());
-        newer_minor.extend_from_slice(&(DUMP_MINOR + 1).to_le_bytes());
-        assert_load_rejects(&newer_minor, "newerminor", "unsupported dump version");
-
-        let mut other_major = Vec::from(*DUMP_MAGIC);
-        other_major.extend_from_slice(&(DUMP_MAJOR + 1).to_le_bytes());
-        other_major.extend_from_slice(&0u16.to_le_bytes());
-        assert_load_rejects(&other_major, "othermajor", "unsupported dump version");
     }
 }

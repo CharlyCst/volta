@@ -1,21 +1,30 @@
-//! Result reporting: tables, summaries, and JSON export.
+//! Result reporting: console tables and summaries. The machine-readable
+//! results JSON lives in `crate::results`.
 
 use std::io::Write;
-use std::path::Path;
 
 use anyhow::Result;
-use serde_json::json;
 
 use crate::config::BenchmarkCategory;
 use crate::runner::{ActualOutcome, BenchmarkResult};
 
-/// Print one category's results as a table (paper-style columns).
+/// Print one category's results as a table (paper-style columns). The
+/// "VC (s)" column is the *median* solve time across the run's
+/// `iterations` (noted on the header line); "Exec (s)" is symbolic
+/// execution alone.
 pub fn print_results_table(
     out: &mut impl Write,
     results: &[BenchmarkResult],
     category: BenchmarkCategory,
+    iterations: usize,
 ) -> Result<()> {
-    writeln!(out, "\n{} ({})", category.name(), category.table_ref())?;
+    writeln!(
+        out,
+        "\n{} ({}) [VC (s): median of {} solve iteration(s)]",
+        category.name(),
+        category.table_ref(),
+        iterations
+    )?;
     writeln!(
         out,
         "{:<28} {:>7} {:>9} {:>9} {:>11} {:>11} {:>9}",
@@ -47,10 +56,14 @@ pub fn print_results_table(
 }
 
 /// Print all results grouped by category.
-pub fn print_all_results(out: &mut impl Write, results: &[BenchmarkResult]) -> Result<()> {
+pub fn print_all_results(
+    out: &mut impl Write,
+    results: &[BenchmarkResult],
+    iterations: usize,
+) -> Result<()> {
     for category in BenchmarkCategory::all() {
         if results.iter().any(|r| r.category == category) {
-            print_results_table(out, results, category)?;
+            print_results_table(out, results, category, iterations)?;
         }
     }
     print_summary(out, results)
@@ -75,30 +88,4 @@ pub fn describe(outcome: &ActualOutcome) -> String {
         ActualOutcome::RaceFree => "race-free".to_string(),
         ActualOutcome::Error { message } => message.clone(),
     }
-}
-
-/// Export results as JSON.
-pub fn export_json(results: &[BenchmarkResult], path: &Path) -> Result<()> {
-    let entries: Vec<_> = results
-        .iter()
-        .map(|r| {
-            json!({
-                "name": r.name,
-                "category": r.category.name(),
-                "status": r.outcome.status(),
-                "detail": describe(&r.outcome),
-                "passed": r.passed,
-                "elapsed_secs": r.elapsed_secs,
-                "exec_secs": r.stats.exec_secs,
-                "vc_secs": r.stats.vc_secs,
-                "block_syncs": r.stats.block_syncs,
-                "warp_syncs": r.stats.warp_syncs,
-                "instructions": r.stats.instructions,
-                "elements_checked": r.stats.elements_checked,
-                "elements_total": r.stats.elements_total,
-            })
-        })
-        .collect();
-    std::fs::write(path, serde_json::to_string_pretty(&entries)?)?;
-    Ok(())
 }

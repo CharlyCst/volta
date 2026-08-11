@@ -110,8 +110,9 @@ cargo run --release -- compare <ref.ptx> <opt.ptx> \
     --param ptr:in --param ptr:out
 ```
 
-- `--sample N`, `--verify-numeric`, `--recycle-terms N`: same meaning as the
-  `volta_bench` flags below
+- `--sample N`, `--verify-numeric`, `--recycle-terms N`, `--iterations N`:
+  same meaning as the `volta_bench` flags below (`--iterations` defaults
+  to 1 here and applies to the decision backend only)
 - `--no-profile`: skip the per-instruction-kind execution profile (shown by default)
 - `--backend decision|z3` (default `decision`): which decision procedure to
   check equivalence with - see [Z3 backend](#z3-backend)
@@ -243,15 +244,69 @@ Useful flags (global):
 
 - `--sample N`: check at most N output elements per array (0 = all)
 - `--verify-numeric`: confirm every verdict with the f64 oracle
+  (iteration 1 only)
 - `--recycle-terms N`: recycle the VC intern tables past N interned terms
   (0 = never). Lower values bound memory at the cost of re-canonicalizing
   shared structure
-- `--json <path>` (on `all`/`category`): export results as JSON
+- `--iterations N` (default 5): run the VC-solve phase N times per
+  benchmark for stable timings - see
+  [Timing, iterations, and output files](#timing-iterations-and-output-files)
+- `--out-dir <path>` (default `bench-out/`): where VC dumps and results
+  JSON files land - same section
+- `--json <path>` (on `all`/`category`/`z3-compare`): *also* write the
+  results JSON document to this explicit path (the timestamped file under
+  `<out-dir>/results/` is always written; both contain the same document)
 
 `single` also prints a per-instruction-kind execution profile for both
 kernels automatically (matching `volta compare`'s default); `all`/`category`
 stay compact and don't, to avoid flooding the table with one profile per
 benchmark row.
+
+### Timing, iterations, and output files
+
+Every benchmark's work splits into two separately-timed phases:
+
+- **VC generation** (`vc_gen_secs`): both kernels' symbolic executions
+  plus footprint pairing - everything it takes to *produce* the
+  verification conditions. Writing the dump file is excluded (reported
+  separately as `dump_write_secs`).
+- **VC solving** (`solve_*`): the per-element equivalence checking only -
+  the summed decision-procedure checks, excluding pairing and the
+  optional `--verify-numeric` oracle.
+
+The solve phase runs `--iterations` times (default 5) so the numbers are
+stable: each iteration re-solves the same sampled elements from a fresh
+VC session (cold-start comparability; memory stays bounded because each
+session drops before the next starts). The verdict comes from iteration
+1, and later iterations must reproduce it - a disagreement is a hard
+error, so the iterations double as a determinism check. Console tables
+report the *median* solve time (noted on each table's header line); the
+results JSON carries every iteration plus median/min/mean.
+
+Each run writes under `--out-dir` (default `bench-out/`, gitignored):
+
+- `bench-out/vcs/<name>.vcdump` - every equivalence benchmark's
+  verification conditions (both kernels' expression arenas + output
+  footprints), named by a sanitized benchmark name ("(Attention, FA1)"
+  becomes `attention-fa1.vcdump`) and overwritten on rerun (VCs are
+  deterministic). These are exactly `volta compare --dump-vcs` files -
+  one shared format implementation
+  (`volta_analysis::driver::vc_dump`) - so they replay directly:
+
+  ```bash
+  cargo run --release -p volta_cli -- compare --from-dump bench-out/vcs/red-1-red-2.vcdump
+  ```
+
+  Race-check benchmarks have no VCs (nothing to compare); they are
+  skipped with a console note.
+- `bench-out/results/<unix-seconds>-<pid>-<command>.json` - the results
+  of every `all`/`category`/`single`/`z3-compare` run (timestamped like
+  the run logs, so runs never clobber each other). The document has a
+  header (argv, timestamp, iterations, sample, recycle-terms, z3 flags
+  for z3-compare) and one record per benchmark: status, element counts,
+  `vc_gen_secs`, `solve_iters_secs` (every iteration),
+  `solve_median_secs`/`solve_min_secs`/`solve_mean_secs`, instruction
+  and sync counters, and the `dump_path` of its vcdump.
 
 To compare against Z3 instead of (or alongside) the decision procedure, use
 `z3-compare` (builds against `libz3` - see [Z3 backend](#z3-backend)):
@@ -263,15 +318,25 @@ cargo run --release -p volta_bench -- z3-compare "(Attention, FA1)"
 ```
 
 For every equivalence benchmark matched by the selector (`all`, a category,
-or an exact benchmark name), this runs *both* backends and prints exec/
-decision/Z3 timing side by side, plus Z3's per-element equivalent/
-not-equivalent/unknown/timeout/unsupported/error breakdown. The two
-timing columns measure only the deciding work, so they are comparable:
-`Dec(s)` is the summed canon equivalence checks (VC pairing and the
-optional `--verify-numeric` oracle excluded), and `Z3(s)` is in-worker
-solver time as described in [Z3 backend](#z3-backend) - worker
+or an exact benchmark name), this runs *both* backends and prints
+VC-generation/decision/Z3 timing side by side, plus Z3's per-element
+equivalent/not-equivalent/unknown/timeout/unsupported/error breakdown.
+The two solve columns measure only the deciding work, so they are
+comparable: `Dec(s)` is the summed canon equivalence checks (VC pairing
+and the optional `--verify-numeric` oracle excluded), and `Z3(s)` is
+in-worker solver time as described in [Z3 backend](#z3-backend) - worker
 spawn/exec and translation excluded, timeout elements counted at their
-full budget. Benchmarks
+full budget. Both columns are medians over `--iterations` solve
+iterations, with one Z3 carve-out: an element whose iteration-1 outcome
+is timeout/unsupported/error is *not* re-solved in later iterations
+(re-solving a timeout would multiply its full budget into every
+iteration; unsupported/error elements never reach the solver) - its
+iteration-1 time is charged to every iteration's total, and the verdict
+counts always come from iteration 1. `z3-compare` writes each
+benchmark's vcdump and its own results JSON exactly like the default
+commands (see
+[Timing, iterations, and output files](#timing-iterations-and-output-files)).
+Benchmarks
 whose VCs contain exponentials additionally get a `+exp-axiom` sub-row:
 the same elements rerun under the paper's addition-law-axiom encoding
 (expected outcome: `timeout`, versus `unknown` on the default row - see

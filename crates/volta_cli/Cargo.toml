@@ -18,7 +18,6 @@ volta_frontend.workspace = true
 volta_z3.workspace = true
 
 anyhow.workspace = true
-bincode.workspace = true
 clap.workspace = true
 env_logger = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
