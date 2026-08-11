@@ -61,7 +61,7 @@ impl From<LogLevel> for log::LevelFilter {
 enum BackendArg {
     /// `volta_analysis::canon` - Volta's own decision procedure (default)
     Decision,
-    /// Z3, via SMT-LIB2 evaluated in-process through libz3. Covers a
+    /// Z3, via SMT-LIB2 evaluated worker subprocess through libz3. Covers a
     /// narrower fragment (see `volta_z3::translate`'s docs) and reports
     /// per-element unsat/sat/unknown rather than a single verdict.
     Z3,

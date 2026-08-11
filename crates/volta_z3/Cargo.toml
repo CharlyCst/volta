@@ -2,7 +2,7 @@
 name = "volta_z3"
 version.workspace = true
 edition.workspace = true
-description = "Z3 backend for verification-condition equivalence checking, for timing comparison against volta_analysis::canon's decision procedure. Generates SMT-LIB2 and evaluates it in-process via libz3's C API (hand-written minimal FFI; requires libz3-dev to build, no bindgen)."
+description = "Z3 backend for verification-condition equivalence checking, for timing comparison against volta_analysis::canon's decision procedure. Generates SMT-LIB2 and evaluates it via libz3's C API in a killable worker subprocess (hand-written minimal FFI; requires libz3-dev to build, no bindgen)."
 
 [dependencies]
 volta_analysis.workspace = true
