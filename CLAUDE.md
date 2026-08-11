@@ -178,10 +178,13 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   free determinism check). Returns a report with the outcome,
   checked/total element counts, `check_iters: Vec<Duration>` (each
   iteration's summed `EquivSession::check` durations only - pairing and
-  the oracle excluded; `check_time()` = iteration 1's), `pair_time`
-  (the `paired_elements` call - the bench adds it to exec time for its
-  VC-generation figure), and `verify_time` (the oracle's total time,
-  `Some` iff `verify_numeric`).
+  the oracle excluded; `check_time()` = iteration 1's), `element_checks:
+  Vec<ElementCheckTime>` (iteration 1's per-element check durations in
+  `sampled_elements` order - the same measurements `check_iters[0]`
+  sums, recorded outside the timed spans, so carrying them is free; the
+  bench harness's `decision_elements`), `pair_time`
+  (the `paired_elements` call), and `verify_time` (the oracle's total
+  time, `Some` iff `verify_numeric`).
 - `check_output_equivalence(ref, opt)` - the Default-options wrapper
   (all elements, no oracle, one iteration)
 - `VcSnapshot`/`VcDump` - serde-serializable arena + output footprint, the
@@ -318,18 +321,44 @@ Benchmark definitions with full launch/param configs live in
 `src/benchmarks/*.rs`. Run with `cargo run --release -p volta_bench --
 category <reduction|matmul|attention|causal|conv|agent|tilelang|race>
 [--sample N] [--verify-numeric] [--recycle-terms N] [--iterations N]
-[--out-dir DIR]` (also `all`, `single <name>`, `list`; release mode
-matters: ~20x). The element loop is
-`driver::check_output_equivalence_with` (exact per-array footprints
-against the reference; every corpus pair is footprint-identical).
+[--z3] [--z3-timeout N] [--out-dir DIR]` (also `all`, `single <name>`,
+`list`; release mode matters: ~20x, and the binary prints loud stderr
+warnings at startup for a debug build or, under the `logging` feature,
+a `--log-level` of info+ - both corrupt timings).
 
-Two timed phases per benchmark: **VC generation** (`vc_gen_secs` = both
-symbolic executions + `paired_elements`; dump writing excluded, timed
-separately as `dump_write_secs`) and **VC solving** (the per-element
-checks only). The solve phase runs `--iterations` times (default 5;
-`EquivCheckOptions::iterations` - fresh session per iteration, verdict
-from iteration 1, later iterations must agree); tables print the median
-(noted in the header line), the results JSON keeps every iteration.
+One pipeline per benchmark (`src/runner.rs`): **VC generation**
+(`--iterations` timed runs of both symbolic executions +
+`paired_elements`; only the last generation's outputs are kept - each
+iteration drops its predecessor, peak memory = one generation - and
+every iteration is shape-checked against iteration 1: same outcome
+kind and per-array footprints, rejections by rejection kind since race
+diagnostics vary benignly; a mismatch fails the benchmark loudly), then
+the dump written once from the last generation (timed as
+`dump_write_secs`), then **decision solve** (`--iterations` runs via
+`driver::check_output_equivalence_with` - fresh session per iteration,
+verdict from iteration 1, later iterations must agree), then the
+optional **Z3 solve** (`--z3`; `src/z3_phase.rs`) over the exact same
+`driver::sampled_elements` list. Race-check benchmarks stop after
+generation (no dump/solve/Z3). Every timed phase defaults to
+`--iterations` 10; tables print medians (the convention: median is the
+headline number - iteration 1 includes process/allocator warmup, the
+median absorbs it), and the harness warns per benchmark when a phase's
+CV (sample sd/mean) exceeds 0.10 (`runner::NOISY_CV_THRESHOLD`).
+
+The Z3 phase (columns appear in the tables only under `--z3`) solves
+with `ExpMode::PowerBounded`, plus a `+exp-axiom` sub-run
+(`ExpMode::AdditionAxiom`) when the VCs contain `Exp` nodes. Solve
+columns cover the deciding work only, so they are comparable:
+decision = summed `EquivSession::check` (pairing and the optional
+numeric oracle excluded), Z3 = in-worker libz3 solve time (worker
+spawn/exec and translation excluded; timeout elements count the full
+budget). One Z3 carve-out: elements whose iteration-1 outcome is
+timeout/unsupported/error are solved once, their iteration-1 time
+charged to every iteration's total (re-solving a timeout would multiply
+its budget); Z3 verdict counts and per-element results always come from
+iteration 1. A Z3 phase *failure* (not an unknown/timeout verdict -
+those are data) fails the benchmark (`Z3PhaseOutcome::Failed`). Paper
+Table 8 reproduction: `--sample 1 --z3 --z3-timeout 600 all`.
 
 Output files under `--out-dir` (default `bench-out/`, gitignored):
 `vcs/<sanitized-name>.vcdump` per equivalence benchmark (written via the
@@ -338,35 +367,24 @@ them; overwritten on rerun; a run whose benchmark names collide under
 sanitization is rejected up front naming both offenders -
 `results::check_slug_collisions`, corpus-guarded by a test; race-check
 benchmarks are skipped with a console note) and
-`results/<unix-seconds>-<pid>-<command>.json` for
-every run command (header: argv/timestamp/iterations/sample/
-recycle-terms/z3 flags; per-benchmark records: status, element counts,
-`vc_gen_secs`, `solve_iters_secs` + median/min/mean,
-`verify_numeric_secs` (oracle time, `Some` iff the flag), instruction/sync
-counters, `dump_path` - kept on failures that occur after the dump was
-written; built in `src/results.rs`). `--json <path>`
-additionally writes the same document to an explicit path. Results files
-are written before the console tables print, and table printing
-tolerates a broken stdout pipe (`| head`), so the files always land.
-
-`z3-compare <all|category|name>` runs equivalence benchmarks through both
-the decision procedure and `volta_z3` side by side (skips race-check
-benchmarks; exits nonzero if any row fails outright); benchmarks whose
-VCs contain exponentials get a second `+exp-axiom` sub-row rerun under
-`ExpMode::AdditionAxiom`. Its two solve columns cover the deciding
-work only: `Dec(s)` = summed `EquivSession::check` (pairing and the
-optional numeric oracle excluded), `Z3(s)` = in-worker libz3 solve
-time (worker spawn/exec and translation excluded; timeout elements
-count the full budget). The default commands' `VC (s)` column is the
-same quantity. Both columns are medians over `--iterations`, with one
-Z3 carve-out: elements whose iteration-1 outcome is timeout/
-unsupported/error are solved once, their iteration-1 time charged to
-every iteration's total (re-solving a timeout would multiply its
-budget); Z3 verdict counts always come from iteration 1. `z3-compare`
-writes the same vcdump/results files as the default commands. Paper
-Table 8 reproduction:
-`--sample 1 z3-compare all --z3-timeout 600`. Every run writes a
-`volta_common::run_log` file (`--log-dir`/`--no-log-file`).
+`results/<unix-seconds>-<pid>-<command>.json` for every run command,
+one schema (built in `src/results.rs`): header
+(argv/timestamp/iterations/sample/recycle-terms/`z3` flag + timeout +
+the carve-out convention) and per-benchmark records - status/detail/
+passed, element counts, per-phase stats (`vc_gen_*` and `solve_*`: full
+`*_iters_secs` array + median/min/mean/cv), `dump_write_secs`,
+`verify_numeric_secs` (oracle time, `Some` iff the flag),
+`decision_elements` (iteration 1's per-element decision times, from
+`EquivCheckReport::element_checks`), a `z3` section (null without
+`--z3`; else `solve_*` stats + verdict `counts` + iteration-1
+`elements` as `{array, index, outcome, detail, solve_secs}`, an `axiom`
+sub-section of the same shape or null, and `error`), instruction/sync
+counters, and `dump_path` - kept on failures that occur after the dump
+was written. `--json <path>` additionally writes the same document to
+an explicit path. Results files are written before the console tables
+print, and table printing tolerates a broken stdout pipe (`| head`), so
+the files always land. Every run writes a `volta_common::run_log` file
+(`--log-dir`/`--no-log-file`).
 Memory: full-element attention wants tens of GiB warm - on small machines
 run one category at a time under `ulimit -v` with `--recycle-terms 250000`
 (bounded at ~5 GiB, slower VCs).

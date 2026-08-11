@@ -238,7 +238,16 @@ cargo run --release -p volta_bench -- list
 cargo run --release -p volta_bench -- all
 cargo run --release -p volta_bench -- category <reduction|matmul|attention|causal|conv|agent|tilelang|race>
 cargo run --release -p volta_bench -- single "(Attention, FA1)"
+cargo run --release -p volta_bench -- --z3 category reduction
 ```
+
+Every benchmark runs through one pipeline: generate the verification
+conditions (`--iterations` timed runs), write the VC dump (once, from
+the last generation), solve with the decision procedure (`--iterations`
+timed runs), optionally solve with Z3 (`--z3`, same iteration scheme),
+and record everything in one results document. Race-check benchmarks
+stop after generation (their whole analysis is the symbolic execution) -
+no dump, no solve phases, and no Z3 even under `--z3`.
 
 Useful flags (global):
 
@@ -248,12 +257,15 @@ Useful flags (global):
 - `--recycle-terms N`: recycle the VC intern tables past N interned terms
   (0 = never). Lower values bound memory at the cost of re-canonicalizing
   shared structure
-- `--iterations N` (default 5): run the VC-solve phase N times per
-  benchmark for stable timings - see
+- `--iterations N` (default 10): run every timed phase N times per
+  benchmark for statistically meaningful numbers - see
   [Timing, iterations, and output files](#timing-iterations-and-output-files)
+- `--z3` / `--z3-timeout N`: also solve every equivalence benchmark's
+  VCs with Z3, side by side with the decision procedure - see
+  [Comparing against Z3](#comparing-against-z3)
 - `--out-dir <path>` (default `bench-out/`): where VC dumps and results
   JSON files land - same section
-- `--json <path>` (on `all`/`category`/`z3-compare`): *also* write the
+- `--json <path>` (on `all`/`category`/`single`): *also* write the
   results JSON document to this explicit path (the timestamped file under
   `<out-dir>/results/` is always written; both contain the same document)
 
@@ -262,28 +274,55 @@ kernels automatically (matching `volta compare`'s default); `all`/`category`
 stay compact and don't, to avoid flooding the table with one profile per
 benchmark row.
 
+At startup the binary prints loud stderr warnings when the environment
+would corrupt the timings: a build without optimizations (timings ~20x
+off - use `--release`) or, under the `logging` feature, a `--log-level`
+of `info` or above (log output is emitted from inside the timed phases).
+
 ### Timing, iterations, and output files
 
-Every benchmark's work splits into two separately-timed phases:
+Every benchmark's work splits into separately-timed phases:
 
-- **VC generation** (`vc_gen_secs`): both kernels' symbolic executions
+- **VC generation** (`vc_gen_*`): both kernels' symbolic executions
   plus footprint pairing - everything it takes to *produce* the
   verification conditions. Writing the dump file is excluded (reported
-  separately as `dump_write_secs`).
+  separately as `dump_write_secs`; the dump is written once, from the
+  last generation iteration, whose outputs also feed the solve phases).
 - **VC solving** (`solve_*`): the per-element equivalence checking only -
   the summed decision-procedure checks, excluding pairing and the
   optional `--verify-numeric` oracle (the oracle's own time is reported
   separately as `verify_numeric_secs`, present exactly when the flag is
   on).
+- **Z3 solving** (the `z3` record section, under `--z3`): the in-worker
+  libz3 solve time - see [Comparing against Z3](#comparing-against-z3).
 
-The solve phase runs `--iterations` times (default 5) so the numbers are
-stable: each iteration re-solves the same sampled elements from a fresh
-VC session (cold-start comparability; memory stays bounded because each
-session drops before the next starts). The verdict comes from iteration
-1, and later iterations must reproduce it - a disagreement is a hard
-error, so the iterations double as a determinism check. Console tables
-report the *median* solve time (noted on each table's header line); the
-results JSON carries every iteration plus median/min/mean.
+Each phase runs `--iterations` times (default 10) so the numbers are
+statistically meaningful. The convention: **the median is the headline
+number** - iteration 1 includes process/allocator warmup (and, for the
+solve phase, first-touch of the VC arenas), and the median absorbs it.
+Console tables print medians (noted on each table's header line); the
+results JSON keeps every phase's full per-iteration array plus
+median/min/mean and the coefficient of variation (sample standard
+deviation over the mean). When a phase's CV exceeds 0.10 the harness
+prints a per-benchmark warning ("timing noisy; consider more iterations
+or a quieter machine") - the numbers still land, but treat them with
+suspicion.
+
+Re-running phases is also a correctness check, not just a timing one:
+
+- Every solve iteration re-solves the same sampled elements from a fresh
+  VC session (cold-start comparability; memory stays bounded because
+  each session drops before the next starts). The verdict comes from
+  iteration 1, and later iterations must reproduce it - a disagreement
+  is a hard error.
+- Every generation iteration must produce the same *shape* as iteration
+  1 - the same outcome kind and, element for element, the same written
+  footprints (for rejections, the same rejection kind: which access pair
+  a race report names first can vary benignly) - so a nondeterministic
+  interpreter regression fails loudly instead of silently timing
+  different work. Only the last generation's outputs are kept (each
+  iteration drops its predecessor first), so peak memory stays at one
+  generation.
 
 Each run writes under `--out-dir` (default `bench-out/`, gitignored):
 
@@ -308,62 +347,81 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
   Race-check benchmarks have no VCs (nothing to compare); they are
   skipped with a console note.
 - `bench-out/results/<unix-seconds>-<pid>-<command>.json` - the results
-  of every `all`/`category`/`single`/`z3-compare` run (timestamped like
-  the run logs, so runs never clobber each other). The document has a
-  header (argv, timestamp, iterations, sample, recycle-terms, z3 flags
-  for z3-compare) and one record per benchmark: status, element counts,
-  `vc_gen_secs`, `solve_iters_secs` (every iteration),
-  `solve_median_secs`/`solve_min_secs`/`solve_mean_secs`,
-  `verify_numeric_secs` (oracle time; null unless `--verify-numeric`),
-  instruction and sync counters, and the `dump_path` of its vcdump (kept
-  even when a benchmark fails after its dump was written).
+  of every `all`/`category`/`single` run (timestamped like
+  the run logs, so runs never clobber each other). One schema for every
+  run: a header (argv, timestamp, iterations, sample, recycle-terms,
+  whether `--z3` was on plus its timeout and the iteration carve-out
+  convention), and one record per benchmark:
 
-To compare against Z3 instead of (or alongside) the decision procedure, use
-`z3-compare` (builds against `libz3` - see [Z3 backend](#z3-backend)):
+  - identity and verdict: `name`, `category`, `status`, `detail`,
+    `passed`, `elements_checked`/`elements_total`
+  - per-phase timing stats, one set per timed phase
+    (`vc_gen_*`, `solve_*`): the full `*_iters_secs` array plus
+    `*_median_secs`/`*_min_secs`/`*_mean_secs`/`*_cv`
+  - `dump_write_secs` and the `dump_path` of its vcdump (kept even when
+    a benchmark fails after its dump was written), and
+    `verify_numeric_secs` (oracle time; null unless `--verify-numeric`)
+  - `decision_elements`: iteration 1's per-element decision-procedure
+    check times as `{array, index, solve_secs}` (empty when no solve
+    ran; on a full-footprint run this is one entry per element)
+  - `z3`: null without `--z3` (and for benchmarks with no solve phase);
+    otherwise the Z3 phase's results - see
+    [Comparing against Z3](#comparing-against-z3)
+  - instruction and sync counters
+
+### Comparing against Z3
+
+`--z3` adds a Z3 solve phase to the same pipeline (builds against
+`libz3` - see [Z3 backend](#z3-backend)):
 
 ```bash
-cargo run --release -p volta_bench -- z3-compare all --json results.json
-cargo run --release -p volta_bench -- z3-compare reduction
-cargo run --release -p volta_bench -- z3-compare "(Attention, FA1)"
+cargo run --release -p volta_bench -- --z3 all --json results.json
+cargo run --release -p volta_bench -- --z3 category reduction
+cargo run --release -p volta_bench -- --z3 single "(Attention, FA1)"
 ```
 
-For every equivalence benchmark matched by the selector (`all`, a category,
-or an exact benchmark name), this runs *both* backends and prints
-VC-generation/decision/Z3 timing side by side, plus Z3's per-element
+Every equivalence benchmark's VCs are then solved by *both* backends -
+the exact same sampled elements - and the tables gain two columns: the
+median Z3 solve time and Z3's per-element
 equivalent/not-equivalent/unknown/timeout/unsupported/error breakdown.
-The two solve columns measure only the deciding work, so they are
-comparable: `Dec(s)` is the summed canon equivalence checks (VC pairing
-and the optional `--verify-numeric` oracle excluded), and `Z3(s)` is
-in-worker solver time as described in [Z3 backend](#z3-backend) - worker
-spawn/exec and translation excluded, timeout elements counted at their
-full budget. Both columns are medians over `--iterations` solve
-iterations, with one Z3 carve-out: an element whose iteration-1 outcome
-is timeout/unsupported/error is *not* re-solved in later iterations
-(re-solving a timeout would multiply its full budget into every
-iteration; unsupported/error elements never reach the solver) - its
-iteration-1 time is charged to every iteration's total, and the verdict
-counts always come from iteration 1. `z3-compare` writes each
-benchmark's vcdump and its own results JSON exactly like the default
-commands (see
-[Timing, iterations, and output files](#timing-iterations-and-output-files)).
-Benchmarks
-whose VCs contain exponentials additionally get a `+exp-axiom` sub-row:
-the same elements rerun under the paper's addition-law-axiom encoding
-(expected outcome: `timeout`, versus `unknown` on the default row - see
-[Z3 backend](#z3-backend)). Race-check benchmarks (no optimized kernel)
-are skipped with a note when matched by `all` or a category.
-`--z3-timeout N` hard-bounds each Z3 query in seconds (default 30, `0` =
-no limit); the global `--sample` flag applies to both backends, and
-`--recycle-terms`/`--verify-numeric` to the decision-procedure column,
-exactly as in the default commands. Exits nonzero if any benchmark row
-failed outright. The default `all`/`category`/`single` commands never
-invoke Z3 - `z3-compare` is opt-in.
+The decision and Z3 columns measure only the deciding work, so they are
+comparable: `Solve (s)` is the summed canon equivalence checks (VC
+pairing and the optional `--verify-numeric` oracle excluded), and
+`Z3 (s)` is in-worker solver time as described in
+[Z3 backend](#z3-backend) - worker spawn/exec and translation excluded,
+timeout elements counted at their full budget. Both are medians over
+`--iterations`, with one Z3 carve-out: an element whose iteration-1
+outcome is timeout/unsupported/error is *not* re-solved in later
+iterations (re-solving a timeout would multiply its full budget into
+every iteration; unsupported/error elements never reach the solver) -
+its iteration-1 time is charged to every iteration's total, and the
+verdict counts always come from iteration 1. Benchmarks whose VCs
+contain exponentials additionally get a `+exp-axiom` sub-row: the same
+elements rerun under the paper's addition-law-axiom encoding (expected
+outcome: `timeout`, versus `unknown` on the default row - see
+[Z3 backend](#z3-backend)). Race-check benchmarks have no VCs and no Z3
+phase. `--z3-timeout N` hard-bounds each Z3 query in seconds (default
+30, `0` = no limit); the global `--sample` flag applies to both
+backends, and `--recycle-terms`/`--verify-numeric` to the decision
+procedure only, exactly as without `--z3`. A benchmark whose Z3 phase
+fails outright (as opposed to returning unknown/timeout verdicts, which
+are data) fails the run. Without `--z3`, Z3 is never invoked.
+
+In the results JSON, each benchmark's `z3` section carries the phase's
+full data: `solve_iters_secs` (every iteration, carve-out included) with
+median/min/mean/CV, the verdict `counts`, and `elements` - iteration 1's
+per-element results as `{array, index, outcome, detail, solve_secs}`
+(per-element times for *every* iteration would bloat the document;
+iteration-1 elements plus per-iteration totals is the shape). The
+`axiom` sub-section repeats all of that for the `+exp-axiom` rerun
+(null for exponential-free benchmarks), and `error` is non-null when
+the phase failed.
 
 To reproduce the paper's Table 8 exactly - one element per output tensor,
 a 10-minute budget per query:
 
 ```bash
-cargo run --release -p volta_bench -- --sample 1 z3-compare all --z3-timeout 600
+cargo run --release -p volta_bench -- --sample 1 --z3 --z3-timeout 600 all
 ```
 
 (Expect the attention/causal rows to spend the full budget per element on

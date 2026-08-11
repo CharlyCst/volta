@@ -187,6 +187,15 @@ impl Default for EquivCheckOptions {
     }
 }
 
+/// One checked element's iteration-1 decision-procedure check duration.
+#[derive(Debug, Clone)]
+pub struct ElementCheckTime {
+    pub array: String,
+    pub index: u64,
+    /// The element's `EquivSession::check` duration in solve iteration 1.
+    pub check: Duration,
+}
+
 /// The outcome of a comparison plus how much of the footprint it covered.
 #[derive(Debug)]
 pub struct EquivCheckReport {
@@ -203,6 +212,12 @@ pub struct EquivCheckReport {
     /// move when `verify_numeric` is toggled. One entry per
     /// `EquivCheckOptions::iterations`, in order; never empty.
     pub check_iters: Vec<Duration>,
+    /// Iteration 1's per-element check durations, one entry per checked
+    /// element in `sampled_elements` order (so `check_iters[0]` is their
+    /// sum). Recorded outside the timed spans - the entries are the same
+    /// measurements `check_iters[0]` accumulates, not extra timing work -
+    /// so carrying them does not move the iteration totals.
+    pub element_checks: Vec<ElementCheckTime>,
     /// Time spent pairing the two footprints (`paired_elements`). Callers
     /// that account "VC generation" as symbolic execution plus pairing
     /// (the bench harness) add this to their execution time.
@@ -365,6 +380,7 @@ pub fn check_output_equivalence_with(
 
     let mut verify_time = options.verify_numeric.then_some(Duration::ZERO);
     let mut check_iters = Vec::with_capacity(options.iterations.get());
+    let mut element_checks = Vec::with_capacity(checked.len());
     let mut first_verdicts: Vec<bool> = Vec::with_capacity(checked.len());
     for iteration in 1..=options.iterations.get() {
         let mut session = EquivSession::with_recycle_terms(
@@ -376,8 +392,14 @@ pub fn check_output_equivalence_with(
         for (slot, &(name, index, r, o)) in checked.iter().enumerate() {
             let check_start = Instant::now();
             let equivalent = session.check(r, o)?;
-            iter_time += check_start.elapsed();
+            let check = check_start.elapsed();
+            iter_time += check;
             if iteration == 1 {
+                element_checks.push(ElementCheckTime {
+                    array: name.to_string(),
+                    index,
+                    check,
+                });
                 if let Some(verify_time) = verify_time.as_mut() {
                     let verify_start = Instant::now();
                     numeric::verify_verdict(&reference.arena, r, &optimized.arena, o, equivalent)
@@ -419,6 +441,7 @@ pub fn check_output_equivalence_with(
         elements_checked: checked.len() as u64,
         elements_total,
         check_iters,
+        element_checks,
         pair_time,
         verify_time,
     })
@@ -858,6 +881,25 @@ mod tests {
         assert!(matches!(report.outcome, EquivOutcome::Equivalent));
         // Oracle off: no oracle-time bucket, rather than a zero one.
         assert_eq!(report.verify_time, None);
+        // Per-element times: iteration 1 only (no multiplication across
+        // iterations), in `sampled_elements` order, summing to iteration
+        // 1's total.
+        assert_eq!(
+            report
+                .element_checks
+                .iter()
+                .map(|e| (e.array.as_str(), e.index))
+                .collect::<Vec<_>>(),
+            vec![("out", 0), ("out", 1), ("out", 2)]
+        );
+        assert_eq!(
+            report
+                .element_checks
+                .iter()
+                .map(|e| e.check)
+                .sum::<Duration>(),
+            report.check_iters[0]
+        );
 
         // Sampling caps the per-array element count once, not per iteration,
         // and a NotEquivalent verdict survives the later iterations'

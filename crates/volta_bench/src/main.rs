@@ -1,11 +1,12 @@
 //! Volta benchmark runner CLI.
 //!
 //! Note: run in release mode; symbolic execution of the larger kernels is
-//! ~20x slower unoptimized.
+//! ~20x slower unoptimized (the binary warns at startup when it isn't).
 //!
 //! ```bash
 //! cargo run --release -p volta_bench -- all --sample 16
 //! cargo run --release -p volta_bench -- category reduction
+//! cargo run --release -p volta_bench -- --z3 category reduction
 //! cargo run --release -p volta_bench -- single "(Red-1, Red-2)"
 //! cargo run --release -p volta_bench -- list
 //! ```
@@ -19,8 +20,9 @@ use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use volta_analysis::driver::write_op_counts;
 use volta_bench::{
-    BenchmarkCategory, BenchmarkRunner, KERNELS_DIR, RunnerConfig, Z3CompareOptions,
-    all_benchmarks, print_all_results, print_results_table, print_summary, results,
+    BenchmarkCategory, BenchmarkDef, BenchmarkRunner, KERNELS_DIR, RunnerConfig, Z3Options,
+    all_benchmarks, print_all_results, print_results_table, print_single_result, print_summary,
+    results,
 };
 use volta_common::run_log::RunLog;
 
@@ -85,11 +87,22 @@ struct Cli {
     #[arg(long, global = true, default_value_t = volta_analysis::equiv::DEFAULT_RECYCLE_TERMS)]
     recycle_terms: usize,
 
-    /// Run the VC-solve phase this many times per benchmark (fresh
-    /// session each iteration; tables report the median; the verdict
-    /// comes from iteration 1 and later iterations must agree)
-    #[arg(long, global = true, default_value_t = NonZeroUsize::new(5).unwrap())]
+    /// Run every timed phase (VC generation, decision solve, and the Z3
+    /// solve under --z3) this many times per benchmark; tables report
+    /// medians, the results JSON keeps every iteration
+    #[arg(long, global = true, default_value_t = NonZeroUsize::new(10).unwrap())]
     iterations: NonZeroUsize,
+
+    /// Also solve every equivalence benchmark's VCs with Z3 (SMT-LIB2
+    /// evaluated in-process via libz3) for a side-by-side comparison;
+    /// exp-containing benchmarks get a second +exp-axiom sub-run
+    #[arg(long, global = true)]
+    z3: bool,
+
+    /// Soft per-query Z3 timeout in seconds under --z3 (0 = no limit;
+    /// expiry reports `timeout`)
+    #[arg(long, global = true, default_value_t = 30)]
+    z3_timeout: u64,
 
     /// Output directory: VC dumps under <out-dir>/vcs/, results JSON
     /// under <out-dir>/results/
@@ -129,24 +142,41 @@ enum Commands {
         json: Option<PathBuf>,
     },
     /// Run a single benchmark by name
-    Single { name: String },
-    /// List all benchmarks
-    List,
-    /// Compare the decision procedure against Z3 (SMT-LIB2 evaluated
-    /// in-process via libz3) on the same equivalence benchmarks: timing
-    /// and per-element outcome side by side.
-    Z3Compare {
-        /// "all", a category, or an exact benchmark name
-        selector: String,
+    Single {
+        name: String,
         /// Also write the results document to this explicit path (the
         /// timestamped file under <out-dir>/results/ is always written)
         #[arg(long)]
         json: Option<PathBuf>,
-        /// Soft per-query Z3 timeout in seconds (0 = no limit; expiry
-        /// reports `unknown`)
-        #[arg(long, default_value_t = 30)]
-        z3_timeout: u64,
     },
+    /// List all benchmarks
+    List,
+}
+
+/// Loud stderr warnings for environments that make the timed phases
+/// untrustworthy. Warnings, not errors: the run proceeds either way.
+fn print_environment_warnings(#[cfg(feature = "logging")] log_level: LogLevel) {
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "WARNING: built without optimizations (debug_assertions on); \
+             timings will be ~20x off - use `cargo run --release`"
+        );
+    }
+    // The `logging` feature compiles volta_analysis's log statements in;
+    // at info and above they emit during the timed phases themselves
+    // (barrier/warp fires at trace, launch/completion/session recycles at
+    // info), so the timings include logging overhead. At error/warn the
+    // compiled-in statements only fire on exceptional paths.
+    #[cfg(feature = "logging")]
+    if log::LevelFilter::from(log_level) >= log::LevelFilter::Info {
+        eprintln!(
+            "WARNING: the `logging` feature is compiled in and --log-level {:?} \
+             emits log output during timed phases; timings will include logging \
+             overhead - drop to --log-level warn (or build without the feature) \
+             for clean measurements",
+            log_level
+        );
+    }
 }
 
 /// Refuse to run a benchmark set whose names collide under the VC-dump
@@ -155,7 +185,7 @@ enum Commands {
 /// dump with another's. Prints both offending names and fails the run
 /// before anything executes.
 fn ensure_unique_slugs<'a>(
-    defs: impl IntoIterator<Item = &'a volta_bench::BenchmarkDef>,
+    defs: impl IntoIterator<Item = &'a BenchmarkDef>,
     log: &mut RunLog,
 ) -> Result<(), ExitCode> {
     match results::check_slug_collisions(defs.into_iter().map(|d| d.name.as_str())) {
@@ -182,8 +212,8 @@ fn print_stdout(result: anyhow::Result<()>) {
 }
 
 /// One stdout line under the [`print_stdout`] broken-pipe policy - for
-/// the `all`/`category` progress and results-path lines, which must not
-/// panic before (or between) the results-file writes.
+/// progress and results-path lines, which must not panic before (or
+/// between) the results-file writes.
 fn println_tolerant(line: String) {
     use std::io::Write;
     print_stdout(writeln!(std::io::stdout(), "{line}").map_err(anyhow::Error::from));
@@ -212,6 +242,18 @@ fn write_results(
     }
 }
 
+/// Announce the Z3 phase once per run: solver version (provenance for
+/// the results) and the iteration carve-out convention.
+fn announce_z3(iterations: NonZeroUsize) {
+    println_tolerant(format!("z3 {} (libz3, in-process)", volta_z3::z3_version()));
+    println_tolerant(format!(
+        "z3 solve: {} iteration(s); elements whose iteration-1 outcome is \
+         timeout/unsupported/error are solved once, with that time charged to \
+         every iteration",
+        iterations
+    ));
+}
+
 fn main() -> ExitCode {
     // Must precede everything: if this process was spawned as a z3
     // solver worker, this runs the query and exits (see volta_z3::ffi).
@@ -224,7 +266,6 @@ fn main() -> ExitCode {
         Commands::Category { .. } => "category",
         Commands::Single { .. } => "single",
         Commands::List => "list",
-        Commands::Z3Compare { .. } => "z3-compare",
     };
     let mut log = RunLog::open(&cli.log_dir, command_name, cli.no_log_file);
 
@@ -238,10 +279,16 @@ fn main() -> ExitCode {
         .target(env_logger::Target::Pipe(log.tee(std::io::stderr())))
         .init();
 
+    print_environment_warnings(
+        #[cfg(feature = "logging")]
+        cli.log_level,
+    );
+
     let out_dir = cli.out_dir.clone();
     let iterations = cli.iterations;
-    let meta = |command: &'static str, z3_timeout_secs: Option<u64>| results::RunMeta {
-        command,
+    let z3_timeout_secs = cli.z3.then_some(cli.z3_timeout);
+    let meta = results::RunMeta {
+        command: command_name,
         iterations: iterations.get(),
         sample: cli.sample,
         verify_numeric: cli.verify_numeric,
@@ -259,6 +306,9 @@ fn main() -> ExitCode {
         recycle_terms: cli.recycle_terms,
         iterations: cli.iterations,
         vcs_dir: Some(cli.out_dir.join("vcs")),
+        z3: cli.z3.then(|| Z3Options {
+            timeout: volta_z3::timeout_from_secs(cli.z3_timeout),
+        }),
     };
 
     let code = match cli.command {
@@ -268,17 +318,21 @@ fn main() -> ExitCode {
                 return finish(log, code);
             }
             println_tolerant(format!("Running {} benchmarks...", suite.benchmarks.len()));
+            if cli.z3 {
+                announce_z3(iterations);
+            }
             let runner = BenchmarkRunner::new(runner_config);
             let run_results = runner.run_all(&suite.benchmarks);
             // Results files first, console tables second: a broken pipe
             // must not lose the files.
             let records = run_results.iter().map(results::benchmark_record).collect();
-            write_results(&out_dir, &meta("run-all", None), records, json.as_deref());
+            write_results(&out_dir, &meta, records, json.as_deref());
             let mut stdout = std::io::stdout();
             print_stdout(print_all_results(
                 &mut stdout,
                 &run_results,
                 iterations.get(),
+                cli.z3,
             ));
             let passed = run_results.iter().filter(|r| r.passed).count();
             log.record(&format!(
@@ -311,18 +365,22 @@ fn main() -> ExitCode {
                 filtered.len(),
                 category.name()
             ));
+            if cli.z3 {
+                announce_z3(iterations);
+            }
             let runner = BenchmarkRunner::new(runner_config);
             let run_results = runner.run_all(&filtered);
             // Results files first, console tables second: a broken pipe
             // must not lose the files.
             let records = run_results.iter().map(results::benchmark_record).collect();
-            write_results(&out_dir, &meta("category", None), records, json.as_deref());
+            write_results(&out_dir, &meta, records, json.as_deref());
             let mut stdout = std::io::stdout();
             print_stdout(print_results_table(
                 &mut stdout,
                 &run_results,
                 category,
                 iterations.get(),
+                cli.z3,
             ));
             print_stdout(print_summary(&mut stdout, &run_results));
             let passed = run_results.iter().filter(|r| r.passed).count();
@@ -334,7 +392,7 @@ fn main() -> ExitCode {
             ));
             exit_by_pass(passed == run_results.len())
         }
-        Commands::Single { name } => {
+        Commands::Single { name, json } => {
             let suite = all_benchmarks();
             let Some(def) = suite.benchmarks.iter().find(|b| b.name == name) else {
                 eprintln!("Benchmark not found: {}", name);
@@ -343,41 +401,13 @@ fn main() -> ExitCode {
                 return finish(log, ExitCode::FAILURE);
             };
             println!("Running {} ...", name);
+            if cli.z3 {
+                announce_z3(iterations);
+            }
             let runner = BenchmarkRunner::new(runner_config);
             let result = runner.run(def);
-            println!("Status:  {}", result.outcome.status());
-            println!(
-                "Detail:  {}",
-                volta_bench::reporter::describe(&result.outcome)
-            );
-            println!("Passed:  {}", if result.passed { "yes" } else { "no" });
-            println!("Exec:    {:.2}s", result.stats.exec_secs);
-            println!(
-                "VC gen:  {:.2}s (exec + footprint pairing)",
-                result.stats.vc_gen_secs
-            );
-            // Race-check benchmarks (and failed runs) have no solve
-            // phase; don't print a "0.000s median of 0 iteration(s)" line.
-            if !result.stats.solve_iters_secs.is_empty() {
-                println!(
-                    "Solve:   {:.3}s median of {} iteration(s)",
-                    result.stats.vc_secs,
-                    result.stats.solve_iters_secs.len()
-                );
-            }
-            if let Some(path) = &result.dump_path {
-                println!("VC dump: {}", path.display());
-            }
-            println!("Instrs:  {}", result.stats.instructions);
-            println!(
-                "Syncs:   {} block, {} warp",
-                result.stats.block_syncs, result.stats.warp_syncs
-            );
-            println!(
-                "Elems:   {} checked of {}",
-                result.stats.elements_checked, result.stats.elements_total
-            );
             let mut stdout = std::io::stdout().lock();
+            print_single_result(&mut stdout, &result).unwrap();
             write_op_counts(&mut stdout, "reference", &result.stats.reference_op_counts).unwrap();
             write_op_counts(&mut stdout, "optimized", &result.stats.optimized_op_counts).unwrap();
             drop(stdout);
@@ -387,7 +417,7 @@ fn main() -> ExitCode {
                 print!("{}", String::from_utf8_lossy(&out));
             }
             let records = vec![results::benchmark_record(&result)];
-            write_results(&out_dir, &meta("single", None), records, None);
+            write_results(&out_dir, &meta, records, json.as_deref());
             log.record(&format!(
                 "single {}: {} ({})",
                 name,
@@ -395,107 +425,6 @@ fn main() -> ExitCode {
                 if result.passed { "pass" } else { "FAIL" }
             ));
             exit_by_pass(result.passed)
-        }
-        Commands::Z3Compare {
-            selector,
-            json,
-            z3_timeout,
-        } => {
-            println!("z3 {} (libz3, in-process)", volta_z3::z3_version());
-            let suite = all_benchmarks();
-            // "all" and category selectors silently skip race-check
-            // benchmarks (no optimized kernel to compare against); an exact
-            // NAME that has no optimized kernel is a user error and still
-            // fails loudly below via `compare_one`'s error row.
-            let by_name = suite.benchmarks.iter().find(|b| b.name == selector);
-            let defs: Vec<&volta_bench::BenchmarkDef> = if selector.eq_ignore_ascii_case("all") {
-                skip_race_check(suite.benchmarks.iter().collect())
-            } else if let Some(category) = parse_category(&selector) {
-                skip_race_check(suite.filter_category(category))
-            } else if let Some(def) = by_name {
-                vec![def]
-            } else {
-                eprintln!(
-                    "Unknown selector '{}' (not 'all', a category, or an exact benchmark name)",
-                    selector
-                );
-                log.record(&format!("z3-compare: unknown selector '{}'", selector));
-                return finish(log, ExitCode::FAILURE);
-            };
-            if let Err(code) = ensure_unique_slugs(defs.iter().copied(), &mut log) {
-                return finish(log, code);
-            }
-
-            let compare_options = Z3CompareOptions {
-                sample: cli.sample,
-                verify_numeric: cli.verify_numeric,
-                recycle_terms: cli.recycle_terms,
-                iterations: cli.iterations,
-                z3_timeout: volta_z3::timeout_from_secs(z3_timeout),
-                vcs_dir: runner_config.vcs_dir.clone(),
-            };
-            let kernels_dir = runner_config.kernels_dir.clone();
-
-            println!(
-                "solve columns: median of {} iteration(s); z3 elements whose iteration-1 \
-                 outcome is timeout/unsupported/error are solved once, with that time \
-                 charged to every iteration",
-                iterations
-            );
-            println!(
-                "{:<28} {:>8} {:>8} {:>8} {:>9}  {}",
-                "Benchmark",
-                "VCgen(s)",
-                "Dec(s)",
-                "Z3(s)",
-                "Decision",
-                "Z3: equiv/diff/unk/to/unsup/err"
-            );
-            println!("{}", "-".repeat(100));
-            let mut rows = Vec::new();
-            for def in &defs {
-                let row = volta_bench::compare_one(&kernels_dir, def, &compare_options);
-                if let Some(err) = &row.error {
-                    println!("{:<28} {}", row.name, err);
-                } else {
-                    println!(
-                        "{:<28} {:>8.3} {:>8.3} {:>8.3} {:>9}  {}",
-                        row.name,
-                        row.vc_gen_secs,
-                        row.decision_median_secs(),
-                        row.z3_median_secs(),
-                        row.decision_status,
-                        row.z3.compact(),
-                    );
-                    if let Some(rerun) = &row.z3_axiom {
-                        println!(
-                            "{:<28} {:>8} {:>8} {:>8.3} {:>9}  {}",
-                            "  +exp-axiom",
-                            "",
-                            "",
-                            results::median(&rerun.iters_secs).unwrap_or(0.0),
-                            "",
-                            rerun.counts.compact(),
-                        );
-                    }
-                }
-                rows.push(row);
-            }
-            let records = rows.iter().map(results::z3_row_record).collect();
-            write_results(
-                &out_dir,
-                &meta("z3-compare", Some(z3_timeout)),
-                records,
-                json.as_deref(),
-            );
-            let errors = rows.iter().filter(|r| r.error.is_some()).count();
-            log.record(&format!(
-                "z3-compare {}: {} row(s), {} error(s)",
-                selector,
-                rows.len(),
-                errors
-            ));
-            exit_by_pass(errors == 0)
         }
         Commands::List => {
             let suite = all_benchmarks();
@@ -521,20 +450,6 @@ fn finish(log: RunLog, code: ExitCode) -> ExitCode {
         eprintln!("log: {}", path.display());
     }
     code
-}
-
-/// Drop the race-check benchmarks (no optimized kernel), announcing how
-/// many were skipped so a `z3-compare all`/category run isn't silently
-/// short. Called only for the "all"/category selectors.
-fn skip_race_check(defs: Vec<&volta_bench::BenchmarkDef>) -> Vec<&volta_bench::BenchmarkDef> {
-    let (kept, skipped): (Vec<_>, Vec<_>) = defs.into_iter().partition(|d| d.optimized.is_some());
-    if !skipped.is_empty() {
-        println!(
-            "skipping {} race-check benchmark(s) (no optimized kernel)",
-            skipped.len()
-        );
-    }
-    kept
 }
 
 fn exit_by_pass(passed: bool) -> ExitCode {
