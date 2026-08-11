@@ -249,6 +249,22 @@ and record everything in one results document. Race-check benchmarks
 stop after generation (their whole analysis is the symbolic execution) -
 no dump, no solve phases, and no Z3 even under `--z3`.
 
+The pipeline's two halves also run separately, over the same `all`/
+`category <c>`/`single <name>` selectors: `generate` runs just the
+generation phase and writes the dumps (plus `vcs/manifest.json`, its
+record of what each dump contains), and `solve` replays just the solve
+phase(s) from those dumps - no parsing, lowering, or symbolic execution
+- with `--backend decision|z3|both` choosing the solver(s). Both halves
+call the same phase functions as the one-shot pipeline, so they measure
+and decide exactly the same things; see
+[Reproducing the paper](#reproducing-the-paper) for the intended
+workflow.
+
+```bash
+cargo run --release -p volta_bench -- generate category attention   # VCs + dumps only
+cargo run --release -p volta_bench -- solve category attention --sample 1
+```
+
 Useful flags (global):
 
 - `--sample N`: check at most N output elements per array (0 = all)
@@ -265,9 +281,17 @@ Useful flags (global):
   [Comparing against Z3](#comparing-against-z3)
 - `--out-dir <path>` (default `bench-out/`): where VC dumps and results
   JSON files land - same section
-- `--json <path>` (on `all`/`category`/`single`): *also* write the
+- `--json <path>` (on every run command): *also* write the
   results JSON document to this explicit path (the timestamped file under
   `<out-dir>/results/` is always written; both contain the same document)
+
+`--sample`, `--verify-numeric`, and `--recycle-terms` are solve-phase
+options: they apply to the one-shot commands and to `solve` (where
+`--verify-numeric` needs `--backend decision|both` - the oracle confirms
+decision-procedure verdicts), and `generate` notes and ignores them.
+`--z3` belongs to the one-shot commands only; `solve` picks its
+solver(s) with `--backend`. `--iterations` applies to whichever phases a
+command runs.
 
 `single` also prints a per-instruction-kind execution profile for both
 kernels automatically (matching `volta compare`'s default); `all`/`category`
@@ -278,6 +302,39 @@ At startup the binary prints loud stderr warnings when the environment
 would corrupt the timings: a build without optimizations (timings ~20x
 off - use `--release`) or, under the `logging` feature, a `--log-level`
 of `info` or above (log output is emitted from inside the timed phases).
+
+### Reproducing the paper
+
+The full evaluation is four commands: generate every benchmark's VCs
+once, then solve the same dumps three ways. Each command runs its own
+timed phase the default 10 `--iterations`.
+
+```bash
+# 1. Generate and dump every benchmark's VCs - the "Gen" timings; no solving.
+cargo run --release -p volta_bench -- generate all
+
+# 2. Decision-solve ALL elements from the dumps - the full-footprint "Solve" timings.
+cargo run --release -p volta_bench -- --recycle-terms 0 solve all
+
+# 3. Decision-solve one element per output array - the paper's sampled setting.
+cargo run --release -p volta_bench -- solve all --sample 1
+
+# 4. Z3 on the same sampled elements under a 10-minute budget - Table 8.
+cargo run --release -p volta_bench -- solve all --sample 1 --backend z3 --z3-timeout 600
+```
+
+Step 1 also settles the race table: Table 7 is static - verdicts, not
+solve timings - and those verdicts come from generation (race-check
+benchmarks' whole analysis is the symbolic execution), so they land in
+step 1's results file and `solve` skips those benchmarks with a note.
+Steps 2-4 never re-execute a kernel: they load `bench-out/vcs/*.vcdump`
+(validated on load, and checked against `bench-out/vcs/manifest.json` so
+a stale or mixed dump directory fails loudly instead of quietly solving
+the wrong VCs; the load time is reported as `dump_load_secs`, excluded
+from the solve timings). On a memory-limited machine, replace step 2
+with per-category `solve category <c>` runs under a positive
+`--recycle-terms` (see the memory note below) - step 2 as written wants
+the full-footprint attention working set.
 
 ### Timing, iterations, and output files
 
@@ -351,12 +408,20 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
 
   Race-check benchmarks have no VCs (nothing to compare); they are
   skipped with a console note.
+- `bench-out/vcs/manifest.json` - written by `generate` (read-modify-
+  write per dump, so partial regenerations keep the other entries):
+  each dump's benchmark name, generation timestamp, and per-array
+  footprint element counts. `solve` checks every dump it loads against
+  it and hard-errors on disagreement (a stale or mixed vcs directory);
+  a missing manifest or entry is only a warning, so hand-copied dumps
+  stay usable.
 - `bench-out/results/<unix-seconds>-<pid>-<command>.json` - the results
-  of every `all`/`category`/`single` run (timestamped like
+  of every run command (timestamped like
   the run logs, so runs never clobber each other). One schema for every
   run: a header (argv, timestamp, iterations, sample, recycle-terms,
   whether `--z3` was on plus its timeout and the iteration carve-out
-  convention), and one record per benchmark:
+  convention; `solve` headers add the `backend` and `vcs_from_dumps:
+  true`), and one record per benchmark:
 
   - identity and verdict: `name`, `category`, `status`, `detail`,
     `passed`, `elements_checked`/`elements_total`
@@ -373,6 +438,12 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
     otherwise the Z3 phase's results - see
     [Comparing against Z3](#comparing-against-z3)
   - instruction and sync counters
+
+  `generate` records carry only the identity/verdict and generation
+  fields (no solve fields - nothing was solved); `solve` records carry
+  only the identity/verdict and solve fields plus `dump_load_secs` (no
+  generation fields - the VCs came from dumps), with skipped race-check
+  benchmarks as `status: "SKIP"` records.
 
 ### Comparing against Z3
 

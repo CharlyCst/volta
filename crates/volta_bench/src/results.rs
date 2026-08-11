@@ -11,11 +11,17 @@
 //!   compare --dump-vcs`, so `volta compare --from-dump` replays them.
 //!   Overwritten on rerun (VCs are deterministic). Race-check benchmarks
 //!   have no VC and are skipped with a console note.
+//! - `vcs/manifest.json` - `generate`'s record of what each dump
+//!   contains; `solve`'s staleness guard (see `crate::manifest`).
 //! - `results/<unix-seconds>-<pid>-<command>.json` - the machine-readable
 //!   results for every run command, timestamped like
 //!   `volta_common::run_log` files so runs never clobber each other. The
 //!   `--json <path>` flag writes the same document to an explicit path in
-//!   addition.
+//!   addition. One-shot runs use the full record shape
+//!   ([`benchmark_record`]); `generate` runs drop the solve fields
+//!   ([`generate_record`]); `solve` runs drop the generation fields and
+//!   add `dump_load_secs` ([`solve_record`]), with skipped race checks as
+//!   [`skip_record`]s.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,6 +136,10 @@ pub struct RunMeta {
     pub recycle_terms: usize,
     /// `Some(per-query timeout)` exactly when the Z3 phase is enabled.
     pub z3_timeout_secs: Option<u64>,
+    /// `Some(backend name)` exactly for `solve` runs, whose VCs come
+    /// from dumps rather than fresh generation (the header records both
+    /// facts).
+    pub solve_backend: Option<&'static str>,
 }
 
 /// Insert one timed phase's stats: `<prefix>_iters_secs` (the full
@@ -223,10 +233,8 @@ fn z3_section(z3: Option<&Z3PhaseOutcome>) -> Value {
     }
 }
 
-/// One benchmark as a results-JSON record - the single record shape for
-/// every run command (`all`/`category`/`single`), with the Z3 phase as a
-/// nested `z3` section (null without `--z3`).
-pub fn benchmark_record(r: &BenchmarkResult) -> Value {
+/// The identity fields every record shape starts with.
+fn identity_fields(r: &BenchmarkResult) -> serde_json::Map<String, Value> {
     let mut obj = serde_json::Map::new();
     obj.insert("name".into(), json!(r.name));
     obj.insert("category".into(), json!(r.category.name()));
@@ -236,11 +244,22 @@ pub fn benchmark_record(r: &BenchmarkResult) -> Value {
         json!(crate::reporter::describe(&r.outcome)),
     );
     obj.insert("passed".into(), json!(r.passed));
-    obj.insert("elements_checked".into(), json!(r.stats.elements_checked));
-    obj.insert("elements_total".into(), json!(r.stats.elements_total));
-    insert_phase_stats(&mut obj, "vc_gen", &r.stats.vc_gen_iters_secs);
+    obj
+}
+
+/// The generation-phase fields (the one-shot and `generate` records).
+fn insert_gen_fields(obj: &mut serde_json::Map<String, Value>, r: &BenchmarkResult) {
+    insert_phase_stats(obj, "vc_gen", &r.stats.vc_gen_iters_secs);
     obj.insert("dump_write_secs".into(), json!(r.stats.dump_write_secs));
-    insert_phase_stats(&mut obj, "solve", &r.stats.solve_iters_secs);
+    obj.insert("instructions".into(), json!(r.stats.instructions));
+    obj.insert("block_syncs".into(), json!(r.stats.block_syncs));
+    obj.insert("warp_syncs".into(), json!(r.stats.warp_syncs));
+}
+
+/// The solve-phase fields (the one-shot and `solve` records).
+fn insert_solve_fields(obj: &mut serde_json::Map<String, Value>, r: &BenchmarkResult) {
+    obj.insert("elements_checked".into(), json!(r.stats.elements_checked));
+    insert_phase_stats(obj, "solve", &r.stats.solve_iters_secs);
     // The `--verify-numeric` oracle's time (iteration 1 only); null when
     // the flag was off. Kept out of the solve stats so those don't move
     // when the oracle is toggled.
@@ -265,11 +284,55 @@ pub fn benchmark_record(r: &BenchmarkResult) -> Value {
         .collect();
     obj.insert("decision_elements".into(), Value::Array(decision_elements));
     obj.insert("z3".into(), z3_section(r.z3.as_ref()));
-    obj.insert("instructions".into(), json!(r.stats.instructions));
-    obj.insert("block_syncs".into(), json!(r.stats.block_syncs));
-    obj.insert("warp_syncs".into(), json!(r.stats.warp_syncs));
+}
+
+/// One benchmark as a results-JSON record - the single record shape for
+/// every one-shot run command (`all`/`category`/`single`), with the Z3
+/// phase as a nested `z3` section (null without `--z3`).
+pub fn benchmark_record(r: &BenchmarkResult) -> Value {
+    let mut obj = identity_fields(r);
+    obj.insert("elements_total".into(), json!(r.stats.elements_total));
+    insert_gen_fields(&mut obj, r);
+    insert_solve_fields(&mut obj, r);
     obj.insert("dump_path".into(), json!(r.dump_path));
     Value::Object(obj)
+}
+
+/// A `generate` run's record: the one-shot shape minus every solve field
+/// (nothing was solved). `elements_total` is the generated footprint
+/// size; race-check benchmarks carry their real verdicts here - this is
+/// the record the race table comes from.
+pub fn generate_record(r: &BenchmarkResult) -> Value {
+    let mut obj = identity_fields(r);
+    obj.insert("elements_total".into(), json!(r.stats.elements_total));
+    insert_gen_fields(&mut obj, r);
+    obj.insert("dump_path".into(), json!(r.dump_path));
+    Value::Object(obj)
+}
+
+/// A `solve` run's record: the one-shot shape minus every generation
+/// field (VCs came from a dump; there are no gen timings or execution
+/// counters to report), plus `dump_load_secs` (the load is excluded from
+/// the solve spans). `dump_path` is the dump the VCs were read from.
+pub fn solve_record(r: &BenchmarkResult) -> Value {
+    let mut obj = identity_fields(r);
+    obj.insert("elements_total".into(), json!(r.stats.elements_total));
+    obj.insert("dump_load_secs".into(), json!(r.stats.dump_load_secs));
+    insert_solve_fields(&mut obj, r);
+    obj.insert("dump_path".into(), json!(r.dump_path));
+    Value::Object(obj)
+}
+
+/// A `solve` run's record for a benchmark it skipped (race checks:
+/// nothing to solve).
+pub fn skip_record(name: &str, category: crate::config::BenchmarkCategory, note: &str) -> Value {
+    json!({
+        "name": name,
+        "category": category.name(),
+        "status": "SKIP",
+        "detail": note,
+        "passed": true,
+    })
 }
 
 /// Assemble the full results document: run header + per-benchmark records.
@@ -289,6 +352,12 @@ pub fn results_doc(meta: &RunMeta, benchmarks: Vec<Value>) -> Value {
     doc.insert("sample".into(), json!(meta.sample));
     doc.insert("verify_numeric".into(), json!(meta.verify_numeric));
     doc.insert("recycle_terms".into(), json!(meta.recycle_terms));
+    if let Some(backend) = meta.solve_backend {
+        // A `solve` run: which backend(s) solved, and that the VCs were
+        // loaded from `generate`'s dumps rather than freshly generated.
+        doc.insert("backend".into(), json!(backend));
+        doc.insert("vcs_from_dumps".into(), json!(true));
+    }
     doc.insert("z3".into(), json!(meta.z3_timeout_secs.is_some()));
     if let Some(timeout) = meta.z3_timeout_secs {
         doc.insert("z3_timeout_secs".into(), json!(timeout));
@@ -447,6 +516,87 @@ mod tests {
         let record = benchmark_record(&result);
         assert_eq!(record["status"], json!("ERR"));
         assert_eq!(record["dump_path"], json!(dump));
+    }
+
+    /// The three record shapes partition the fields: `generate` records
+    /// carry the gen fields and no solve fields, `solve` records carry
+    /// the solve fields plus `dump_load_secs` and no gen fields, and the
+    /// one-shot record carries both (and no `dump_load_secs`).
+    #[test]
+    fn generate_and_solve_records_split_the_one_shot_shape() {
+        let mut result = result_with(crate::runner::ActualOutcome::VcsGenerated, true);
+        result.stats.vc_gen_iters_secs = vec![1.0, 2.0];
+        result.stats.dump_write_secs = Some(0.5);
+        result.stats.elements_total = 4;
+
+        let generated = generate_record(&result);
+        assert_eq!(generated["status"], json!("GEN"));
+        assert_eq!(generated["vc_gen_iters_secs"], json!([1.0, 2.0]));
+        assert_eq!(generated["dump_write_secs"], json!(0.5));
+        assert_eq!(generated["elements_total"], json!(4));
+        for solve_field in [
+            "solve_iters_secs",
+            "z3",
+            "elements_checked",
+            "dump_load_secs",
+        ] {
+            assert!(generated.get(solve_field).is_none(), "{solve_field}");
+        }
+
+        let mut result = result_with(crate::runner::ActualOutcome::Equivalent, true);
+        result.stats.solve_iters_secs = vec![3.0];
+        result.stats.dump_load_secs = Some(0.25);
+        result.stats.elements_checked = 4;
+        result.stats.elements_total = 4;
+
+        let solve = solve_record(&result);
+        assert_eq!(solve["status"], json!("EQUIV"));
+        assert_eq!(solve["solve_iters_secs"], json!([3.0]));
+        assert_eq!(solve["dump_load_secs"], json!(0.25));
+        assert_eq!(solve["elements_checked"], json!(4));
+        assert!(solve["z3"].is_null());
+        for gen_field in ["vc_gen_iters_secs", "dump_write_secs", "instructions"] {
+            assert!(solve.get(gen_field).is_none(), "{gen_field}");
+        }
+
+        // The one-shot record keeps its historical shape: both field
+        // sets, no dump_load_secs.
+        let one_shot = benchmark_record(&result);
+        assert!(one_shot.get("vc_gen_iters_secs").is_some());
+        assert!(one_shot.get("solve_iters_secs").is_some());
+        assert!(one_shot.get("dump_load_secs").is_none());
+
+        let skip = skip_record(
+            "Red-5 (racy)",
+            crate::config::BenchmarkCategory::Reduction,
+            "race-check benchmark",
+        );
+        assert_eq!(skip["status"], json!("SKIP"));
+        assert_eq!(skip["passed"], json!(true));
+    }
+
+    /// A solve run's header names the backend and that the VCs came from
+    /// dumps; other runs' headers carry neither key.
+    #[test]
+    fn results_doc_header_records_solve_backend() {
+        let mut meta = RunMeta {
+            command: "solve",
+            iterations: 10,
+            sample: 1,
+            verify_numeric: false,
+            recycle_terms: 0,
+            z3_timeout_secs: None,
+            solve_backend: Some("decision"),
+        };
+        let doc = results_doc(&meta, vec![]);
+        assert_eq!(doc["backend"], json!("decision"));
+        assert_eq!(doc["vcs_from_dumps"], json!(true));
+        assert_eq!(doc["z3"], json!(false));
+
+        meta.solve_backend = None;
+        let doc = results_doc(&meta, vec![]);
+        assert!(doc.get("backend").is_none());
+        assert!(doc.get("vcs_from_dumps").is_none());
     }
 
     /// The oracle-time bucket is `Some` exactly when `--verify-numeric`

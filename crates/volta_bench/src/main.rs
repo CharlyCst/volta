@@ -8,6 +8,8 @@
 //! cargo run --release -p volta_bench -- category reduction
 //! cargo run --release -p volta_bench -- --z3 category reduction
 //! cargo run --release -p volta_bench -- single "(Red-1, Red-2)"
+//! cargo run --release -p volta_bench -- generate all
+//! cargo run --release -p volta_bench -- solve all --sample 1 --backend z3
 //! cargo run --release -p volta_bench -- list
 //! ```
 
@@ -15,14 +17,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-#[cfg(feature = "logging")]
-use clap::ValueEnum;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use volta_analysis::driver::write_op_counts;
 use volta_bench::{
-    BenchmarkCategory, BenchmarkDef, BenchmarkRunner, KERNELS_DIR, RunnerConfig, Z3Options,
-    all_benchmarks, print_all_results, print_results_table, print_single_result, print_summary,
-    results,
+    BenchmarkCategory, BenchmarkDef, BenchmarkResult, BenchmarkRunner, KERNELS_DIR, RunnerConfig,
+    SolveBackend, SolveItem, TableMode, Z3Options, all_benchmarks, print_all_results,
+    print_results_table, print_single_result, print_summary, results,
 };
 use volta_common::run_log::RunLog;
 
@@ -150,8 +150,71 @@ enum Commands {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Generate and dump VCs without solving them (the pipeline's
+    /// generation phase, x --iterations); race-check benchmarks run to
+    /// their real verdicts here. Writes <out-dir>/vcs/<slug>.vcdump and
+    /// updates <out-dir>/vcs/manifest.json; `solve` runs from these
+    Generate {
+        #[command(subcommand)]
+        target: Target,
+        /// Also write the results document to this explicit path (the
+        /// timestamped file under <out-dir>/results/ is always written)
+        #[arg(long, global = true)]
+        json: Option<PathBuf>,
+    },
+    /// Solve previously generated VC dumps (see `generate`), x
+    /// --iterations - no parsing, lowering, or symbolic execution.
+    /// Race-check benchmarks are skipped (their verdicts come from
+    /// `generate`)
+    Solve {
+        #[command(subcommand)]
+        target: Target,
+        /// Which backend(s) to solve with: the decision procedure, z3
+        /// (no decision verdict; the z3 outcomes are the data), or both
+        /// side by side. --verify-numeric confirms decision-procedure
+        /// verdicts, so it needs decision|both
+        #[arg(long, global = true, value_enum, default_value_t = BackendArg::Decision)]
+        backend: BackendArg,
+        /// Also write the results document to this explicit path (the
+        /// timestamped file under <out-dir>/results/ is always written)
+        #[arg(long, global = true)]
+        json: Option<PathBuf>,
+    },
     /// List all benchmarks
     List,
+}
+
+/// Which benchmarks a `generate`/`solve` run covers - the same selectors
+/// as the one-shot commands.
+#[derive(Subcommand)]
+enum Target {
+    /// All benchmarks
+    All,
+    /// One category
+    Category {
+        /// reduction | matmul | attention | causal | conv | agent | tilelang | race
+        category: String,
+    },
+    /// A single benchmark by name
+    Single { name: String },
+}
+
+/// `--backend` for `solve` (clap surface of [`SolveBackend`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BackendArg {
+    Decision,
+    Z3,
+    Both,
+}
+
+impl From<BackendArg> for SolveBackend {
+    fn from(arg: BackendArg) -> Self {
+        match arg {
+            BackendArg::Decision => Self::Decision,
+            BackendArg::Z3 => Self::Z3,
+            BackendArg::Both => Self::Both,
+        }
+    }
 }
 
 /// Loud stderr warnings for environments that make the timed phases
@@ -269,6 +332,8 @@ fn main() -> ExitCode {
         Commands::All { .. } => "run-all",
         Commands::Category { .. } => "category",
         Commands::Single { .. } => "single",
+        Commands::Generate { .. } => "generate",
+        Commands::Solve { .. } => "solve",
         Commands::List => "list",
     };
     let mut log = RunLog::open(&cli.log_dir, command_name, cli.no_log_file);
@@ -291,16 +356,19 @@ fn main() -> ExitCode {
     let out_dir = cli.out_dir.clone();
     let iterations = cli.iterations;
     let z3_timeout_secs = cli.z3.then_some(cli.z3_timeout);
-    let meta = results::RunMeta {
+    // `mut`: the `solve` arm records its backend (and derives the Z3
+    // phase from it rather than from `--z3`).
+    let mut meta = results::RunMeta {
         command: command_name,
         iterations: iterations.get(),
         sample: cli.sample,
         verify_numeric: cli.verify_numeric,
         recycle_terms: cli.recycle_terms,
         z3_timeout_secs,
+        solve_backend: None,
     };
 
-    let runner_config = RunnerConfig {
+    let mut runner_config = RunnerConfig {
         kernels_dir: cli
             .kernels_dir
             .unwrap_or_else(|| PathBuf::from(KERNELS_DIR)),
@@ -337,6 +405,7 @@ fn main() -> ExitCode {
                 &run_results,
                 iterations.get(),
                 cli.z3,
+                TableMode::Combined,
             ));
             let passed = run_results.iter().filter(|r| r.passed).count();
             log.record(&format!(
@@ -385,6 +454,7 @@ fn main() -> ExitCode {
                 category,
                 iterations.get(),
                 cli.z3,
+                TableMode::Combined,
             ));
             print_stdout(print_summary(&mut stdout, &run_results));
             let passed = run_results.iter().filter(|r| r.passed).count();
@@ -436,6 +506,162 @@ fn main() -> ExitCode {
             ));
             exit_by_pass(result.passed)
         }
+        Commands::Generate { target, json } => {
+            if cli.z3 {
+                eprintln!(
+                    "--z3 does not apply to `generate` (nothing is solved); use the \
+                     one-shot commands, or `solve --backend z3|both` on the dumps"
+                );
+                log.record("generate: rejected --z3");
+                return finish(log, ExitCode::FAILURE);
+            }
+            // Solve-phase flags don't change what `generate` produces;
+            // say so instead of silently ignoring them.
+            let mut ignored = Vec::new();
+            if cli.sample != 0 {
+                ignored.push("--sample");
+            }
+            if cli.verify_numeric {
+                ignored.push("--verify-numeric");
+            }
+            if cli.recycle_terms != volta_analysis::equiv::DEFAULT_RECYCLE_TERMS {
+                ignored.push("--recycle-terms");
+            }
+            if !ignored.is_empty() {
+                eprintln!(
+                    "note: {} ignored by `generate` (solve-phase options; pass them \
+                     to `solve`)",
+                    ignored.join(", ")
+                );
+            }
+            let defs = match resolve_target(&target, "generate", &mut log) {
+                Ok(defs) => defs,
+                Err(code) => return finish(log, code),
+            };
+            if let Err(code) = ensure_unique_slugs(&defs, &mut log) {
+                return finish(log, code);
+            }
+            println_tolerant(format!(
+                "Generating VCs for {} benchmark(s) into {} ...",
+                defs.len(),
+                out_dir.join("vcs").display()
+            ));
+            let runner = BenchmarkRunner::new(runner_config);
+            let run_results = runner.generate_all(&defs);
+            // Results files first, console tables second: a broken pipe
+            // must not lose the files.
+            let records = run_results.iter().map(results::generate_record).collect();
+            write_results(&out_dir, &meta, records, json.as_deref());
+            print_phase_results(
+                &run_results,
+                &target,
+                iterations.get(),
+                false,
+                TableMode::GenerateOnly,
+            );
+            let passed = run_results.iter().filter(|r| r.passed).count();
+            log.record(&format!(
+                "generate: {}/{} benchmarks passed",
+                passed,
+                run_results.len()
+            ));
+            exit_by_pass(passed == run_results.len())
+        }
+        Commands::Solve {
+            target,
+            backend,
+            json,
+        } => {
+            if cli.z3 {
+                eprintln!(
+                    "--z3 does not apply to `solve`; pick the backend with \
+                     `--backend decision|z3|both`"
+                );
+                log.record("solve: rejected --z3");
+                return finish(log, ExitCode::FAILURE);
+            }
+            let backend = SolveBackend::from(backend);
+            if cli.verify_numeric && !backend.runs_decision() {
+                eprintln!(
+                    "note: --verify-numeric confirms decision-procedure verdicts; \
+                     it has no effect with --backend z3"
+                );
+            }
+            let defs = match resolve_target(&target, "solve", &mut log) {
+                Ok(defs) => defs,
+                Err(code) => return finish(log, code),
+            };
+            if let Err(code) = ensure_unique_slugs(&defs, &mut log) {
+                return finish(log, code);
+            }
+            // The Z3 phase follows the backend, not `--z3`; the header
+            // records the backend and that VCs come from dumps.
+            meta.solve_backend = Some(backend.name());
+            meta.z3_timeout_secs = backend.runs_z3().then_some(cli.z3_timeout);
+            runner_config.z3 = backend.runs_z3().then(|| Z3Options {
+                timeout: volta_z3::timeout_from_secs(cli.z3_timeout),
+            });
+            if backend.runs_z3() {
+                announce_z3(iterations);
+            }
+            println_tolerant(format!(
+                "Solving {} benchmark(s) from dumps in {} ...",
+                defs.len(),
+                out_dir.join("vcs").display()
+            ));
+            let runner = BenchmarkRunner::new(runner_config);
+            let items = match runner.solve_suite(&defs, backend) {
+                Ok(items) => items,
+                Err(e) => {
+                    eprintln!("{:#}", e);
+                    log.record(&format!("solve: {:#}", e));
+                    return finish(log, ExitCode::FAILURE);
+                }
+            };
+            // Results files first, console tables second: a broken pipe
+            // must not lose the files.
+            let records = items
+                .iter()
+                .map(|item| match item {
+                    SolveItem::Solved(r) => results::solve_record(r),
+                    SolveItem::Skipped { name, category } => {
+                        results::skip_record(name, *category, volta_bench::RACE_SKIP_NOTE)
+                    }
+                })
+                .collect();
+            write_results(&out_dir, &meta, records, json.as_deref());
+            let solved: Vec<BenchmarkResult> = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    SolveItem::Solved(r) => Some(r),
+                    SolveItem::Skipped { .. } => None,
+                })
+                .collect();
+            let skipped = defs.len() - solved.len();
+            print_phase_results(
+                &solved,
+                &target,
+                iterations.get(),
+                backend.runs_z3(),
+                TableMode::SolveOnly,
+            );
+            if solved.is_empty() {
+                println_tolerant(format!(
+                    "Nothing to solve: all {} selected benchmark(s) are race checks \
+                     (their verdicts come from `volta-bench generate`)",
+                    skipped
+                ));
+            }
+            let passed = solved.iter().filter(|r| r.passed).count();
+            log.record(&format!(
+                "solve[{}]: {}/{} solved benchmarks passed, {} skipped",
+                backend.name(),
+                passed,
+                solved.len(),
+                skipped
+            ));
+            exit_by_pass(passed == solved.len())
+        }
         Commands::List => {
             let suite = all_benchmarks();
             for category in suite.categories() {
@@ -467,6 +693,86 @@ fn exit_by_pass(passed: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Resolve a `generate`/`solve` target to its benchmark list, with the
+/// same console errors as the one-shot commands on an unknown category
+/// or benchmark name.
+fn resolve_target(
+    target: &Target,
+    command: &str,
+    log: &mut RunLog,
+) -> Result<Vec<BenchmarkDef>, ExitCode> {
+    let suite = all_benchmarks();
+    match target {
+        Target::All => Ok(suite.benchmarks),
+        Target::Category { category } => {
+            let Some(parsed) = parse_category(category) else {
+                eprintln!("Unknown category: {}", category);
+                eprintln!(
+                    "Available: reduction, matmul, attention, causal, conv, agent, tilelang, race"
+                );
+                log.record(&format!("{}: unknown category '{}'", command, category));
+                return Err(ExitCode::FAILURE);
+            };
+            Ok(suite.filter_category(parsed).into_iter().cloned().collect())
+        }
+        Target::Single { name } => match suite.benchmarks.iter().find(|b| b.name == *name) {
+            Some(def) => Ok(vec![def.clone()]),
+            None => {
+                eprintln!("Benchmark not found: {}", name);
+                eprintln!("Use 'volta-bench list' to see available benchmarks.");
+                log.record(&format!("{}: benchmark not found '{}'", command, name));
+                Err(ExitCode::FAILURE)
+            }
+        },
+    }
+}
+
+/// Console presentation for a `generate`/`solve` run: category tables
+/// (plus summary) for `all`/`category` targets, the detailed
+/// single-benchmark report for `single` - mirroring the one-shot
+/// commands' presentation.
+fn print_phase_results(
+    results: &[BenchmarkResult],
+    target: &Target,
+    iterations: usize,
+    z3: bool,
+    mode: TableMode,
+) {
+    let mut stdout = std::io::stdout().lock();
+    match target {
+        Target::All | Target::Category { .. } => {
+            print_stdout(print_all_results(
+                &mut stdout,
+                results,
+                iterations,
+                z3,
+                mode,
+            ));
+        }
+        Target::Single { .. } => {
+            // Empty exactly when the one selected benchmark was skipped
+            // (a race check under `solve`); the skip note already printed.
+            let Some(result) = results.first() else {
+                return;
+            };
+            print_stdout(print_single_result(&mut stdout, result));
+            // Execution profiles exist only when this run executed the
+            // kernels (`generate`); `write_op_counts` skips empty maps.
+            print_stdout(
+                write_op_counts(&mut stdout, "reference", &result.stats.reference_op_counts)
+                    .map_err(anyhow::Error::from),
+            );
+            print_stdout(
+                write_op_counts(&mut stdout, "optimized", &result.stats.optimized_op_counts)
+                    .map_err(anyhow::Error::from),
+            );
+            if !result.passed {
+                print_stdout(print_summary(&mut stdout, std::slice::from_ref(result)));
+            }
+        }
     }
 }
 

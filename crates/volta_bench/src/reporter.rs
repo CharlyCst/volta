@@ -9,55 +9,125 @@ use crate::config::BenchmarkCategory;
 use crate::runner::{ActualOutcome, BenchmarkResult};
 use crate::z3_phase::Z3PhaseOutcome;
 
-/// Print one category's results as a table (paper-style columns, plus Z3
-/// columns when the run had a Z3 phase). "Gen (s)" and "Solve (s)" (and
-/// "Z3 (s)") are *medians* across the run's `iterations` (noted on the
-/// header line).
+/// Which of the pipeline's timed phases a run performed - decides the
+/// table's timing columns. Everything else (status, Z3 sub-rows, failure
+/// lines) is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableMode {
+    /// The one-shot commands: generation and solve columns.
+    Combined,
+    /// `generate`: generation columns only (nothing was solved; Elems is
+    /// the generated footprint size).
+    GenerateOnly,
+    /// `solve`: dump-load and solve columns only (nothing was generated).
+    SolveOnly,
+}
+
+impl TableMode {
+    /// The bracketed note after the table title, naming the timing
+    /// columns that are medians.
+    fn header_note(self, iterations: usize) -> String {
+        match self {
+            Self::Combined => format!("[Gen/Solve (s): median of {} iteration(s)]", iterations),
+            Self::GenerateOnly => format!(
+                "[Gen (s): median of {} iteration(s); VCs dumped, not solved]",
+                iterations
+            ),
+            Self::SolveOnly => format!(
+                "[Solve (s): median of {} iteration(s); VCs loaded from dumps]",
+                iterations
+            ),
+        }
+    }
+}
+
+/// Print one category's results as a table (paper-style columns per
+/// [`TableMode`], plus Z3 columns when the run had a Z3 phase). "Gen (s)"
+/// and "Solve (s)" (and "Z3 (s)") are *medians* across the run's
+/// `iterations` (noted on the header line).
 pub fn print_results_table(
     out: &mut impl Write,
     results: &[BenchmarkResult],
     category: BenchmarkCategory,
     iterations: usize,
     z3: bool,
+    mode: TableMode,
 ) -> Result<()> {
     writeln!(
         out,
-        "\n{} ({}) [Gen/Solve (s): median of {} iteration(s)]",
+        "\n{} ({}) {}",
         category.name(),
         category.table_ref(),
-        iterations
+        mode.header_note(iterations)
     )?;
-    write!(
-        out,
-        "{:<28} {:>7} {:>9} {:>9} {:>11} {:>11} {:>9}",
-        "Benchmark", "Status", "Gen (s)", "Solve (s)", "#BlockSync", "#WarpSync", "Elems"
-    )?;
+    let mut width = 28 + 8;
+    write!(out, "{:<28} {:>7}", "Benchmark", "Status")?;
+    if mode != TableMode::SolveOnly {
+        write!(out, " {:>9}", "Gen (s)")?;
+        width += 10;
+    }
+    if mode == TableMode::SolveOnly {
+        write!(out, " {:>9}", "Load (s)")?;
+        width += 10;
+    }
+    if mode != TableMode::GenerateOnly {
+        write!(out, " {:>9}", "Solve (s)")?;
+        width += 10;
+    }
+    if mode != TableMode::SolveOnly {
+        write!(out, " {:>11} {:>11}", "#BlockSync", "#WarpSync")?;
+        width += 24;
+    }
+    write!(out, " {:>9}", "Elems")?;
+    width += 10;
+    // Everything before the Z3 columns - the `+exp-axiom` sub-rows pad
+    // to here so their Z3 cells align with the main rows'.
+    let pre_z3_width = width;
     if z3 {
         write!(
             out,
             " {:>9}  {}",
             "Z3 (s)", "Z3: equiv/diff/unk/to/unsup/err"
         )?;
+        width += 43;
     }
     writeln!(out)?;
-    writeln!(out, "{}", "-".repeat(if z3 { 133 } else { 90 }))?;
+    writeln!(out, "{}", "-".repeat(width))?;
     for r in results.iter().filter(|r| r.category == category) {
-        let elems = if r.stats.elements_checked == r.stats.elements_total {
+        let elems = if mode == TableMode::GenerateOnly
+            || r.stats.elements_checked == r.stats.elements_total
+        {
             format!("{}", r.stats.elements_total)
         } else {
             format!("{}/{}", r.stats.elements_checked, r.stats.elements_total)
         };
-        write!(
-            out,
-            "{:<28} {:>7} {:>9.2} {:>9.3} {:>11} {:>11} {:>9}",
-            r.name,
-            r.outcome.status(),
-            r.stats.vc_gen_median_secs(),
-            r.stats.solve_median_secs(),
-            r.stats.block_syncs,
-            r.stats.warp_syncs,
-            elems,
-        )?;
+        write!(out, "{:<28} {:>7}", r.name, r.outcome.status())?;
+        if mode != TableMode::SolveOnly {
+            write!(out, " {:>9.2}", r.stats.vc_gen_median_secs())?;
+        }
+        if mode == TableMode::SolveOnly {
+            match r.stats.dump_load_secs {
+                Some(secs) => write!(out, " {:>9.3}", secs)?,
+                None => write!(out, " {:>9}", "-")?,
+            }
+        }
+        if mode != TableMode::GenerateOnly {
+            // A z3-only solve has no decision iterations: show a dash,
+            // not a fabricated 0.000.
+            if r.stats.solve_iters_secs.is_empty() && mode == TableMode::SolveOnly {
+                write!(out, " {:>9}", "-")?;
+            } else {
+                write!(out, " {:>9.3}", r.stats.solve_median_secs())?;
+            }
+        }
+        if mode != TableMode::SolveOnly {
+            write!(
+                out,
+                " {:>11} {:>11}",
+                r.stats.block_syncs, r.stats.warp_syncs
+            )?;
+        }
+        write!(out, " {:>9}", elems)?;
         if z3 {
             match &r.z3 {
                 Some(Z3PhaseOutcome::Ran(phase)) => write!(
@@ -77,16 +147,11 @@ pub fn print_results_table(
         {
             writeln!(
                 out,
-                "{:<28} {:>7} {:>9} {:>9} {:>11} {:>11} {:>9} {:>9.3}  {}",
+                "{:<pad$} {:>9.3}  {}",
                 "  +exp-axiom",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
                 axiom.median_secs(),
                 axiom.counts.compact(),
+                pad = pre_z3_width,
             )?;
         }
         if let Some(Z3PhaseOutcome::Failed(message)) = &r.z3 {
@@ -105,10 +170,11 @@ pub fn print_all_results(
     results: &[BenchmarkResult],
     iterations: usize,
     z3: bool,
+    mode: TableMode,
 ) -> Result<()> {
     for category in BenchmarkCategory::all() {
         if results.iter().any(|r| r.category == category) {
-            print_results_table(out, results, category, iterations, z3)?;
+            print_results_table(out, results, category, iterations, z3, mode)?;
         }
     }
     print_summary(out, results)
@@ -132,19 +198,28 @@ pub fn print_summary(out: &mut impl Write, results: &[BenchmarkResult]) -> Resul
     Ok(())
 }
 
-/// The `single` command's detailed report for one benchmark.
+/// The `single` command's detailed report for one benchmark (also used
+/// by `generate single`/`solve single`; phases that didn't run print no
+/// line).
 pub fn print_single_result(out: &mut impl Write, result: &BenchmarkResult) -> Result<()> {
     writeln!(out, "Status:  {}", result.outcome.status())?;
     writeln!(out, "Detail:  {}", describe(&result.outcome))?;
     writeln!(out, "Passed:  {}", if result.passed { "yes" } else { "no" })?;
-    writeln!(
-        out,
-        "VC gen:  {:.3}s median of {} iteration(s) (lowering + exec + footprint pairing)",
-        result.stats.vc_gen_median_secs(),
-        result.stats.vc_gen_iters_secs.len(),
-    )?;
-    // Race-check benchmarks (and failed runs) have no solve phase; don't
+    // `solve` runs (and failed runs) have no generation phase; don't
     // print a "0.000s median of 0 iteration(s)" line.
+    if !result.stats.vc_gen_iters_secs.is_empty() {
+        writeln!(
+            out,
+            "VC gen:  {:.3}s median of {} iteration(s) (lowering + exec + footprint pairing)",
+            result.stats.vc_gen_median_secs(),
+            result.stats.vc_gen_iters_secs.len(),
+        )?;
+    }
+    if let Some(secs) = result.stats.dump_load_secs {
+        writeln!(out, "VC load: {:.3}s (excluded from solve times)", secs)?;
+    }
+    // Race-check benchmarks (and failed or z3-only runs) have no
+    // decision-solve phase; same rule.
     if !result.stats.solve_iters_secs.is_empty() {
         writeln!(
             out,
@@ -180,12 +255,16 @@ pub fn print_single_result(out: &mut impl Write, result: &BenchmarkResult) -> Re
     if let Some(path) = &result.dump_path {
         writeln!(out, "VC dump: {}", path.display())?;
     }
-    writeln!(out, "Instrs:  {}", result.stats.instructions)?;
-    writeln!(
-        out,
-        "Syncs:   {} block, {} warp",
-        result.stats.block_syncs, result.stats.warp_syncs
-    )?;
+    // Execution counters exist only when this run executed the kernels;
+    // a `solve` run (VCs from a dump) has none to report.
+    if !result.stats.vc_gen_iters_secs.is_empty() {
+        writeln!(out, "Instrs:  {}", result.stats.instructions)?;
+        writeln!(
+            out,
+            "Syncs:   {} block, {} warp",
+            result.stats.block_syncs, result.stats.warp_syncs
+        )?;
+    }
     writeln!(
         out,
         "Elems:   {} checked of {}",
@@ -202,6 +281,10 @@ pub fn describe(outcome: &ActualOutcome) -> String {
         }
         ActualOutcome::Rejected { description, .. } => description.clone(),
         ActualOutcome::RaceFree => "race-free".to_string(),
+        ActualOutcome::VcsGenerated => {
+            "VCs generated and dumped (not solved; run `volta-bench solve`)".to_string()
+        }
+        ActualOutcome::Z3Only => "z3 comparison only (no decision-procedure verdict)".to_string(),
         ActualOutcome::Error { message } => message.clone(),
     }
 }

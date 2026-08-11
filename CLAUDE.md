@@ -322,7 +322,8 @@ Benchmark definitions with full launch/param configs live in
 category <reduction|matmul|attention|causal|conv|agent|tilelang|race>
 [--sample N] [--verify-numeric] [--recycle-terms N] [--iterations N]
 [--z3] [--z3-timeout N] [--out-dir DIR]` (also `all`, `single <name>`,
-`list`; release mode matters: ~20x, and the binary prints loud stderr
+`list`, and the phase-decoupled `generate`/`solve` below; release mode
+matters: ~20x, and the binary prints loud stderr
 warnings at startup for a debug build or, under the `logging` feature,
 a `--log-level` of info+ - both corrupt timings).
 
@@ -363,6 +364,33 @@ its budget); Z3 verdict counts and per-element results always come from
 iteration 1. A Z3 phase *failure* (not an unknown/timeout verdict -
 those are data) fails the benchmark (`Z3PhaseOutcome::Failed`). Paper
 Table 8 reproduction: `--sample 1 --z3 --z3-timeout 600 all`.
+
+The pipeline's halves also run separately, calling the same phase
+functions (no duplicated pipeline): `generate <all|category <c>|single
+<name>>` runs the generation half only (`generate_inner`: fingerprint
+check, dump write) and records each dump in `vcs/manifest.json`
+(`src/manifest.rs`: benchmark name, timestamp, per-array footprint
+element counts; read-modify-write per dump, so partial regenerations
+keep other entries) - race-check benchmarks reach their real verdicts
+here, so the race table comes from a `generate` run; equivalence
+benchmarks report `GEN` (`ActualOutcome::VcsGenerated`) and a failed
+dump/manifest write fails them (the dump is the product). `solve
+<target> [--backend decision|z3|both]` (`src/solve.rs`) replays the
+solve phase(s) from the dumps via `check_equivalence`/`run_z3_phase`:
+dumps load through the shared validated reader (`dump_load_secs`
+recorded, excluded from solve timings), a missing dump or a
+manifest/dump disagreement (the stale/mixed-vcs-dir guard; missing
+manifest = warning only) is a per-benchmark failure naming `generate`,
+race benchmarks are skipped with a note, and `--backend z3` yields no
+decision verdict (`ActualOutcome::Z3Only`: passing = the phase
+completed). `--sample`/`--verify-numeric` (decision|both only)/
+`--recycle-terms` apply to `solve`; `--z3` is one-shot-only and both
+new subcommands reject it. Records split accordingly: `generate`
+records carry gen fields only, `solve` records carry solve fields plus
+`dump_load_secs`, and the header adds `backend` + `vcs_from_dumps`.
+Paper workflow: `generate all`, then `--recycle-terms 0 solve all`,
+`solve all --sample 1`, `solve all --sample 1 --backend z3
+--z3-timeout 600` (Table 8; Table 7 is static, from `generate`).
 
 Output files under `--out-dir` (default `bench-out/`, gitignored):
 `vcs/<sanitized-name>.vcdump` per equivalence benchmark (written via the
