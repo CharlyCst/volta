@@ -698,6 +698,7 @@ dependencies = [
  "stacker",
  "thiserror",
  "volta_analysis",
+ "volta_frontend",
 ]
 
 [[package]]
