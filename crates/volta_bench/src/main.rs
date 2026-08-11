@@ -149,6 +149,46 @@ enum Commands {
     },
 }
 
+/// Refuse to run a benchmark set whose names collide under the VC-dump
+/// slug sanitization: `sanitize_name` is many-to-one and dumps overwrite
+/// by slug, so a colliding set would silently clobber one benchmark's
+/// dump with another's. Prints both offending names and fails the run
+/// before anything executes.
+fn ensure_unique_slugs<'a>(
+    defs: impl IntoIterator<Item = &'a volta_bench::BenchmarkDef>,
+    log: &mut RunLog,
+) -> Result<(), ExitCode> {
+    match results::check_slug_collisions(defs.into_iter().map(|d| d.name.as_str())) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("{:#}", e);
+            log.record(&format!("{:#}", e));
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Handle a stdout print result: ignore a broken pipe (`volta-bench ...
+/// | head` closes stdout early, and the run must carry on so the results
+/// files still get written), panic on any other write failure.
+fn print_stdout(result: anyhow::Result<()>) {
+    match result {
+        Ok(()) => {}
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe) => {}
+        Err(e) => panic!("failed to write to stdout: {:#}", e),
+    }
+}
+
+/// One stdout line under the [`print_stdout`] broken-pipe policy - for
+/// the `all`/`category` progress and results-path lines, which must not
+/// panic before (or between) the results-file writes.
+fn println_tolerant(line: String) {
+    use std::io::Write;
+    print_stdout(writeln!(std::io::stdout(), "{line}").map_err(anyhow::Error::from));
+}
+
 /// Write the results document: always to the timestamped file under
 /// `<out_dir>/results/`, and additionally to the explicit `--json` path
 /// when given. Failures warn rather than abort - a full disk should not
@@ -161,12 +201,12 @@ fn write_results(
 ) {
     let doc = results::results_doc(meta, records);
     match results::write_results_file(out_dir, meta.command, &doc) {
-        Ok(path) => println!("Results written to {}", path.display()),
+        Ok(path) => println_tolerant(format!("Results written to {}", path.display())),
         Err(e) => eprintln!("warning: {:#}", e),
     }
     if let Some(path) = json {
         match results::write_results_to(path, &doc) {
-            Ok(()) => println!("Results exported to {}", path.display()),
+            Ok(()) => println_tolerant(format!("Results exported to {}", path.display())),
             Err(e) => eprintln!("warning: {:#}", e),
         }
     }
@@ -224,13 +264,22 @@ fn main() -> ExitCode {
     let code = match cli.command {
         Commands::All { json } => {
             let suite = all_benchmarks();
-            println!("Running {} benchmarks...", suite.benchmarks.len());
+            if let Err(code) = ensure_unique_slugs(&suite.benchmarks, &mut log) {
+                return finish(log, code);
+            }
+            println_tolerant(format!("Running {} benchmarks...", suite.benchmarks.len()));
             let runner = BenchmarkRunner::new(runner_config);
             let run_results = runner.run_all(&suite.benchmarks);
-            let mut stdout = std::io::stdout();
-            print_all_results(&mut stdout, &run_results, iterations.get()).unwrap();
+            // Results files first, console tables second: a broken pipe
+            // must not lose the files.
             let records = run_results.iter().map(results::benchmark_record).collect();
             write_results(&out_dir, &meta("run-all", None), records, json.as_deref());
+            let mut stdout = std::io::stdout();
+            print_stdout(print_all_results(
+                &mut stdout,
+                &run_results,
+                iterations.get(),
+            ));
             let passed = run_results.iter().filter(|r| r.passed).count();
             log.record(&format!(
                 "run-all: {}/{} benchmarks passed",
@@ -254,18 +303,28 @@ fn main() -> ExitCode {
                 .into_iter()
                 .cloned()
                 .collect();
-            println!(
+            if let Err(code) = ensure_unique_slugs(&filtered, &mut log) {
+                return finish(log, code);
+            }
+            println_tolerant(format!(
                 "Running {} benchmarks for {}...",
                 filtered.len(),
                 category.name()
-            );
+            ));
             let runner = BenchmarkRunner::new(runner_config);
             let run_results = runner.run_all(&filtered);
-            let mut stdout = std::io::stdout();
-            print_results_table(&mut stdout, &run_results, category, iterations.get()).unwrap();
-            print_summary(&mut stdout, &run_results).unwrap();
+            // Results files first, console tables second: a broken pipe
+            // must not lose the files.
             let records = run_results.iter().map(results::benchmark_record).collect();
             write_results(&out_dir, &meta("category", None), records, json.as_deref());
+            let mut stdout = std::io::stdout();
+            print_stdout(print_results_table(
+                &mut stdout,
+                &run_results,
+                category,
+                iterations.get(),
+            ));
+            print_stdout(print_summary(&mut stdout, &run_results));
             let passed = run_results.iter().filter(|r| r.passed).count();
             log.record(&format!(
                 "category {}: {}/{} benchmarks passed",
@@ -297,11 +356,15 @@ fn main() -> ExitCode {
                 "VC gen:  {:.2}s (exec + footprint pairing)",
                 result.stats.vc_gen_secs
             );
-            println!(
-                "Solve:   {:.3}s median of {} iteration(s)",
-                result.stats.vc_secs,
-                result.stats.solve_iters_secs.len()
-            );
+            // Race-check benchmarks (and failed runs) have no solve
+            // phase; don't print a "0.000s median of 0 iteration(s)" line.
+            if !result.stats.solve_iters_secs.is_empty() {
+                println!(
+                    "Solve:   {:.3}s median of {} iteration(s)",
+                    result.stats.vc_secs,
+                    result.stats.solve_iters_secs.len()
+                );
+            }
             if let Some(path) = &result.dump_path {
                 println!("VC dump: {}", path.display());
             }
@@ -359,6 +422,9 @@ fn main() -> ExitCode {
                 log.record(&format!("z3-compare: unknown selector '{}'", selector));
                 return finish(log, ExitCode::FAILURE);
             };
+            if let Err(code) = ensure_unique_slugs(defs.iter().copied(), &mut log) {
+                return finish(log, code);
+            }
 
             let compare_options = Z3CompareOptions {
                 sample: cli.sample,

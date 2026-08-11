@@ -51,6 +51,31 @@ pub fn vc_dump_path(vcs_dir: &Path, benchmark_name: &str) -> PathBuf {
     vcs_dir.join(format!("{}.vcdump", sanitize_name(benchmark_name)))
 }
 
+/// Reject a benchmark set whose names collide under [`sanitize_name`]:
+/// sanitization is many-to-one ("(Red-1, Red-2)" and "Red 1 Red 2" both
+/// slug to "red-1-red-2"), and VC dumps are keyed by slug and overwrite
+/// silently, so a colliding set would clobber one benchmark's dump with
+/// another's. The error names both offenders. Run this wherever a run's
+/// benchmark set is known, before anything is written.
+pub fn check_slug_collisions<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut by_slug: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for name in names {
+        match by_slug.entry(sanitize_name(name)) {
+            std::collections::hash_map::Entry::Occupied(entry) => anyhow::bail!(
+                "benchmark names '{}' and '{}' both sanitize to VC-dump slug '{}'; \
+                 their dumps would overwrite each other - rename one of them",
+                entry.get(),
+                name,
+                entry.key(),
+            ),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(name);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Median of the samples (mean of the two middle values for even counts);
 /// `None` for an empty slice.
 pub fn median(xs: &[f64]) -> Option<f64> {
@@ -118,6 +143,13 @@ pub fn benchmark_record(r: &BenchmarkResult) -> Value {
     obj.insert("vc_gen_secs".into(), json!(r.stats.vc_gen_secs));
     obj.insert("dump_write_secs".into(), json!(r.stats.dump_write_secs));
     insert_solve_stats(&mut obj, "solve", &r.stats.solve_iters_secs);
+    // The `--verify-numeric` oracle's time (iteration 1 only); null when
+    // the flag was off. Kept out of the solve stats so those don't move
+    // when the oracle is toggled.
+    obj.insert(
+        "verify_numeric_secs".into(),
+        json!(r.stats.verify_numeric_secs),
+    );
     obj.insert("instructions".into(), json!(r.stats.instructions));
     obj.insert("block_syncs".into(), json!(r.stats.block_syncs));
     obj.insert("warp_syncs".into(), json!(r.stats.warp_syncs));
@@ -265,6 +297,92 @@ mod tests {
         assert_eq!(
             vc_dump_path(dir, "(Attention, FA1)"),
             vc_dump_path(dir, "(Attention, FA1)"),
+        );
+    }
+
+    /// `sanitize_name` is many-to-one; a set containing two names with
+    /// the same slug must be rejected up front, naming both offenders.
+    #[test]
+    fn slug_collisions_fail_with_both_names() {
+        check_slug_collisions(["(Red-1, Red-2)", "(Red-1, Red-3)"]).unwrap();
+        check_slug_collisions(std::iter::empty::<&str>()).unwrap();
+
+        let err = check_slug_collisions(["(Red-1, Red-2)", "Red 1 Red: 2"]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("(Red-1, Red-2)"), "{message}");
+        assert!(message.contains("Red 1 Red: 2"), "{message}");
+        assert!(message.contains("'red-1-red-2'"), "{message}");
+    }
+
+    /// Guardrail over the real corpus: every name in `all_benchmarks()`
+    /// must slug uniquely, so a future benchmark whose name collides with
+    /// an existing one fails here (in CI) instead of silently overwriting
+    /// that benchmark's VC dump.
+    #[test]
+    fn full_corpus_has_no_slug_collisions() {
+        let suite = crate::all_benchmarks();
+        check_slug_collisions(suite.benchmarks.iter().map(|b| b.name.as_str())).unwrap();
+    }
+
+    /// A benchmark that fails *after* its VC dump is written still has
+    /// the dump on disk: the record builders must keep a `Some(dump_path)`
+    /// alongside an error outcome rather than nulling it.
+    #[test]
+    fn error_records_keep_the_dump_path() {
+        let dump = PathBuf::from("bench-out/vcs/x.vcdump");
+
+        let result = crate::runner::BenchmarkResult {
+            name: "x".to_string(),
+            category: crate::config::BenchmarkCategory::Reduction,
+            elapsed_secs: 0.0,
+            outcome: crate::runner::ActualOutcome::Error {
+                message: "post-dump failure".to_string(),
+            },
+            stats: Default::default(),
+            passed: false,
+            dump_path: Some(dump.clone()),
+        };
+        let record = benchmark_record(&result);
+        assert_eq!(record["status"], json!("ERR"));
+        assert_eq!(record["dump_path"], json!(dump));
+
+        let row = Z3CompareRow {
+            name: "x".to_string(),
+            category: crate::config::BenchmarkCategory::Reduction,
+            vc_gen_secs: 0.0,
+            decision_iters_secs: Vec::new(),
+            decision_status: "N/A".to_string(),
+            z3_iters_secs: Vec::new(),
+            z3: volta_z3::Z3Counts::default(),
+            z3_axiom: None,
+            dump_path: Some(dump.clone()),
+            error: Some("post-dump failure".to_string()),
+        };
+        let record = z3_row_record(&row);
+        assert!(record["error"].is_string());
+        assert_eq!(record["dump_path"], json!(dump));
+    }
+
+    /// The oracle-time bucket is `Some` exactly when `--verify-numeric`
+    /// ran (JSON: a number vs null), so its absence is distinguishable
+    /// from a fast oracle.
+    #[test]
+    fn verify_numeric_secs_round_trips() {
+        let mut result = crate::runner::BenchmarkResult {
+            name: "x".to_string(),
+            category: crate::config::BenchmarkCategory::Reduction,
+            elapsed_secs: 0.0,
+            outcome: crate::runner::ActualOutcome::Equivalent,
+            stats: Default::default(),
+            passed: true,
+            dump_path: None,
+        };
+        assert!(benchmark_record(&result)["verify_numeric_secs"].is_null());
+
+        result.stats.verify_numeric_secs = Some(0.25);
+        assert_eq!(
+            benchmark_record(&result)["verify_numeric_secs"],
+            json!(0.25)
         );
     }
 }

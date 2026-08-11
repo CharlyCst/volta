@@ -163,7 +163,10 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   empty list is an error). Callers derive the list explicitly: the bench
   harness and CLI use the reference config's declared output arrays.
   Shared by the decision procedure and `volta_z3` so both backends check
-  exactly the same elements
+  exactly the same elements. `sampled_elements(paired, sample)` flattens
+  the paired footprints to each array's sampled prefix - the one
+  definition of *which* elements get checked, used by both backends and
+  the bench harness's Z3 re-solve loop
 - `check_output_equivalence_with(ref, opt, options)` - the per-element
   check, one shared `EquivSession` per solve iteration.
   `EquivCheckOptions`: `sample`, `verify_numeric` (f64 oracle per
@@ -175,9 +178,10 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   free determinism check). Returns a report with the outcome,
   checked/total element counts, `check_iters: Vec<Duration>` (each
   iteration's summed `EquivSession::check` durations only - pairing and
-  the oracle excluded; `check_time()` = iteration 1's), and `pair_time`
+  the oracle excluded; `check_time()` = iteration 1's), `pair_time`
   (the `paired_elements` call - the bench adds it to exec time for its
-  VC-generation figure).
+  VC-generation figure), and `verify_time` (the oracle's total time,
+  `Some` iff `verify_numeric`).
 - `check_output_equivalence(ref, opt)` - the Default-options wrapper
   (all elements, no oracle, one iteration)
 - `VcSnapshot`/`VcDump` - serde-serializable arena + output footprint, the
@@ -330,13 +334,20 @@ from iteration 1, later iterations must agree); tables print the median
 Output files under `--out-dir` (default `bench-out/`, gitignored):
 `vcs/<sanitized-name>.vcdump` per equivalence benchmark (written via the
 shared `driver::vc_dump` module, so `volta compare --from-dump` replays
-them; overwritten on rerun; race-check benchmarks are skipped with a
-console note) and `results/<unix-seconds>-<pid>-<command>.json` for
+them; overwritten on rerun; a run whose benchmark names collide under
+sanitization is rejected up front naming both offenders -
+`results::check_slug_collisions`, corpus-guarded by a test; race-check
+benchmarks are skipped with a console note) and
+`results/<unix-seconds>-<pid>-<command>.json` for
 every run command (header: argv/timestamp/iterations/sample/
 recycle-terms/z3 flags; per-benchmark records: status, element counts,
-`vc_gen_secs`, `solve_iters_secs` + median/min/mean, instruction/sync
-counters, `dump_path`; built in `src/results.rs`). `--json <path>`
-additionally writes the same document to an explicit path.
+`vc_gen_secs`, `solve_iters_secs` + median/min/mean,
+`verify_numeric_secs` (oracle time, `Some` iff the flag), instruction/sync
+counters, `dump_path` - kept on failures that occur after the dump was
+written; built in `src/results.rs`). `--json <path>`
+additionally writes the same document to an explicit path. Results files
+are written before the console tables print, and table printing
+tolerates a broken stdout pipe (`| head`), so the files always land.
 
 `z3-compare <all|category|name>` runs equivalence benchmarks through both
 the decision procedure and `volta_z3` side by side (skips race-check

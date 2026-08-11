@@ -272,7 +272,9 @@ Every benchmark's work splits into two separately-timed phases:
   separately as `dump_write_secs`).
 - **VC solving** (`solve_*`): the per-element equivalence checking only -
   the summed decision-procedure checks, excluding pairing and the
-  optional `--verify-numeric` oracle.
+  optional `--verify-numeric` oracle (the oracle's own time is reported
+  separately as `verify_numeric_secs`, present exactly when the flag is
+  on).
 
 The solve phase runs `--iterations` times (default 5) so the numbers are
 stable: each iteration re-solves the same sampled elements from a fresh
@@ -288,8 +290,14 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
 - `bench-out/vcs/<name>.vcdump` - every equivalence benchmark's
   verification conditions (both kernels' expression arenas + output
   footprints), named by a sanitized benchmark name ("(Attention, FA1)"
-  becomes `attention-fa1.vcdump`) and overwritten on rerun (VCs are
-  deterministic). These are exactly `volta compare --dump-vcs` files -
+  becomes `attention-fa1.vcdump`; a benchmark set whose sanitized names
+  collide is rejected up front, naming both offenders) and overwritten
+  on rerun (VCs are deterministic). Dumps are byte-identical across runs
+  because no production code path creates machine symbols - the one id
+  drawn from a process-global counter (`ExprArena::symbol`); a future
+  caller of it would void byte-identity but not replayability, since
+  `--from-dump` never depends on the numeric id values. These are
+  exactly `volta compare --dump-vcs` files -
   one shared format implementation
   (`volta_analysis::driver::vc_dump`) - so they replay directly:
 
@@ -305,8 +313,10 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
   header (argv, timestamp, iterations, sample, recycle-terms, z3 flags
   for z3-compare) and one record per benchmark: status, element counts,
   `vc_gen_secs`, `solve_iters_secs` (every iteration),
-  `solve_median_secs`/`solve_min_secs`/`solve_mean_secs`, instruction
-  and sync counters, and the `dump_path` of its vcdump.
+  `solve_median_secs`/`solve_min_secs`/`solve_mean_secs`,
+  `verify_numeric_secs` (oracle time; null unless `--verify-numeric`),
+  instruction and sync counters, and the `dump_path` of its vcdump (kept
+  even when a benchmark fails after its dump was written).
 
 To compare against Z3 instead of (or alongside) the decision procedure, use
 `z3-compare` (builds against `libz3` - see [Z3 backend](#z3-backend)):

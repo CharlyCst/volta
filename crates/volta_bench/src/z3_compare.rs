@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use volta_analysis::driver::{
     EquivCheckOptions, EquivOutcome, check_output_equivalence_with, paired_elements,
+    sampled_elements,
 };
 use volta_analysis::eval::AnalysisOutput;
 use volta_analysis::symbolic::{ExprId, ExprNode};
@@ -111,7 +112,9 @@ pub struct Z3CompareRow {
     pub dump_path: Option<PathBuf>,
     /// Set when the row couldn't be produced at all (bad kernel, not an
     /// equivalence benchmark, decision-procedure error, ...); the other
-    /// fields are left at their defaults in that case.
+    /// fields are left at their defaults in that case - except
+    /// `dump_path`, which still points at any dump written before the
+    /// failure.
     pub error: Option<String>,
 }
 
@@ -127,7 +130,10 @@ impl Z3CompareRow {
     }
 }
 
-fn empty_row(def: &BenchmarkDef, error: String) -> Z3CompareRow {
+/// A failed row. `dump_path` is whatever dump was already written before
+/// the failure (`None` when the failure precedes `persist_vcs`): the file
+/// exists either way, and the record should say so.
+fn empty_row(def: &BenchmarkDef, dump_path: Option<PathBuf>, error: String) -> Z3CompareRow {
     Z3CompareRow {
         name: def.name.clone(),
         category: def.category,
@@ -137,7 +143,7 @@ fn empty_row(def: &BenchmarkDef, error: String) -> Z3CompareRow {
         z3_iters_secs: Vec::new(),
         z3: volta_z3::Z3Counts::default(),
         z3_axiom: None,
-        dump_path: None,
+        dump_path,
         error: Some(error),
     }
 }
@@ -169,12 +175,17 @@ fn vc_uses_exp(output: &AnalysisOutput) -> bool {
 
 /// The carve-out predicate: outcomes that are solved in iteration 1 only.
 /// Re-solving a timeout multiplies its full budget into every iteration;
-/// unsupported/error elements never reached the solver at all.
+/// unsupported/error elements never reached the solver at all. An
+/// exhaustive match (mirroring `Z3EquivReport::counts`) so a future
+/// `ElementOutcome` variant is a compile error here, not a silent
+/// re-solve decision.
 fn carved_out(outcome: &ElementOutcome) -> bool {
-    matches!(
-        outcome,
-        ElementOutcome::Timeout | ElementOutcome::Unsupported(_) | ElementOutcome::Error(_)
-    )
+    match outcome {
+        ElementOutcome::Timeout | ElementOutcome::Unsupported(_) | ElementOutcome::Error(_) => true,
+        ElementOutcome::Equivalent | ElementOutcome::NotEquivalent | ElementOutcome::Unknown => {
+            false
+        }
+    }
 }
 
 /// One element's Z3 solve time for a re-solve iteration. Verdicts of
@@ -198,13 +209,14 @@ fn z3_resolve_time(
 
 /// Run the Z3 backend over the same sampled elements
 /// `volta_z3::check_output_equivalence` would check, `iterations` times,
-/// applying the carve-out on re-solves. Returns per-iteration solve
-/// totals plus iteration 1's verdict counts.
+/// applying the carve-out on re-solves. `sampled` is the caller's
+/// `driver::sampled_elements` list (borrowed array names). Returns
+/// per-iteration solve totals plus iteration 1's verdict counts.
 fn z3_iterations(
     reference: &AnalysisOutput,
     optimized: &AnalysisOutput,
     arrays: &[String],
-    sampled: &[(String, u64, ExprId, ExprId)],
+    sampled: &[(&str, u64, ExprId, ExprId)],
     options: &Z3CompareOptions,
     mode: ExpMode,
 ) -> Result<(Vec<f64>, volta_z3::Z3Counts), String> {
@@ -219,9 +231,26 @@ fn z3_iterations(
     )
     .map_err(|e| format!("z3: {}", e))?;
     let counts = report.counts();
-    // `check_output_equivalence` samples each array's prefix, exactly like
-    // the flattened list we re-solve from.
-    debug_assert_eq!(report.elements.len(), sampled.len());
+    // The re-solve loop below pairs `report.elements` with `sampled`
+    // positionally. Both lists derive from `driver::sampled_elements`
+    // over the same footprints, so they must agree element for element -
+    // verified for real (not just in debug builds): a silent mispairing
+    // would re-solve the wrong expressions.
+    if report.elements.len() != sampled.len()
+        || report
+            .elements
+            .iter()
+            .zip(sampled)
+            .any(|(e, &(name, index, _, _))| e.array != name || e.index != index)
+    {
+        return Err(format!(
+            "z3 element list ({} elements) does not match the sampled VC list ({}): \
+             volta_z3::check_output_equivalence and driver::sampled_elements must \
+             sample identically",
+            report.elements.len(),
+            sampled.len(),
+        ));
+    }
 
     // Iteration-1 time of the carved-out elements, charged to every
     // iteration's total (timeouts report their budget - see
@@ -262,6 +291,7 @@ pub fn compare_one(
     let Some(optimized_run) = &def.optimized else {
         return empty_row(
             def,
+            None,
             "no optimized kernel (not an equivalence benchmark)".to_string(),
         );
     };
@@ -269,11 +299,11 @@ pub fn compare_one(
     let exec0 = Instant::now();
     let reference = match run_kernel(kernels_dir, &def.reference) {
         Ok(o) => o,
-        Err(e) => return empty_row(def, format!("reference kernel: {:#}", e)),
+        Err(e) => return empty_row(def, None, format!("reference kernel: {:#}", e)),
     };
     let optimized = match run_kernel(kernels_dir, optimized_run) {
         Ok(o) => o,
-        Err(e) => return empty_row(def, format!("optimized kernel: {:#}", e)),
+        Err(e) => return empty_row(def, None, format!("optimized kernel: {:#}", e)),
     };
     let exec_secs = exec0.elapsed().as_secs_f64();
     // Both backends check along the reference config's declared outputs.
@@ -285,23 +315,15 @@ pub fn compare_one(
     let dump_path = persisted.path;
 
     // Pair the footprints once (the tail of VC generation) and flatten the
-    // sampled elements for the Z3 re-solve iterations.
+    // sampled elements for the Z3 re-solve iterations - the same
+    // `driver::sampled_elements` list both backends check.
     let pair0 = Instant::now();
     let paired = match paired_elements(&reference, &optimized, &arrays) {
         Ok(p) => p,
-        Err(e) => return empty_row(def, format!("pairing footprints: {}", e)),
+        Err(e) => return empty_row(def, dump_path, format!("pairing footprints: {}", e)),
     };
     let vc_gen_secs = exec_secs + pair0.elapsed().as_secs_f64();
-    let mut sampled: Vec<(String, u64, ExprId, ExprId)> = Vec::new();
-    for (name, common) in &paired {
-        let limit = match options.sample {
-            0 => common.len(),
-            n => common.len().min(n as usize),
-        };
-        for &(index, r, o) in common.iter().take(limit) {
-            sampled.push((name.clone(), index, r, o));
-        }
-    }
+    let sampled = sampled_elements(&paired, options.sample);
 
     let equiv_options = EquivCheckOptions {
         sample: options.sample,
@@ -323,7 +345,7 @@ pub fn compare_one(
                 let iters: Vec<f64> = report.check_iters.iter().map(|d| d.as_secs_f64()).collect();
                 (status, iters)
             }
-            Err(e) => return empty_row(def, format!("decision procedure: {}", e)),
+            Err(e) => return empty_row(def, dump_path, format!("decision procedure: {}", e)),
         };
 
     let run_z3 =

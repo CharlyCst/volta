@@ -207,6 +207,13 @@ pub struct EquivCheckReport {
     /// that account "VC generation" as symbolic execution plus pairing
     /// (the bench harness) add this to their execution time.
     pub pair_time: Duration,
+    /// Total time in the f64-oracle confirmations (`verify_verdict`,
+    /// iteration 1 only - the only iteration the oracle runs on). `Some`
+    /// exactly when `EquivCheckOptions::verify_numeric` was set, so
+    /// `None` means the oracle was off, not that it was free. Kept out
+    /// of `check_iters` so the solve timings do not move when the oracle
+    /// is toggled.
+    pub verify_time: Option<Duration>,
 }
 
 impl EquivCheckReport {
@@ -276,6 +283,31 @@ pub fn paired_elements(
     Ok(result)
 }
 
+/// Flatten paired footprints into the per-element check list under a
+/// sample limit: each array's element prefix, capped at `sample` elements
+/// per array (0 = all), arrays in `paired` order. This is the one
+/// definition of *which* elements a run checks - the decision procedure
+/// (`check_output_equivalence_with`), the Z3 backend
+/// (`volta_z3::check_output_equivalence`), and the bench harness's Z3
+/// re-solve loop all iterate exactly this list, so their per-element
+/// results correspond positionally.
+pub fn sampled_elements(
+    paired: &[(String, Vec<(u64, ExprId, ExprId)>)],
+    sample: u64,
+) -> Vec<(&str, u64, ExprId, ExprId)> {
+    let mut sampled = Vec::new();
+    for (name, common) in paired {
+        let limit = match sample {
+            0 => common.len(),
+            n => common.len().min(n as usize),
+        };
+        for &(index, r, o) in common.iter().take(limit) {
+            sampled.push((name.as_str(), index, r, o));
+        }
+    }
+    sampled
+}
+
 /// Verify that a later solve iteration reproduced iteration 1's verdict
 /// for one element. `iteration` is 1-based (so always >= 2 here). The
 /// decision procedure is deterministic; a disagreement is a hard error.
@@ -326,21 +358,12 @@ pub fn check_output_equivalence_with(
     let pair_time = pair_start.elapsed();
 
     // Flatten the sampled elements once: every iteration solves exactly
-    // this list, in this order (sampling takes each array's prefix, so
-    // "the same sampled elements" holds by construction).
-    let mut elements_total = 0u64;
-    let mut checked: Vec<(&String, u64, ExprId, ExprId)> = Vec::new();
-    for (name, common) in &paired {
-        elements_total += common.len() as u64;
-        let limit = match options.sample {
-            0 => common.len(),
-            n => common.len().min(n as usize),
-        };
-        for &(index, r, o) in common.iter().take(limit) {
-            checked.push((name, index, r, o));
-        }
-    }
+    // this list, in this order (`sampled_elements` takes each array's
+    // prefix, so "the same sampled elements" holds by construction).
+    let elements_total: u64 = paired.iter().map(|(_, common)| common.len() as u64).sum();
+    let checked = sampled_elements(&paired, options.sample);
 
+    let mut verify_time = options.verify_numeric.then_some(Duration::ZERO);
     let mut check_iters = Vec::with_capacity(options.iterations.get());
     let mut first_verdicts: Vec<bool> = Vec::with_capacity(checked.len());
     for iteration in 1..=options.iterations.get() {
@@ -355,11 +378,13 @@ pub fn check_output_equivalence_with(
             let equivalent = session.check(r, o)?;
             iter_time += check_start.elapsed();
             if iteration == 1 {
-                if options.verify_numeric {
+                if let Some(verify_time) = verify_time.as_mut() {
+                    let verify_start = Instant::now();
                     numeric::verify_verdict(&reference.arena, r, &optimized.arena, o, equivalent)
                         .map_err(|message| EquivCheckError::Numeric {
                         message: format!("array '{}' element {}: {}", name, index, message),
                     })?;
+                    *verify_time += verify_start.elapsed();
                 }
                 first_verdicts.push(equivalent);
             } else {
@@ -380,7 +405,7 @@ pub fn check_output_equivalence_with(
         .zip(&first_verdicts)
         .filter(|&(_, &equivalent)| !equivalent)
         .map(|(&(name, index, _, _), _)| Mismatch {
-            array: name.clone(),
+            array: name.to_string(),
             index,
         })
         .collect();
@@ -395,6 +420,7 @@ pub fn check_output_equivalence_with(
         elements_total,
         check_iters,
         pair_time,
+        verify_time,
     })
 }
 
@@ -830,6 +856,8 @@ mod tests {
         assert_eq!(report.elements_checked, 3);
         assert_eq!(report.elements_total, 3);
         assert!(matches!(report.outcome, EquivOutcome::Equivalent));
+        // Oracle off: no oracle-time bucket, rather than a zero one.
+        assert_eq!(report.verify_time, None);
 
         // Sampling caps the per-array element count once, not per iteration,
         // and a NotEquivalent verdict survives the later iterations'
@@ -860,6 +888,48 @@ mod tests {
             panic!("input-element reads of different arrays must differ");
         };
         assert_eq!(mismatches.len(), 2);
+    }
+
+    /// With `verify_numeric` on, the oracle's time is reported in its own
+    /// bucket (`Some` exactly when the flag is set), never folded into the
+    /// solve iterations.
+    #[test]
+    fn verify_numeric_time_is_reported_separately() {
+        let reference = output_with(&[("out", &[0, 1])]);
+        let optimized = output_with(&[("out", &[0, 1])]);
+        let options = EquivCheckOptions {
+            verify_numeric: true,
+            ..EquivCheckOptions::default()
+        };
+        let report =
+            check_output_equivalence_with(&reference, &optimized, &names(&["out"]), &options)
+                .unwrap();
+        assert!(matches!(report.outcome, EquivOutcome::Equivalent));
+        assert!(report.verify_time.is_some());
+    }
+
+    /// `sampled_elements` is the one definition of which elements get
+    /// checked: each array's prefix, capped per array, in `paired` order.
+    #[test]
+    fn sampled_elements_takes_each_arrays_prefix() {
+        let reference = output_with(&[("a", &[0, 1, 2]), ("b", &[7])]);
+        let optimized = output_with(&[("a", &[0, 1, 2]), ("b", &[7])]);
+        let paired = paired_elements(&reference, &optimized, &names(&["a", "b"])).unwrap();
+
+        let all = sampled_elements(&paired, 0);
+        assert_eq!(
+            all.iter().map(|&(n, i, _, _)| (n, i)).collect::<Vec<_>>(),
+            vec![("a", 0), ("a", 1), ("a", 2), ("b", 7)]
+        );
+
+        let capped = sampled_elements(&paired, 2);
+        assert_eq!(
+            capped
+                .iter()
+                .map(|&(n, i, _, _)| (n, i))
+                .collect::<Vec<_>>(),
+            vec![("a", 0), ("a", 1), ("b", 7)]
+        );
     }
 
     /// The determinism guard: agreeing iterations pass, a flipped verdict

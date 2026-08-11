@@ -41,6 +41,11 @@ pub struct BenchmarkStats {
     /// Median of `solve_iters_secs` (the table's "VC (s)" column); 0 when
     /// no solve ran.
     pub vc_secs: f64,
+    /// Time in the `--verify-numeric` f64-oracle confirmations (they run
+    /// on solve iteration 1 only); `Some` exactly when the flag was on.
+    /// Excluded from `solve_iters_secs` - see
+    /// `EquivCheckReport::verify_time`.
+    pub verify_numeric_secs: Option<f64>,
     /// bar.sync executions across all threads (optimized kernel if present)
     pub block_syncs: u64,
     /// Warp-level sync executions across all threads
@@ -149,6 +154,27 @@ impl Default for RunnerConfig {
     }
 }
 
+/// An infrastructure failure inside [`BenchmarkRunner::run_inner`],
+/// carrying any VC dump written before the failure: the file exists on
+/// disk, and the benchmark's record should say so even when the run
+/// errors after the dump (e.g. a failed equivalence check).
+struct RunFailure {
+    error: anyhow::Error,
+    dump_path: Option<PathBuf>,
+}
+
+impl From<anyhow::Error> for RunFailure {
+    /// For `?` on failures that occur before any dump is written: no
+    /// path to preserve. Post-dump failure sites attach the path
+    /// explicitly instead of using this.
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            dump_path: None,
+        }
+    }
+}
+
 pub struct BenchmarkRunner {
     config: RunnerConfig,
 }
@@ -160,7 +186,10 @@ impl BenchmarkRunner {
 
     pub fn run(&self, def: &BenchmarkDef) -> BenchmarkResult {
         if self.config.vcs_dir.is_some() && def.optimized.is_none() {
-            println!(
+            // stderr, like the runner's other progress chatter: it must
+            // not panic mid-run when stdout is a closed pipe (`| head`) -
+            // the results files still have to be written afterwards.
+            eprintln!(
                 "note: {}: race-check benchmark (no optimized kernel) - no VC dump",
                 def.name
             );
@@ -168,12 +197,15 @@ impl BenchmarkRunner {
         let start = Instant::now();
         let (outcome, stats, dump_path) = match self.run_inner(def) {
             Ok((outcome, stats, dump_path)) => (outcome, stats, dump_path),
-            Err(e) => (
+            Err(failure) => (
                 ActualOutcome::Error {
-                    message: format!("{:#}", e),
+                    message: format!("{:#}", failure.error),
                 },
                 BenchmarkStats::default(),
-                None,
+                // A failure after the dump was written (e.g. the
+                // equivalence check erroring) still leaves the dump on
+                // disk; the record keeps pointing at it.
+                failure.dump_path,
             ),
         };
         let elapsed_secs = start.elapsed().as_secs_f64();
@@ -211,7 +243,7 @@ impl BenchmarkRunner {
     fn run_inner(
         &self,
         def: &BenchmarkDef,
-    ) -> Result<(ActualOutcome, BenchmarkStats, Option<PathBuf>)> {
+    ) -> Result<(ActualOutcome, BenchmarkStats, Option<PathBuf>), RunFailure> {
         let mut stats = BenchmarkStats::default();
 
         // Analyze the reference kernel.
@@ -265,8 +297,15 @@ impl BenchmarkRunner {
         // Check the verification conditions along the reference config's
         // declared output arrays (`check_equivalence` fills in the
         // solve times and completes `vc_gen_secs` with the pairing time).
+        // A failure past this point happens *after* the dump was written,
+        // so it carries the dump path.
         let arrays = def.reference.config.output_array_names();
-        let outcome = self.check_equivalence(&reference, &optimized, &arrays, &mut stats)?;
+        let outcome = self
+            .check_equivalence(&reference, &optimized, &arrays, &mut stats)
+            .map_err(|error| RunFailure {
+                error,
+                dump_path: persisted.path.clone(),
+            })?;
         Ok((outcome, stats, persisted.path))
     }
 
@@ -308,6 +347,7 @@ impl BenchmarkRunner {
         stats.vc_gen_secs = stats.exec_secs + report.pair_time.as_secs_f64();
         stats.solve_iters_secs = report.check_iters.iter().map(|d| d.as_secs_f64()).collect();
         stats.vc_secs = median(&stats.solve_iters_secs).unwrap_or(0.0);
+        stats.verify_numeric_secs = report.verify_time.map(|d| d.as_secs_f64());
         Ok(match report.outcome {
             EquivOutcome::Equivalent => ActualOutcome::Equivalent,
             EquivOutcome::NotEquivalent { mismatches } => {
@@ -346,7 +386,12 @@ pub(crate) struct PersistedVcs {
 /// (`into_analysis_output`), which clears their `stats`/`op_counts` -
 /// callers must record those before calling. Shared by the benchmark
 /// runner and `z3_compare`, so both write byte-identical dumps to the
-/// same path.
+/// same path. Byte-identity rests on one premise: no production code
+/// path creates machine symbols (`ExprArena::symbol`, the only id drawn
+/// from a process-global counter), so every id in a dump is
+/// deterministic; a future machine-symbol caller would void byte-identity
+/// across runs but not the dumps' validity - `--from-dump` never depends
+/// on the numeric id values.
 pub(crate) fn persist_vcs(
     vcs_dir: Option<&Path>,
     benchmark_name: &str,
@@ -366,8 +411,11 @@ pub(crate) fn persist_vcs(
         reference: VcSnapshot::from_output(reference),
         optimized: VcSnapshot::from_output(optimized),
     };
+    // The directory is a one-time setup cost, not part of any dump's
+    // write time - create it before starting the write timer.
+    let created = std::fs::create_dir_all(vcs_dir);
     let write0 = Instant::now();
-    let written = std::fs::create_dir_all(vcs_dir).and_then(|_| write_vc_dump(&path, &dump));
+    let written = created.and_then(|_| write_vc_dump(&path, &dump));
     let (path, write_secs) = match written {
         Ok(()) => (Some(path), Some(write0.elapsed().as_secs_f64())),
         Err(e) => {

@@ -285,7 +285,10 @@ impl Z3EquivReport {
 
 /// Check every paired output element (exactly like
 /// `volta_analysis::driver::check_output_equivalence_with`, against the
-/// reference's footprint) with Z3 instead of the decision procedure. Unlike the decision procedure, this never
+/// reference's footprint) with Z3 instead of the decision procedure. The
+/// element list is `driver::sampled_elements` over
+/// `driver::paired_elements` - the same list, in the same order, as the
+/// decision procedure checks. Unlike the decision procedure, this never
 /// aborts partway through a run over a single element's failure - each
 /// element's outcome (including "unsupported" or a solver error) is
 /// recorded independently, since the whole point is comparing coverage as
@@ -301,35 +304,27 @@ pub fn check_output_equivalence(
 ) -> Result<Z3EquivReport, EquivCheckError> {
     let paired = volta_analysis::driver::paired_elements(reference, optimized, arrays)?;
     let mut elements = Vec::new();
-    for (name, common) in paired {
-        let limit = match sample {
-            0 => common.len(),
-            n => common.len().min(n as usize),
-        };
-        for (index, r, o) in common.into_iter().take(limit) {
-            let (outcome, solve) =
-                match check_equivalent(&reference.arena, r, &optimized.arena, o, timeout, mode) {
-                    Ok(res) => (
-                        match res.verdict {
-                            Z3Verdict::Equivalent => ElementOutcome::Equivalent,
-                            Z3Verdict::NotEquivalent => ElementOutcome::NotEquivalent,
-                            Z3Verdict::Unknown => ElementOutcome::Unknown,
-                            Z3Verdict::Timeout => ElementOutcome::Timeout,
-                        },
-                        res.solve,
-                    ),
-                    Err(Z3Error::Unsupported(u)) => {
-                        (ElementOutcome::Unsupported(u.0), Duration::ZERO)
-                    }
-                    Err(e) => (ElementOutcome::Error(e.to_string()), Duration::ZERO),
-                };
-            elements.push(ElementResult {
-                array: name.clone(),
-                index,
-                outcome,
-                solve,
-            });
-        }
+    for (name, index, r, o) in volta_analysis::driver::sampled_elements(&paired, sample) {
+        let (outcome, solve) =
+            match check_equivalent(&reference.arena, r, &optimized.arena, o, timeout, mode) {
+                Ok(res) => (
+                    match res.verdict {
+                        Z3Verdict::Equivalent => ElementOutcome::Equivalent,
+                        Z3Verdict::NotEquivalent => ElementOutcome::NotEquivalent,
+                        Z3Verdict::Unknown => ElementOutcome::Unknown,
+                        Z3Verdict::Timeout => ElementOutcome::Timeout,
+                    },
+                    res.solve,
+                ),
+                Err(Z3Error::Unsupported(u)) => (ElementOutcome::Unsupported(u.0), Duration::ZERO),
+                Err(e) => (ElementOutcome::Error(e.to_string()), Duration::ZERO),
+            };
+        elements.push(ElementResult {
+            array: name.to_string(),
+            index,
+            outcome,
+            solve,
+        });
     }
     Ok(Z3EquivReport { elements })
 }
