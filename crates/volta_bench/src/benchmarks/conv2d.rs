@@ -7,6 +7,8 @@ use volta_analysis::eval::{AnalysisConfig, ParamValue};
 
 use crate::config::{BenchmarkCategory, BenchmarkDef, KernelRun, f32_input, f32_output};
 
+// The macro block shared by Conv2D-ref.cu and Conv2D-opt.cu (AlexNet
+// conv1: stride 4, pad 2, so H_OUT = W_OUT = (224 + 2*2 - 11)/4 + 1 = 55).
 const N_BATCH: u64 = 100;
 const C_IN: u64 = 3;
 const H_IN: u64 = 224;
@@ -22,8 +24,14 @@ const W_BASE: u64 = 0x2_0000_0000;
 const BIAS_BASE: u64 = 0x2_8000_0000;
 const OUT_BASE: u64 = 0x3_0000_0000;
 
-/// `conv2d(input, weight, bias, output)`, 256 threads,
-/// grid = (ceil(N/128), ceil(M/128)).
+/// `conv2d(input, weight, bias, output)`. 256 threads =
+/// `THREADS_PER_BLOCK` (8 warps x 32) in both .cu files; the grid is
+/// their launcher's `dim3(CEIL_DIV(N_GEMM,128), CEIL_DIV(M_GEMM,128))` =
+/// (2364, 1) for the 128x128 CTA tile (neither PTX reads `%nctaid`, so it
+/// is documentation only). Array extents are the .cu tensor shapes:
+/// input (N,Cin,Hin,Win), weight (Cout,Cin,Kh,Kw), bias (Cout), output
+/// (N,Cout,Hout,Wout) = C_OUT * n_gemm elements. Both kernels use only
+/// static shared memory, so no dynamic_shared is set.
 fn config() -> AnalysisConfig {
     let n_gemm = N_BATCH * H_OUT * W_OUT;
     let mut config = AnalysisConfig::new((256, 1, 1));

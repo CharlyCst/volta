@@ -13,6 +13,12 @@ const B_BASE: u64 = 0x2_0000_0000;
 const C_BASE: u64 = 0x3_0000_0000;
 
 /// `sgemm(A, B, C, alpha, beta)`; alpha/beta stay symbolic.
+///
+/// N = 4096 is the `M`/`N`/`K` macro set in every MatMul-*.cu; A/B are
+/// read-only and C is read (`beta * C[..]`) then written, hence inout.
+/// The grid is the tutorial's `CEIL_DIV(4096, 64)`-per-axis launch for the
+/// 64x64 CTA tile; none of the seven PTX files reads `%nctaid`, so it is
+/// documentation only (CTA (0,0) computes C's top-left 64x64 tile).
 fn config(threads: u32) -> AnalysisConfig {
     let mut config = AnalysisConfig::new((threads, 1, 1));
     config.grid_dim = (64, 64, 1);
@@ -36,10 +42,17 @@ fn kernel(file: &str, name: &str, threads: u32) -> KernelRun {
 }
 
 fn matmul1() -> KernelRun {
+    // 512 threads = BM*BN/TM = 64*64/8 results per thread (MatMul-1.cu).
     kernel("MatMul-1.ptx", "_Z5sgemmPKfS0_Pfff", 512)
 }
 
 pub fn benchmarks() -> Vec<BenchmarkDef> {
+    // Thread counts follow each .cu's per-thread tiling over the 64x64 CTA
+    // tile: MatMul-2 = 64*64/(TM*TN = 4*2) = 512; MatMul-3/4/5 =
+    // 64*64/(8*4) = 128; MatMul-6/7 declare `NUM_THREADS = 256` (warp
+    // tiling). Cross-check: the paper's Table 2 block-sync counts are
+    // threads x 1024 bar.syncs (2 per K-tile, K/BK = 512 tiles):
+    // 524k/524k/131k/131k/131k/262k/262k.
     let defs = [
         ("MatMul-2.ptx", "_Z5sgemmPKfS0_Pfff", 512u32),
         ("MatMul-3.ptx", "_Z5sgemmPfS_S_ff", 128),

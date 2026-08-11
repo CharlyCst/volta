@@ -7,6 +7,9 @@ use volta_analysis::eval::{AnalysisConfig, ParamValue};
 
 use crate::config::{BenchmarkCategory, BenchmarkDef, KernelRun, f32_input, f32_output};
 
+// The `LQ`/`LK`/`HEAD_DIM`(= `VALUE_DIM`) macros shared by all the .cu
+// sources in 03_attention/ and 04_causal_attention/, and the paper's
+// "Q:(16,64), K:(512,64), V:(512,64)".
 const LQ: u64 = 16;
 const LK: u64 = 512;
 const DIM: u64 = 64;
@@ -18,13 +21,22 @@ const O_BASE: u64 = 0x4_0000_0000;
 const AUX0_BASE: u64 = 0x5_0000_0000;
 const AUX1_BASE: u64 = 0x6_0000_0000;
 
-/// scale = 1/sqrt(HEAD_DIM); kernels are specialized for it, and a concrete
-/// value keeps the exponents simple for the decision procedure.
+/// scale = 1/sqrt(HEAD_DIM) = 1/sqrt(64), exactly representable; kernels
+/// are specialized for it, and a concrete value keeps the exponents simple
+/// for the decision procedure.
 const SCALE: f64 = 0.125;
 
 /// `sdpa(Q, K, V, O, scale, [l, m])`. The FA1 kernels take two extra
-/// auxiliary output buffers (running softmax statistics). Shared with the
-/// causal variants (Table 4), which have identical signatures and dims.
+/// auxiliary output buffers (running softmax statistics), `ell`/`mrow`
+/// in FA1.cu, both `[LQ]`. Shared with the causal variants (Table 4),
+/// which have identical signatures and dims.
+///
+/// All shared memory in these kernels is static `__shared__` (no
+/// `.extern .shared` in any PTX), so no dynamic_shared is set. The grid
+/// stays (1,1,1): no PTX reads `%nctaid`, and every kernel confines its
+/// work to CTA 0 (the single-thread reference guards `blockIdx.x != 0`;
+/// the FA kernels have a single row-block, LQ/Br = 16/16 = 1, at
+/// `blockIdx.x` = 0).
 pub(super) fn config(threads: u32, aux_outputs: bool) -> AnalysisConfig {
     let mut config = AnalysisConfig::new((threads, 1, 1));
     config.arrays = vec![
@@ -50,7 +62,9 @@ pub(super) fn config(threads: u32, aux_outputs: bool) -> AnalysisConfig {
 }
 
 fn attention() -> KernelRun {
-    // The reference computes the whole head with a single thread.
+    // The reference computes the whole head with a single thread:
+    // Attention.cu guards `threadIdx.x != 0 || blockIdx.x != 0` (paper
+    // Table 3 lists #Threads = 1).
     KernelRun::new(
         "03_attention/Attention.ptx",
         "_Z10sdpa_basicPKfS0_S0_Pff",
@@ -59,6 +73,9 @@ fn attention() -> KernelRun {
 }
 
 pub fn benchmarks() -> Vec<BenchmarkDef> {
+    // The optimized kernels all use 128 threads = the BLOCKSIZE macro in
+    // their .cu (paper Table 3). The `S1_S1_` suffix on the FA1 mangled
+    // name is the two extra `float*` aux outputs.
     let fa1 = KernelRun::new(
         "03_attention/FA1.ptx",
         "_Z12sdpa_fa_likePKfS0_S0_PffS1_S1_",

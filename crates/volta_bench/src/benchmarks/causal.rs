@@ -11,6 +11,13 @@ use crate::config::{BenchmarkCategory, BenchmarkDef, KernelRun};
 
 pub fn benchmarks() -> Vec<BenchmarkDef> {
     // (paper name, mangled entry, threads, aux l/m output buffers)
+    //
+    // Threads and dims come from the same macros as Table 3: all eight .cu
+    // sources in 04_causal_attention/ repeat LQ=16, LK=512,
+    // HEAD_DIM=VALUE_DIM=64, and BLOCKSIZE=128; the basic kernels keep the
+    // single-thread `threadIdx.x != 0 || blockIdx.x != 0` guard, so
+    // `attention::config` applies unchanged (paper Table 4 #Threads
+    // 1/128/128/128).
     let levels: [(&str, &str, u32, bool); 4] = [
         ("Causal-Attention", "_Z10sdpa_basicPKfS0_S0_Pff", 1, false),
         (
