@@ -1,4 +1,10 @@
+# Build artifacts
 /target
-/bench-out
 **/__pycache__/
+
+# Volta output
+/volta-logs
+/bench-out
+
+# Configuration files
 .venv
