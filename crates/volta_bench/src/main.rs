@@ -94,8 +94,9 @@ struct Cli {
     iterations: NonZeroUsize,
 
     /// Also solve every equivalence benchmark's VCs with Z3 (SMT-LIB2
-    /// evaluated in-process via libz3) for a side-by-side comparison;
-    /// exp-containing benchmarks get a second +exp-axiom sub-run
+    /// evaluated via libz3 in a killable worker subprocess) for a
+    /// side-by-side comparison; exp-containing benchmarks get a second
+    /// +exp-axiom sub-run
     #[arg(long, global = true)]
     z3: bool,
 
@@ -245,7 +246,10 @@ fn write_results(
 /// Announce the Z3 phase once per run: solver version (provenance for
 /// the results) and the iteration carve-out convention.
 fn announce_z3(iterations: NonZeroUsize) {
-    println_tolerant(format!("z3 {} (libz3, in-process)", volta_z3::z3_version()));
+    println_tolerant(format!(
+        "z3 {} (libz3, worker subprocess)",
+        volta_z3::z3_version()
+    ));
     println_tolerant(format!(
         "z3 solve: {} iteration(s); elements whose iteration-1 outcome is \
          timeout/unsupported/error are solved once, with that time charged to \
@@ -400,24 +404,30 @@ fn main() -> ExitCode {
                 log.record(&format!("single: benchmark not found '{}'", name));
                 return finish(log, ExitCode::FAILURE);
             };
-            println!("Running {} ...", name);
+            println_tolerant(format!("Running {} ...", name));
             if cli.z3 {
                 announce_z3(iterations);
             }
             let runner = BenchmarkRunner::new(runner_config);
             let result = runner.run(def);
-            let mut stdout = std::io::stdout().lock();
-            print_single_result(&mut stdout, &result).unwrap();
-            write_op_counts(&mut stdout, "reference", &result.stats.reference_op_counts).unwrap();
-            write_op_counts(&mut stdout, "optimized", &result.stats.optimized_op_counts).unwrap();
-            drop(stdout);
-            if !result.passed {
-                let mut out = Vec::new();
-                print_summary(&mut out, std::slice::from_ref(&result)).unwrap();
-                print!("{}", String::from_utf8_lossy(&out));
-            }
+            // Results files first, console report second: a broken pipe
+            // must not lose the files.
             let records = vec![results::benchmark_record(&result)];
             write_results(&out_dir, &meta, records, json.as_deref());
+            let mut stdout = std::io::stdout().lock();
+            print_stdout(print_single_result(&mut stdout, &result));
+            print_stdout(
+                write_op_counts(&mut stdout, "reference", &result.stats.reference_op_counts)
+                    .map_err(anyhow::Error::from),
+            );
+            print_stdout(
+                write_op_counts(&mut stdout, "optimized", &result.stats.optimized_op_counts)
+                    .map_err(anyhow::Error::from),
+            );
+            if !result.passed {
+                print_stdout(print_summary(&mut stdout, std::slice::from_ref(&result)));
+            }
+            drop(stdout);
             log.record(&format!(
                 "single {}: {} ({})",
                 name,

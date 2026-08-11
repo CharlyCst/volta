@@ -167,7 +167,7 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   the paired footprints to each array's sampled prefix - the one
   definition of *which* elements get checked, used by both backends and
   the bench harness's Z3 re-solve loop
-- `check_output_equivalence_with(ref, opt, options)` - the per-element
+- `check_output_equivalence_with(ref, opt, arrays, options)` - the per-element
   check, one shared `EquivSession` per solve iteration.
   `EquivCheckOptions`: `sample`, `verify_numeric` (f64 oracle per
   element; iteration 1 only), `recycle_terms`, `iterations`
@@ -185,7 +185,7 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   bench harness's `decision_elements`), `pair_time`
   (the `paired_elements` call), and `verify_time` (the oracle's total
   time, `Some` iff `verify_numeric`).
-- `check_output_equivalence(ref, opt)` - the Default-options wrapper
+- `check_output_equivalence(ref, opt, arrays)` - the Default-options wrapper
   (all elements, no oracle, one iteration)
 - `VcSnapshot`/`VcDump` - serde-serializable arena + output footprint, the
   payload of `volta compare --dump-vcs`/`--from-dump` and of volta-bench's
@@ -327,12 +327,16 @@ warnings at startup for a debug build or, under the `logging` feature,
 a `--log-level` of info+ - both corrupt timings).
 
 One pipeline per benchmark (`src/runner.rs`): **VC generation**
-(`--iterations` timed runs of both symbolic executions +
-`paired_elements`; only the last generation's outputs are kept - each
+(`--iterations` timed runs of lowering + both symbolic executions +
+`paired_elements`; kernel files are read and parsed once, outside the
+timed loop; only the last generation's outputs are kept - each
 iteration drops its predecessor, peak memory = one generation - and
-every iteration is shape-checked against iteration 1: same outcome
-kind and per-array footprints, rejections by rejection kind since race
-diagnostics vary benignly; a mismatch fails the benchmark loudly), then
+every iteration is fingerprint-checked against iteration 1: same
+outcome kind, per-array footprints, and expression identities (arena
+node count + per-element `ExprId`s - fresh deterministic arenas make id
+equality a strong check at zero cost); rejections compare by rejection
+kind only, since diagnostic text may embed schedule-dependent details -
+verdict kinds are the contract; a mismatch fails the benchmark loudly), then
 the dump written once from the last generation (timed as
 `dump_write_secs`), then **decision solve** (`--iterations` runs via
 `driver::check_output_equivalence_with` - fresh session per iteration,
@@ -381,8 +385,9 @@ passed, element counts, per-phase stats (`vc_gen_*` and `solve_*`: full
 sub-section of the same shape or null, and `error`), instruction/sync
 counters, and `dump_path` - kept on failures that occur after the dump
 was written. `--json <path>` additionally writes the same document to
-an explicit path. Results files are written before the console tables
-print, and table printing tolerates a broken stdout pipe (`| head`), so
+an explicit path. Results files are written before any console report
+prints (`all`/`category` tables and `single`'s result block alike), and
+report printing tolerates a broken stdout pipe (`| head`), so
 the files always land. Every run writes a `volta_common::run_log` file
 (`--log-dir`/`--no-log-file`).
 Memory: full-element attention wants tens of GiB warm - on small machines

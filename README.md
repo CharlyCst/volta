@@ -283,11 +283,13 @@ of `info` or above (log output is emitted from inside the timed phases).
 
 Every benchmark's work splits into separately-timed phases:
 
-- **VC generation** (`vc_gen_*`): both kernels' symbolic executions
-  plus footprint pairing - everything it takes to *produce* the
-  verification conditions. Writing the dump file is excluded (reported
-  separately as `dump_write_secs`; the dump is written once, from the
-  last generation iteration, whose outputs also feed the solve phases).
+- **VC generation** (`vc_gen_*`): lowering, both kernels' symbolic
+  executions, and footprint pairing - everything it takes to *produce*
+  the verification conditions from the parsed modules. Each kernel file
+  is read and parsed once per benchmark, outside the timed loop; writing
+  the dump file is excluded too (reported separately as
+  `dump_write_secs`; the dump is written once, from the last generation
+  iteration, whose outputs also feed the solve phases).
 - **VC solving** (`solve_*`): the per-element equivalence checking only -
   the summed decision-procedure checks, excluding pairing and the
   optional `--verify-numeric` oracle (the oracle's own time is reported
@@ -315,14 +317,17 @@ Re-running phases is also a correctness check, not just a timing one:
   each session drops before the next starts). The verdict comes from
   iteration 1, and later iterations must reproduce it - a disagreement
   is a hard error.
-- Every generation iteration must produce the same *shape* as iteration
-  1 - the same outcome kind and, element for element, the same written
-  footprints (for rejections, the same rejection kind: which access pair
-  a race report names first can vary benignly) - so a nondeterministic
-  interpreter regression fails loudly instead of silently timing
-  different work. Only the last generation's outputs are kept (each
-  iteration drops its predecessor first), so peak memory stays at one
-  generation.
+- Every generation iteration must reproduce iteration 1's
+  *fingerprint* - the same outcome kind and, element for element, the
+  same written footprints and expression identities (arena node count plus
+  per-element `ExprId`s: each generation builds a fresh arena
+  deterministically, so identical construction order is equivalent to
+  identical ids). Rejections compare by rejection kind only - diagnostic
+  text may embed schedule-dependent details; verdict kinds are the
+  contract. Either way a nondeterministic interpreter regression fails
+  loudly instead of silently timing different work. Only the last
+  generation's outputs are kept (each iteration drops its predecessor
+  first), so peak memory stays at one generation.
 
 Each run writes under `--out-dir` (default `bench-out/`, gitignored):
 

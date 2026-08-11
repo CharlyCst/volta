@@ -6,13 +6,17 @@
 //! Phase timing:
 //!
 //! - **VC generation** re-runs everything it takes to produce the
-//!   verification conditions - both symbolic executions plus footprint
-//!   pairing - once per iteration. The last iteration's outputs feed the
-//!   dump file and both solve phases (earlier ones are dropped before
-//!   the next starts, so peak memory is one generation); every earlier
-//!   iteration is shape-checked against iteration 1 (same outcome kind,
-//!   same per-array footprints), so a nondeterministic interpreter
-//!   regression fails loudly instead of silently timing different work.
+//!   verification conditions from the parsed modules - lowering, both
+//!   symbolic executions, and footprint pairing - once per iteration.
+//!   Each kernel file is read and parsed once per benchmark, *outside*
+//!   the timed loop: file I/O and parsing are not VC generation. The
+//!   last iteration's outputs feed the dump file and both solve phases
+//!   (earlier ones are dropped before the next starts, so peak memory is
+//!   one generation); every later iteration is fingerprint-checked
+//!   against iteration 1 (same outcome kind, same per-array footprints,
+//!   and same expression identities: arena node count plus per-element
+//!   `ExprId`s), so a nondeterministic interpreter regression fails
+//!   loudly instead of silently timing different work.
 //! - **Decision solve** and the optional **Z3 solve** re-solve the same
 //!   sampled elements per iteration (see
 //!   `EquivCheckOptions::iterations` and `crate::z3_phase`).
@@ -49,11 +53,13 @@ pub const NOISY_CV_THRESHOLD: f64 = 0.10;
 #[derive(Debug, Clone, Default)]
 pub struct BenchmarkStats {
     /// VC-generation wall time per iteration, seconds: each entry is one
-    /// full generation - both symbolic executions (one for race-check
+    /// full generation from the parsed modules - lowering plus symbolic
+    /// execution for both kernels (just the reference for race-check
     /// benchmarks) plus footprint pairing (nothing to pair for race-check
-    /// and rejected benchmarks). Writing the VC dump file is excluded
-    /// (tracked in `dump_write_secs`). Empty only for infrastructure
-    /// failures.
+    /// and rejected benchmarks). File reading and parsing happen once per
+    /// benchmark, outside the timed loop; writing the VC dump file is
+    /// excluded too (tracked in `dump_write_secs`). Empty only for
+    /// infrastructure failures.
     pub vc_gen_iters_secs: Vec<f64>,
     /// Time writing the `.vcdump` file (once, from the last generation);
     /// `None` when no dump was written.
@@ -252,40 +258,108 @@ enum Generated {
     },
 }
 
-/// The cheap shape of one generation, kept across iterations (without
-/// the arenas) to check that every iteration generated the same thing.
+/// One benchmark's kernel file(s), read and parsed once per run (see
+/// [`BenchmarkRunner::load_benchmark`]): every generation iteration
+/// re-analyzes the same parsed modules. Each module is paired with its
+/// `KernelRun` so [`generate`] cannot mix a module up with the wrong
+/// launch config.
+struct LoadedBenchmark<'d> {
+    reference: (&'d KernelRun, Module),
+    optimized: Option<(&'d KernelRun, Module)>,
+}
+
+/// One VC-generation iteration over the already-parsed modules: lower
+/// and run the kernel(s), then pair the footprints. `Err` is an
+/// infrastructure failure (lowering, footprint pairing); an analysis
+/// *rejection* (race, deadlock, ...) is a `Generated::Rejected` outcome,
+/// expected for racy benchmarks.
+fn generate(loaded: &LoadedBenchmark) -> Result<Generated> {
+    let (reference_run, reference_module) = &loaded.reference;
+    let reference = match analyze(reference_module, reference_run)? {
+        Ok(output) => output,
+        Err(e) => {
+            return Ok(Generated::Rejected {
+                outcome: rejected_outcome(e),
+            });
+        }
+    };
+    let Some((optimized_run, optimized_module)) = &loaded.optimized else {
+        // Race-check benchmark: reaching the end means no race.
+        return Ok(Generated::RaceFree { reference });
+    };
+    let optimized = match analyze(optimized_module, optimized_run)? {
+        Ok(output) => output,
+        Err(e) => {
+            return Ok(Generated::Rejected {
+                outcome: rejected_outcome(e),
+            });
+        }
+    };
+    // Pair along the reference config's declared output arrays - the
+    // tail of VC generation, shared by both solve backends.
+    let arrays = reference_run.config.output_array_names();
+    let paired = paired_elements(&reference, &optimized, &arrays)
+        .map_err(|e| anyhow!("pairing footprints: {}", e))?;
+    Ok(Generated::Equivalence {
+        reference,
+        optimized,
+        paired,
+    })
+}
+
+/// Lower and run one kernel from its parsed module, splitting the two
+/// failure modes the runner cares about: the outer error is an
+/// infrastructure failure (lowering); the inner error is an analysis
+/// rejection (race, deadlock, structured-CTA violation, ...), which for
+/// a race-check benchmark is itself the expected outcome.
+fn analyze(module: &Module, run: &KernelRun) -> Result<Result<AnalysisOutput, EvalError>> {
+    match analyze_kernel(module, Some(&run.kernel), run.config.clone()) {
+        Ok(output) => Ok(Ok(output)),
+        Err(AnalysisError::Eval(e)) => Ok(Err(e)),
+        Err(e) => Err(anyhow!("{}: {}", run.path, e)),
+    }
+}
+
+/// The cheap fingerprint of one generation, kept across iterations
+/// (without the arenas) to check that every iteration generated the same
+/// thing - footprints *and* expression identities.
 ///
 /// For rejections only the verdict-bearing part is compared - the status
-/// (RACE vs REJECT), not the diagnostic text: which access pair a race
-/// report happens to name first varies benignly run to run (hash-map
-/// iteration order in the race reporter), while a rejection *kind* flip
-/// would change the benchmark verdict and must fail loudly.
+/// (RACE vs REJECT), not the diagnostic text: diagnostic text may embed
+/// schedule-dependent details, so verdict kinds are the contract; a
+/// rejection *kind* flip would change the benchmark verdict and must
+/// fail loudly.
 #[derive(PartialEq)]
 enum GenShape {
     Rejected {
         status: &'static str,
     },
     RaceFree {
-        footprint: FootprintShape,
+        reference: KernelFingerprint,
     },
     Equivalence {
-        reference: FootprintShape,
-        optimized: FootprintShape,
+        reference: KernelFingerprint,
+        optimized: KernelFingerprint,
     },
 }
 
-/// Per-array written element indices of one kernel's outputs.
+/// One kernel's generation fingerprint: the arena's node count plus the
+/// full per-array `(index, ExprId)` output lists. Each generation builds
+/// a fresh arena deterministically, so identical construction order is
+/// equivalent to identical ids - `ExprId` equality across independent
+/// arenas is a strong expression-identity check that costs nothing (no
+/// rendering, no arena retained).
 #[derive(PartialEq)]
-struct FootprintShape(Vec<(String, Vec<u64>)>);
+struct KernelFingerprint {
+    node_count: usize,
+    outputs: Vec<(String, Vec<(u64, ExprId)>)>,
+}
 
-fn footprint_shape(output: &AnalysisOutput) -> FootprintShape {
-    FootprintShape(
-        output
-            .outputs
-            .iter()
-            .map(|(name, elems)| (name.clone(), elems.iter().map(|&(i, _)| i).collect()))
-            .collect(),
-    )
+fn kernel_fingerprint(output: &AnalysisOutput) -> KernelFingerprint {
+    KernelFingerprint {
+        node_count: output.arena.node_count(),
+        outputs: output.outputs.clone(),
+    }
 }
 
 impl Generated {
@@ -295,15 +369,15 @@ impl Generated {
                 status: outcome.status(),
             },
             Self::RaceFree { reference } => GenShape::RaceFree {
-                footprint: footprint_shape(reference),
+                reference: kernel_fingerprint(reference),
             },
             Self::Equivalence {
                 reference,
                 optimized,
                 ..
             } => GenShape::Equivalence {
-                reference: footprint_shape(reference),
-                optimized: footprint_shape(optimized),
+                reference: kernel_fingerprint(reference),
+                optimized: kernel_fingerprint(optimized),
             },
         }
     }
@@ -319,53 +393,72 @@ impl GenShape {
     }
 }
 
-/// First difference between one kernel's footprints across two
+/// First difference between one kernel's fingerprints across two
 /// generation iterations, as a message fragment; `None` when identical.
-fn footprint_mismatch(kernel: &str, a: &FootprintShape, b: &FootprintShape) -> Option<String> {
+fn fingerprint_mismatch(
+    kernel: &str,
+    a: &KernelFingerprint,
+    b: &KernelFingerprint,
+) -> Option<String> {
     if a == b {
         return None;
     }
-    for ((an, ai), (bn, bi)) in a.0.iter().zip(&b.0) {
+    if a.node_count != b.node_count {
+        return Some(format!(
+            "{} kernel: built {} vs {} arena nodes",
+            kernel, a.node_count, b.node_count
+        ));
+    }
+    for ((an, ae), (bn, be)) in a.outputs.iter().zip(&b.outputs) {
         if an != bn {
             return Some(format!(
                 "{} kernel: output array '{}' vs '{}'",
                 kernel, an, bn
             ));
         }
-        if ai.len() != bi.len() {
+        if ae.len() != be.len() {
             return Some(format!(
                 "{} kernel: array '{}' wrote {} vs {} elements",
                 kernel,
                 an,
-                ai.len(),
-                bi.len()
+                ae.len(),
+                be.len()
             ));
         }
-        if ai != bi {
-            return Some(format!(
-                "{} kernel: array '{}' wrote different element indices",
-                kernel, an
-            ));
+        for (&(ai, a_expr), &(bi, b_expr)) in ae.iter().zip(be) {
+            if ai != bi {
+                return Some(format!(
+                    "{} kernel: array '{}' wrote element {} vs {}",
+                    kernel, an, ai, bi
+                ));
+            }
+            if a_expr != b_expr {
+                return Some(format!(
+                    "{} kernel: array '{}' element {} built expression {:?} vs {:?}",
+                    kernel, an, ai, a_expr, b_expr
+                ));
+            }
         }
     }
     Some(format!(
         "{} kernel: {} vs {} output arrays",
         kernel,
-        a.0.len(),
-        b.0.len()
+        a.outputs.len(),
+        b.outputs.len()
     ))
 }
 
-/// How a later generation iteration's shape disagrees with iteration
-/// 1's; `None` when they agree. The interpreter is deterministic, so any
-/// disagreement is a bug to fail loudly on, not to time quietly.
+/// How a later generation iteration's fingerprint disagrees with
+/// iteration 1's; `None` when they agree. The interpreter is
+/// deterministic, so any disagreement is a bug to fail loudly on, not to
+/// time quietly.
 fn gen_shape_mismatch(first: &GenShape, later: &GenShape) -> Option<String> {
     match (first, later) {
         (GenShape::Rejected { status: a }, GenShape::Rejected { status: b }) => {
             (a != b).then(|| format!("iteration 1 rejected as {}, this one as {}", a, b))
         }
-        (GenShape::RaceFree { footprint: a }, GenShape::RaceFree { footprint: b }) => {
-            footprint_mismatch("the", a, b)
+        (GenShape::RaceFree { reference: a }, GenShape::RaceFree { reference: b }) => {
+            fingerprint_mismatch("the", a, b)
         }
         (
             GenShape::Equivalence {
@@ -376,8 +469,8 @@ fn gen_shape_mismatch(first: &GenShape, later: &GenShape) -> Option<String> {
                 reference: r2,
                 optimized: o2,
             },
-        ) => footprint_mismatch("reference", r1, r2)
-            .or_else(|| footprint_mismatch("optimized", o1, o2)),
+        ) => fingerprint_mismatch("reference", r1, r2)
+            .or_else(|| fingerprint_mismatch("optimized", o1, o2)),
         _ => Some(format!(
             "iteration 1 produced {}, this one {}",
             first.kind(),
@@ -457,57 +550,39 @@ impl BenchmarkRunner {
             .collect()
     }
 
-    /// One VC-generation iteration: run the kernel(s) and pair the
-    /// footprints. `Err` is an infrastructure failure (I/O, parse,
-    /// lowering, footprint pairing); an analysis *rejection* (race,
-    /// deadlock, ...) is a `Generated::Rejected` outcome, expected for
-    /// racy benchmarks.
-    fn generate(&self, def: &BenchmarkDef) -> Result<Generated> {
-        let reference = match self.analyze(&def.reference)? {
-            Ok(output) => output,
-            Err(e) => {
-                return Ok(Generated::Rejected {
-                    outcome: rejected_outcome(e),
-                });
-            }
+    /// Read and parse the benchmark's kernel file(s) - once per run,
+    /// before the timed generation loop: file I/O and parsing are not
+    /// part of VC generation (lowering is; it happens inside
+    /// `analyze_kernel`, per iteration).
+    fn load_benchmark<'d>(&self, def: &'d BenchmarkDef) -> Result<LoadedBenchmark<'d>> {
+        let load = |run: &'d KernelRun| {
+            load_module(&self.config.kernels_dir.join(&run.path)).map(|module| (run, module))
         };
-        let Some(optimized_run) = &def.optimized else {
-            // Race-check benchmark: reaching the end means no race.
-            return Ok(Generated::RaceFree { reference });
-        };
-        let optimized = match self.analyze(optimized_run)? {
-            Ok(output) => output,
-            Err(e) => {
-                return Ok(Generated::Rejected {
-                    outcome: rejected_outcome(e),
-                });
-            }
-        };
-        // Pair along the reference config's declared output arrays - the
-        // tail of VC generation, shared by both solve backends.
-        let arrays = def.reference.config.output_array_names();
-        let paired = paired_elements(&reference, &optimized, &arrays)
-            .map_err(|e| anyhow!("pairing footprints: {}", e))?;
-        Ok(Generated::Equivalence {
-            reference,
-            optimized,
-            paired,
+        Ok(LoadedBenchmark {
+            reference: load(&def.reference)?,
+            optimized: def.optimized.as_ref().map(load).transpose()?,
         })
     }
 
     fn run_inner(&self, def: &BenchmarkDef) -> Result<RunOutput, RunFailure> {
         let mut stats = BenchmarkStats::default();
 
+        // Kernel files are read and parsed once, outside the timed
+        // generation loop below - file I/O and parsing are not part of
+        // the VC-generation phase.
+        let loaded = self.load_benchmark(def)?;
+
         // --- VC generation: `iterations` timed runs. Only the last
         // one's outputs are kept (dropping the previous before the next
         // starts, so peak memory is a single generation); every later
-        // iteration's shape must match iteration 1's.
+        // iteration's fingerprint (outcome kind, footprints, expression
+        // identities) must match iteration 1's.
         let mut first_shape: Option<GenShape> = None;
         let mut last: Option<Generated> = None;
         for iteration in 1..=self.config.iterations.get() {
             drop(last.take());
             let gen_start = Instant::now();
-            let generated = self.generate(def)?;
+            let generated = generate(&loaded)?;
             stats
                 .vc_gen_iters_secs
                 .push(gen_start.elapsed().as_secs_f64());
@@ -558,9 +633,9 @@ impl BenchmarkRunner {
         };
 
         // Execution counters from the last generation (every iteration
-        // executes identically; the shape check above guards the
-        // footprint part of that). The paper's tables report the
-        // optimized kernel's sync counts.
+        // executes identically; the fingerprint check above guards the
+        // footprint-and-expression part of that). The paper's tables
+        // report the optimized kernel's sync counts.
         stats.instructions = reference.stats.instructions + optimized.stats.instructions;
         stats.block_syncs = optimized.stats.block_syncs;
         stats.warp_syncs = optimized.stats.warp_syncs;
@@ -610,21 +685,6 @@ impl BenchmarkRunner {
             dump_path: persisted.path,
             z3,
         })
-    }
-
-    /// Run one kernel, splitting the two failure modes the runner cares
-    /// about: the outer error is an infrastructure failure (I/O, parse,
-    /// lowering); the inner error is an analysis rejection (race, deadlock,
-    /// structured-CTA violation, ...), which for a race-check benchmark is
-    /// itself the expected outcome.
-    fn analyze(&self, run: &KernelRun) -> Result<Result<AnalysisOutput, EvalError>> {
-        let path = self.config.kernels_dir.join(&run.path);
-        let module = load_module(&path)?;
-        match analyze_kernel(&module, Some(&run.kernel), run.config.clone()) {
-            Ok(output) => Ok(Ok(output)),
-            Err(AnalysisError::Eval(e)) => Ok(Err(e)),
-            Err(e) => Err(anyhow!("{}: {}", run.path, e)),
-        }
     }
 
     /// Compare the two outputs element for element along the named
@@ -708,8 +768,9 @@ struct PersistedVcs {
 /// `<vcs_dir>/<sanitized-name>.vcdump` via the shared
 /// `volta_analysis::driver::vc_dump` format (the same file `volta compare
 /// --dump-vcs` writes and `--from-dump` reads), overwriting any previous
-/// run's dump - VCs are deterministic (and the generation phase's shape
-/// check enforces the footprint part of that per run). A write failure
+/// run's dump - VCs are deterministic (and the generation phase's
+/// fingerprint check enforces the footprint-and-expression-identity part
+/// of that per run). A write failure
 /// warns and carries on: a full disk should not change a benchmark
 /// verdict.
 ///
@@ -766,6 +827,77 @@ fn rejected_outcome(e: EvalError) -> ActualOutcome {
     ActualOutcome::Rejected {
         description: e.to_string(),
         is_race,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use id_collections::Id;
+
+    use super::*;
+
+    fn fp(node_count: usize, elems: &[(u64, u32)]) -> KernelFingerprint {
+        KernelFingerprint {
+            node_count,
+            outputs: vec![(
+                "out".to_string(),
+                elems
+                    .iter()
+                    .map(|&(i, id)| (i, ExprId::from_index(id)))
+                    .collect(),
+            )],
+        }
+    }
+
+    #[test]
+    fn identical_fingerprints_agree() {
+        let a = fp(7, &[(0, 3), (1, 5)]);
+        let b = fp(7, &[(0, 3), (1, 5)]);
+        assert_eq!(fingerprint_mismatch("reference", &a, &b), None);
+    }
+
+    #[test]
+    fn node_count_divergence_is_named() {
+        let a = fp(7, &[(0, 3)]);
+        let b = fp(8, &[(0, 3)]);
+        let msg = fingerprint_mismatch("reference", &a, &b).unwrap();
+        assert!(msg.contains("7 vs 8 arena nodes"), "{}", msg);
+    }
+
+    #[test]
+    fn expression_identity_divergence_is_named() {
+        // Same footprint indices, different ExprIds: exactly the case
+        // the pre-fingerprint shape check let slip through.
+        let a = fp(7, &[(0, 3), (1, 5)]);
+        let b = fp(7, &[(0, 3), (1, 6)]);
+        let msg = fingerprint_mismatch("optimized", &a, &b).unwrap();
+        assert!(
+            msg.contains("array 'out' element 1 built expression"),
+            "{}",
+            msg
+        );
+    }
+
+    #[test]
+    fn footprint_index_divergence_is_named() {
+        let a = fp(7, &[(0, 3)]);
+        let b = fp(7, &[(2, 3)]);
+        let msg = fingerprint_mismatch("the", &a, &b).unwrap();
+        assert!(msg.contains("wrote element 0 vs 2"), "{}", msg);
+    }
+
+    #[test]
+    fn rejection_kind_flip_is_named_but_text_is_not_compared() {
+        // Rejections compare by verdict kind only: diagnostic text may
+        // embed schedule-dependent details.
+        let race = GenShape::Rejected { status: "RACE" };
+        let reject = GenShape::Rejected { status: "REJECT" };
+        assert_eq!(
+            gen_shape_mismatch(&race, &GenShape::Rejected { status: "RACE" }),
+            None
+        );
+        let msg = gen_shape_mismatch(&race, &reject).unwrap();
+        assert!(msg.contains("RACE") && msg.contains("REJECT"), "{}", msg);
     }
 }
 

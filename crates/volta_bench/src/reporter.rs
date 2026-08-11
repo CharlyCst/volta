@@ -139,7 +139,7 @@ pub fn print_single_result(out: &mut impl Write, result: &BenchmarkResult) -> Re
     writeln!(out, "Passed:  {}", if result.passed { "yes" } else { "no" })?;
     writeln!(
         out,
-        "VC gen:  {:.3}s median of {} iteration(s) (exec + footprint pairing)",
+        "VC gen:  {:.3}s median of {} iteration(s) (lowering + exec + footprint pairing)",
         result.stats.vc_gen_median_secs(),
         result.stats.vc_gen_iters_secs.len(),
     )?;
