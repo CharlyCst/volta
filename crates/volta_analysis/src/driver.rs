@@ -538,7 +538,7 @@ pub mod vc_dump {
     //! validates every id in the decoded dump so a corrupt file errors
     //! instead of panicking later.
 
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     use std::path::Path;
 
     use bincode::Options;
@@ -565,37 +565,45 @@ pub mod vc_dump {
     pub fn write_vc_dump(path: &Path, dump: &VcDump) -> io::Result<()> {
         let file = std::fs::File::create(path)?;
         let mut writer = io::BufWriter::new(file);
+        write_vc_dump_to(&mut writer, dump)?;
+        writer.flush()
+    }
+
+    /// Serialize `dump` (header + payload) into any writer - the exact
+    /// byte stream [`write_vc_dump`] puts on disk. Split out so a caller
+    /// that needs the bytes as they are produced (volta-bench's manifest
+    /// fingerprint hashes them through a tee writer) can observe them
+    /// without buffering a second, possibly GiB-scale, copy in memory.
+    /// Does not flush.
+    pub fn write_vc_dump_to(writer: &mut impl Write, dump: &VcDump) -> io::Result<()> {
         writer.write_all(DUMP_MAGIC)?;
         writer.write_all(&DUMP_MAJOR.to_le_bytes())?;
         writer.write_all(&DUMP_MINOR.to_le_bytes())?;
         // `serialize_into` uses fixint little-endian; `read_vc_dump` must
         // decode with a matching `with_fixint_encoding()` (bincode's
         // `options()` default is varint, which would not round-trip).
-        bincode::serialize_into(&mut writer, dump).map_err(io::Error::other)?;
-        writer.flush()
+        bincode::serialize_into(writer, dump).map_err(io::Error::other)
     }
 
     /// Read a dump written by [`write_vc_dump`], checking the header and
     /// validating the decoded contents.
     pub fn read_vc_dump(path: &Path) -> io::Result<VcDump> {
-        let file = std::fs::File::open(path)?;
-        // Cap decode allocations at the file size, so a crafted length prefix
-        // can't make bincode try to allocate (e.g.) a terabyte before it ever
-        // reads that many bytes.
-        let file_len = file.metadata()?.len();
-        let mut reader = io::BufReader::new(file);
+        read_vc_dump_bytes(&std::fs::read(path)?)
+    }
 
-        let mut header = [0u8; 12];
-        reader.read_exact(&mut header).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "not a volta VC dump (file is shorter than the header)",
-                )
-            } else {
-                e
-            }
-        })?;
+    /// Decode a dump from its full file contents (see [`read_vc_dump`]).
+    /// Split out so a caller that already holds the raw bytes -
+    /// volta-bench's `solve` fingerprints them against its manifest
+    /// before decoding anything - can decode the same buffer instead of
+    /// reading the file twice.
+    pub fn read_vc_dump_bytes(bytes: &[u8]) -> io::Result<VcDump> {
+        if bytes.len() < 12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a volta VC dump (file is shorter than the header)",
+            ));
+        }
+        let (header, payload) = bytes.split_at(12);
         if &header[..8] != DUMP_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -614,11 +622,14 @@ pub mod vc_dump {
             ));
         }
 
+        // Cap decode allocations at the payload size, so a crafted length
+        // prefix can't make bincode try to allocate (e.g.) a terabyte
+        // before it ever reads that many bytes.
         let dump: VcDump = bincode::options()
             .with_fixint_encoding()
             .allow_trailing_bytes()
-            .with_limit(file_len)
-            .deserialize_from(&mut reader)
+            .with_limit(payload.len() as u64)
+            .deserialize(payload)
             .map_err(io::Error::other)?;
         dump.validate().map_err(|e| {
             io::Error::new(

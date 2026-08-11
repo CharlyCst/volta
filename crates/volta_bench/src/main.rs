@@ -26,6 +26,10 @@ use volta_bench::{
 };
 use volta_common::run_log::RunLog;
 
+/// The `--z3-timeout` default, named so the "flag has no effect here"
+/// notes below can detect a non-default value.
+const DEFAULT_Z3_TIMEOUT_SECS: u64 = 30;
+
 /// Log level for controlling `log`-crate output verbosity (mirrors
 /// `volta_cli`'s so the two tools take the same `--log-level` values).
 #[cfg(feature = "logging")]
@@ -100,9 +104,9 @@ struct Cli {
     #[arg(long, global = true)]
     z3: bool,
 
-    /// Soft per-query Z3 timeout in seconds under --z3 (0 = no limit;
-    /// expiry reports `timeout`)
-    #[arg(long, global = true, default_value_t = 30)]
+    /// Soft per-query Z3 timeout in seconds under --z3 or `solve
+    /// --backend z3|both` (0 = no limit; expiry reports `timeout`)
+    #[arg(long, global = true, default_value_t = DEFAULT_Z3_TIMEOUT_SECS)]
     z3_timeout: u64,
 
     /// Output directory: VC dumps under <out-dir>/vcs/, results JSON
@@ -170,9 +174,10 @@ enum Commands {
         #[command(subcommand)]
         target: Target,
         /// Which backend(s) to solve with: the decision procedure, z3
-        /// (no decision verdict; the z3 outcomes are the data), or both
-        /// side by side. --verify-numeric confirms decision-procedure
-        /// verdicts, so it needs decision|both
+        /// (no decision verdict; the z3 outcomes are the data, except
+        /// that a not_equivalent verdict fails the row), or both side by
+        /// side. --verify-numeric confirms decision-procedure verdicts,
+        /// so it needs decision|both
         #[arg(long, global = true, value_enum, default_value_t = BackendArg::Decision)]
         backend: BackendArg,
         /// Also write the results document to this explicit path (the
@@ -485,7 +490,11 @@ fn main() -> ExitCode {
             let records = vec![results::benchmark_record(&result)];
             write_results(&out_dir, &meta, records, json.as_deref());
             let mut stdout = std::io::stdout().lock();
-            print_stdout(print_single_result(&mut stdout, &result));
+            print_stdout(print_single_result(
+                &mut stdout,
+                &result,
+                TableMode::Combined,
+            ));
             print_stdout(
                 write_op_counts(&mut stdout, "reference", &result.stats.reference_op_counts)
                     .map_err(anyhow::Error::from),
@@ -526,6 +535,9 @@ fn main() -> ExitCode {
             }
             if cli.recycle_terms != volta_analysis::equiv::DEFAULT_RECYCLE_TERMS {
                 ignored.push("--recycle-terms");
+            }
+            if cli.z3_timeout != DEFAULT_Z3_TIMEOUT_SECS {
+                ignored.push("--z3-timeout");
             }
             if !ignored.is_empty() {
                 eprintln!(
@@ -581,10 +593,26 @@ fn main() -> ExitCode {
                 return finish(log, ExitCode::FAILURE);
             }
             let backend = SolveBackend::from(backend);
+            // Flags for a phase this backend doesn't run are noted and
+            // ignored (the run proceeds), like `generate`'s note.
             if cli.verify_numeric && !backend.runs_decision() {
                 eprintln!(
                     "note: --verify-numeric confirms decision-procedure verdicts; \
                      it has no effect with --backend z3"
+                );
+            }
+            if cli.recycle_terms != volta_analysis::equiv::DEFAULT_RECYCLE_TERMS
+                && !backend.runs_decision()
+            {
+                eprintln!(
+                    "note: --recycle-terms tunes the decision procedure's intern \
+                     tables; it has no effect with --backend z3"
+                );
+            }
+            if cli.z3_timeout != DEFAULT_Z3_TIMEOUT_SECS && !backend.runs_z3() {
+                eprintln!(
+                    "note: --z3-timeout bounds z3 queries; it has no effect with \
+                     --backend decision"
                 );
             }
             let defs = match resolve_target(&target, "solve", &mut log) {
@@ -633,7 +661,7 @@ fn main() -> ExitCode {
             let solved: Vec<BenchmarkResult> = items
                 .into_iter()
                 .filter_map(|item| match item {
-                    SolveItem::Solved(r) => Some(r),
+                    SolveItem::Solved(r) => Some(*r),
                     SolveItem::Skipped { .. } => None,
                 })
                 .collect();
@@ -758,7 +786,7 @@ fn print_phase_results(
             let Some(result) = results.first() else {
                 return;
             };
-            print_stdout(print_single_result(&mut stdout, result));
+            print_stdout(print_single_result(&mut stdout, result, mode));
             // Execution profiles exist only when this run executed the
             // kernels (`generate`); `write_op_counts` skips empty maps.
             print_stdout(

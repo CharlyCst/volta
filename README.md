@@ -286,12 +286,15 @@ Useful flags (global):
   `<out-dir>/results/` is always written; both contain the same document)
 
 `--sample`, `--verify-numeric`, and `--recycle-terms` are solve-phase
-options: they apply to the one-shot commands and to `solve` (where
-`--verify-numeric` needs `--backend decision|both` - the oracle confirms
-decision-procedure verdicts), and `generate` notes and ignores them.
-`--z3` belongs to the one-shot commands only; `solve` picks its
-solver(s) with `--backend`. `--iterations` applies to whichever phases a
-command runs.
+options: they apply to the one-shot commands and to `solve`, and
+`generate` notes and ignores them (as it does a non-default
+`--z3-timeout`). Within `solve`, `--verify-numeric` and
+`--recycle-terms` act on the decision procedure, so under `--backend
+z3` the run prints a note that they have no effect and proceeds;
+symmetrically, `--z3-timeout` acts on the z3 phase and is
+noted-and-ignored under `--backend decision`. `--z3` belongs to the
+one-shot commands only; `solve` picks its solver(s) with `--backend`.
+`--iterations` applies to whichever phases a command runs.
 
 `single` also prints a per-instruction-kind execution profile for both
 kernels automatically (matching `volta compare`'s default); `all`/`category`
@@ -320,6 +323,11 @@ cargo run --release -p volta_bench -- --recycle-terms 0 solve all
 cargo run --release -p volta_bench -- solve all --sample 1
 
 # 4. Z3 on the same sampled elements under a 10-minute budget - Table 8.
+#    unknown/timeout/unsupported are Table 8's data, never failures; a z3
+#    `not_equivalent` on any element FAILS that row (`Z3 DIFF`, nonzero exit) -
+#    with no decision verdict in --backend z3, an affirmative refutation is
+#    exactly what this step must surface (even one that turns out spurious:
+#    volta_z3's SMT division-at-zero semantics diverge from canon's field model).
 cargo run --release -p volta_bench -- solve all --sample 1 --backend z3 --z3-timeout 600
 ```
 
@@ -328,11 +336,12 @@ solve timings - and those verdicts come from generation (race-check
 benchmarks' whole analysis is the symbolic execution), so they land in
 step 1's results file and `solve` skips those benchmarks with a note.
 Steps 2-4 never re-execute a kernel: they load `bench-out/vcs/*.vcdump`
-(validated on load, and checked against `bench-out/vcs/manifest.json` so
-a stale or mixed dump directory fails loudly instead of quietly solving
-the wrong VCs; the load time is reported as `dump_load_secs`, excluded
-from the solve timings). On a memory-limited machine, replace step 2
-with per-category `solve category <c>` runs under a positive
+(each file's bytes are hashed against `bench-out/vcs/manifest.json`
+*before* decoding, then validated on load, so a stale, mixed, or
+modified dump directory fails loudly instead of quietly solving the
+wrong VCs; the load time is reported as `dump_load_secs`, excluded from
+the solve timings). On a memory-limited machine, replace step 2 with
+per-category `solve category <c>` runs under a positive
 `--recycle-terms` (see the memory note below) - step 2 as written wants
 the full-footprint attention working set.
 
@@ -409,12 +418,23 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
   Race-check benchmarks have no VCs (nothing to compare); they are
   skipped with a console note.
 - `bench-out/vcs/manifest.json` - written by `generate` (read-modify-
-  write per dump, so partial regenerations keep the other entries):
-  each dump's benchmark name, generation timestamp, and per-array
-  footprint element counts. `solve` checks every dump it loads against
-  it and hard-errors on disagreement (a stale or mixed vcs directory);
-  a missing manifest or entry is only a warning, so hand-copied dumps
-  stay usable.
+  write per dump, atomically via temp file + rename, so partial
+  regenerations keep the other entries): each dump's benchmark name,
+  generation timestamp, `vc_fingerprint` (a stable FNV-1a hash of the
+  exact `.vcdump` bytes written), and per-array footprint element
+  counts (informational). `solve` hashes every dump file's bytes
+  against the manifest *before* decoding them and hard-errors on
+  disagreement. The guard catches any difference between the dump
+  being solved and the one the last successful `generate` recorded -
+  footprint drift, same-shape expression drift (a one-constant change
+  in the PTX), truncation or corruption; what it deliberately does not
+  check is currency with the current source tree (a dump set
+  consistently regenerated together stays valid however old - solving
+  from dumps is decoupled by design). A generate run that *fails* for
+  a benchmark also deletes that benchmark's leftover dump and entry,
+  so a later `solve` errors on the missing dump instead of silently
+  solving pre-failure VCs. A missing manifest or entry is only a
+  warning, so hand-copied dumps stay usable.
 - `bench-out/results/<unix-seconds>-<pid>-<command>.json` - the results
   of every run command (timestamped like
   the run logs, so runs never clobber each other). One schema for every

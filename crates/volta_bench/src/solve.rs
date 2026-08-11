@@ -2,33 +2,41 @@
 //! from previously generated VC dumps (`volta-bench generate`), with no
 //! parsing, lowering, or symbolic execution involved.
 //!
-//! Per equivalence benchmark: load `<vcs_dir>/<slug>.vcdump` through the
-//! shared `volta_analysis::driver::vc_dump` reader (header + id
-//! validation as usual), check it against the vcs manifest
-//! (`crate::manifest` - the staleness guard), rehydrate both snapshots,
-//! and run the *same* solve-phase functions the one-shot pipeline runs:
+//! Per equivalence benchmark: read `<vcs_dir>/<slug>.vcdump`'s raw
+//! bytes, check their fingerprint against the vcs manifest
+//! (`crate::manifest` - the staleness guard, applied *before* anything
+//! decodes), decode the same buffer through the shared
+//! `volta_analysis::driver::vc_dump` reader (header + id validation as
+//! usual), rehydrate both snapshots, and run the *same* solve-phase
+//! functions the one-shot pipeline runs:
 //! `BenchmarkRunner::check_equivalence` (the decision procedure, under
 //! `--backend decision|both`) and `crate::z3_phase::run_z3_phase` (under
 //! `--backend z3|both`). Verdicts and pass/fail are judged by the same
-//! `assemble_result` tail as the one-shot path.
+//! `assemble_result` tail as the one-shot path - including the
+//! Z3-refutation rule for `--backend z3` (`ActualOutcome::Z3Only`).
 //!
 //! Race-check benchmarks have no VCs and are skipped with a note: their
 //! verdicts are produced by generation (`volta-bench generate` runs them
 //! fully). A missing, corrupt, or manifest-contradicting dump is a
-//! per-benchmark failure naming the `generate` command to run.
+//! per-benchmark failure naming the `generate` command to run; whenever
+//! the dump file exists, the failure record keeps pointing at it
+//! (`dump_path`), matching the one-shot pipeline's post-dump failures.
 //!
-//! Dump load time is recorded (`dump_load_secs`) but excluded from the
-//! solve spans - loading is transport, not solving.
+//! Dump load time - read, fingerprint check, decode - is recorded
+//! (`dump_load_secs`) but excluded from the solve spans: loading is
+//! transport, not solving.
 
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
-use volta_analysis::driver::{paired_elements, sampled_elements, vc_dump::read_vc_dump};
+use anyhow::{Context, Result, anyhow};
+use volta_analysis::driver::{paired_elements, sampled_elements, vc_dump::read_vc_dump_bytes};
 
 use crate::config::{BenchmarkCategory, BenchmarkDef};
 use crate::manifest::{self, ManifestCheck, VcsManifest};
 use crate::results::vc_dump_path;
-use crate::runner::{ActualOutcome, BenchmarkResult, BenchmarkRunner, BenchmarkStats, RunOutput};
+use crate::runner::{
+    ActualOutcome, BenchmarkResult, BenchmarkRunner, BenchmarkStats, RunFailure, RunOutput,
+};
 use crate::z3_phase::run_z3_phase;
 
 /// Which solver backend(s) a `solve` run applies to the dumped VCs.
@@ -71,7 +79,9 @@ pub const RACE_SKIP_NOTE: &str =
 #[derive(Debug)]
 pub enum SolveItem {
     /// An equivalence benchmark: solved (or failed loudly trying).
-    Solved(BenchmarkResult),
+    /// Boxed: a full [`BenchmarkResult`] is ~500 bytes, dwarfing the
+    /// `Skipped` variant.
+    Solved(Box<BenchmarkResult>),
     /// A race-check benchmark: nothing to solve (see [`RACE_SKIP_NOTE`]).
     Skipped {
         name: String,
@@ -146,15 +156,8 @@ impl BenchmarkRunner {
         let start = Instant::now();
         let output = self
             .solve_inner(def, backend, manifest)
-            .unwrap_or_else(|e| RunOutput {
-                outcome: ActualOutcome::Error {
-                    message: format!("{:#}", e),
-                },
-                stats: BenchmarkStats::default(),
-                dump_path: None,
-                z3: None,
-            });
-        SolveItem::Solved(self.assemble_result(def, start, output))
+            .unwrap_or_else(|failure| failure.into_output());
+        SolveItem::Solved(Box::new(self.assemble_result(def, start, output)))
     }
 
     fn solve_inner(
@@ -162,7 +165,7 @@ impl BenchmarkRunner {
         def: &BenchmarkDef,
         backend: SolveBackend,
         manifest: Option<&VcsManifest>,
-    ) -> Result<RunOutput> {
+    ) -> Result<RunOutput, RunFailure> {
         let vcs_dir = self
             .config
             .vcs_dir
@@ -170,35 +173,36 @@ impl BenchmarkRunner {
             .ok_or_else(|| anyhow!("solve requires a VC dump directory"))?;
         let path = vc_dump_path(vcs_dir, &def.name);
         if !path.exists() {
-            bail!(
+            return Err(anyhow!(
                 "no VC dump at {}; run `volta-bench generate single \"{}\"` \
                  (or `volta-bench generate all`) first",
                 path.display(),
                 def.name
-            );
-        }
-        // Load (timed into `dump_load_secs`, never into the solve
-        // spans). `read_vc_dump` checks the header and validates every
-        // id, so stale-format/corrupt files fail here with its message.
-        let load_start = Instant::now();
-        let dump = read_vc_dump(&path).with_context(|| {
-            format!(
-                "loading VC dump {} (if it is stale or corrupt, re-run \
-                 `volta-bench generate`)",
-                path.display()
             )
-        })?;
-        let dump_load_secs = load_start.elapsed().as_secs_f64();
+            .into());
+        }
+        // The dump file exists from here on: every later failure keeps
+        // pointing at it in the record (`RunFailure::dump_path`),
+        // matching the one-shot pipeline's post-dump failures.
+        let fail = |error: anyhow::Error| RunFailure {
+            error,
+            dump_path: Some(path.clone()),
+        };
 
-        // The staleness guard: the dump must hold what `generate` last
-        // recorded for this benchmark.
+        // Load (timed into `dump_load_secs`, never into the solve
+        // spans): read the raw bytes, fingerprint them against the
+        // manifest *before* decoding anything - the staleness guard; the
+        // dump must be byte-for-byte what `generate` last recorded
+        // (`crate::manifest` documents what that does and does not
+        // catch) - then decode the same buffer. `read_vc_dump_bytes`
+        // checks the header and validates every id, so
+        // stale-format/corrupt files fail with its message.
+        let load_start = Instant::now();
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading VC dump {}", path.display()))
+            .map_err(fail)?;
         if let Some(manifest) = manifest {
-            match manifest::check_dump(
-                manifest,
-                &def.name,
-                &dump.reference.outputs,
-                &dump.optimized.outputs,
-            )? {
+            match manifest::check_dump(manifest, &def.name, &bytes).map_err(fail)? {
                 ManifestCheck::Verified => {}
                 ManifestCheck::NoEntry => eprintln!(
                     "warning: {}: dump has no manifest entry (hand-copied?); \
@@ -207,6 +211,17 @@ impl BenchmarkRunner {
                 ),
             }
         }
+        let dump = read_vc_dump_bytes(&bytes)
+            .with_context(|| {
+                format!(
+                    "loading VC dump {} (if it is stale or corrupt, re-run \
+                     `volta-bench generate`)",
+                    path.display()
+                )
+            })
+            .map_err(fail)?;
+        drop(bytes);
+        let dump_load_secs = load_start.elapsed().as_secs_f64();
 
         let reference = dump.reference.into_analysis_output();
         let optimized = dump.optimized.into_analysis_output();
@@ -216,26 +231,30 @@ impl BenchmarkRunner {
             ..BenchmarkStats::default()
         };
         let paired = paired_elements(&reference, &optimized, &arrays)
-            .map_err(|e| anyhow!("pairing the dumped footprints: {}", e))?;
+            .map_err(|e| fail(anyhow!("pairing the dumped footprints: {}", e)))?;
         stats.elements_total = paired.iter().map(|(_, common)| common.len() as u64).sum();
 
         // --- Decision solve (backend decision|both): the same phase
         // function as the one-shot pipeline, iterations and all.
         let outcome = if backend.runs_decision() {
-            self.check_equivalence(&reference, &optimized, &arrays, &mut stats)?
+            self.check_equivalence(&reference, &optimized, &arrays, &mut stats)
+                .map_err(fail)?
         } else {
             stats.elements_checked = sampled_elements(&paired, self.config.sample).len() as u64;
-            ActualOutcome::Z3Only
+            // `assemble_result` folds the Z3 phase's `not_equivalent`
+            // counts into `refutations` - the judgment lives there so
+            // every entry point applies the same rule.
+            ActualOutcome::Z3Only { refutations: 0 }
         };
 
         // --- Z3 solve (backend z3|both): the same phase function as the
         // one-shot `--z3` comparison, over the same sampled elements.
         let z3 = if backend.runs_z3() {
             let options = self.config.z3.as_ref().ok_or_else(|| {
-                anyhow!(
+                fail(anyhow!(
                     "solve backend '{}' requires Z3 options in the runner config",
                     backend.name()
-                )
+                ))
             })?;
             let sampled = sampled_elements(&paired, self.config.sample);
             Some(run_z3_phase(
@@ -305,7 +324,8 @@ mod tests {
     }
 
     /// A missing dump is a per-benchmark FAILURE record that names the
-    /// generate command to run - not a panic, not a silent skip.
+    /// generate command to run - not a panic, not a silent skip. With no
+    /// file on disk there is no dump path to record.
     #[test]
     fn missing_dump_is_a_failure_naming_generate() {
         let dir = temp_vcs_dir("missing");
@@ -316,6 +336,7 @@ mod tests {
         };
         assert!(!result.passed);
         assert_eq!(result.outcome.status(), "ERR");
+        assert_eq!(result.dump_path, None);
         let ActualOutcome::Error { message } = &result.outcome else {
             panic!("missing dump must be an Error outcome");
         };
@@ -348,7 +369,8 @@ mod tests {
 
     /// A well-formed dump solves to the expected verdict with the load
     /// time recorded, and a disagreeing manifest turns the same dump into
-    /// a hard per-benchmark failure (the stale/mixed-directory guard).
+    /// a hard per-benchmark failure (the stale/mixed-directory guard) -
+    /// whose record still points at the on-disk dump file.
     #[test]
     fn solve_from_dump_checks_manifest_and_solves() {
         let dir = temp_vcs_dir("dump");
@@ -357,14 +379,18 @@ mod tests {
             reference: snapshot("in", 2),
             optimized: snapshot("in", 2),
         };
-        write_vc_dump(&vc_dump_path(&dir, &def.name), &dump).unwrap();
+        let dump_path = vc_dump_path(&dir, &def.name);
+        write_vc_dump(&dump_path, &dump).unwrap();
+        let dump_bytes = std::fs::read(&dump_path).unwrap();
 
-        // Matching manifest: verified and solved (identical expressions
-        // on both sides -> EQUIV, which matches the expectation).
+        // Matching manifest (the fingerprint of the exact file bytes):
+        // verified and solved (identical expressions on both sides ->
+        // EQUIV, which matches the expectation).
         let mut manifest = VcsManifest::new();
         manifest::record_dump(
             &mut manifest,
             &def.name,
+            manifest::fingerprint_bytes(&dump_bytes),
             &dump.reference.outputs,
             &dump.optimized.outputs,
         );
@@ -380,13 +406,14 @@ mod tests {
         assert_eq!(result.stats.elements_total, 2);
         assert!(!result.stats.solve_iters_secs.is_empty());
 
-        // Stale manifest (recorded a different footprint): hard failure
-        // pointing at generate.
+        // Stale manifest (recorded a different generation's fingerprint):
+        // hard failure pointing at generate, record pointing at the dump.
         let mut stale = VcsManifest::new();
         manifest::record_dump(
             &mut stale,
             &def.name,
-            &snapshot("in", 5).outputs,
+            manifest::fingerprint_bytes(b"a different generation's bytes"),
+            &dump.reference.outputs,
             &dump.optimized.outputs,
         );
         let SolveItem::Solved(result) =
@@ -395,10 +422,18 @@ mod tests {
             panic!("solved, not skipped");
         };
         assert!(!result.passed);
+        assert_eq!(
+            result.dump_path.as_deref(),
+            Some(dump_path.as_path()),
+            "post-existence failures keep pointing at the dump file"
+        );
         let ActualOutcome::Error { message } = &result.outcome else {
             panic!("manifest disagreement must be an Error outcome");
         };
-        assert!(message.contains("stale or mixed"), "{message}");
+        assert!(
+            message.contains("does not match the vcs manifest"),
+            "{message}"
+        );
         assert!(message.contains("generate"), "{message}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -42,7 +42,7 @@ use anyhow::{Context, Result, anyhow};
 use volta_analysis::driver::{
     AnalysisError, ElementCheckTime, EquivCheckOptions, EquivOutcome, VcDump, VcSnapshot,
     analyze_kernel, check_output_equivalence_with, paired_elements, sampled_elements,
-    vc_dump::write_vc_dump,
+    vc_dump::write_vc_dump_to,
 };
 use volta_analysis::eval::{AnalysisOutput, EvalError};
 use volta_analysis::symbolic::ExprId;
@@ -144,10 +144,18 @@ pub enum ActualOutcome {
     /// equivalence claim exists yet (that is `solve`'s job).
     VcsGenerated,
     /// The `solve` subcommand ran with `--backend z3`: only the Z3 phase
-    /// ran, so there is no decision-procedure verdict. Z3's per-element
-    /// outcomes are the run's data (unknown/timeout are results, not
-    /// failures); the benchmark then passes iff the Z3 phase completed.
-    Z3Only,
+    /// ran, so there is no decision-procedure verdict and the Z3
+    /// per-element outcomes are the run's data. `refutations` counts the
+    /// `not_equivalent` verdicts across the plain run *and* the
+    /// `+exp-axiom` sub-run (folded in by [`BenchmarkRunner::
+    /// assemble_result`] from the phase counts): with no decision verdict
+    /// to rule the row, an affirmative Z3 refutation is the one verdict
+    /// that contradicts the expectation and must fail the benchmark
+    /// (status `Z3 DIFF`). `unknown`/`timeout`/`unsupported` remain
+    /// non-failing data, as in every mode.
+    Z3Only {
+        refutations: usize,
+    },
     Error {
         message: String,
     },
@@ -166,7 +174,18 @@ impl ActualOutcome {
             // `generate` runs them to their real verdicts and `solve`
             // skips them.)
             (Self::VcsGenerated, ExpectedOutcome::Equivalent) => true,
-            (Self::Z3Only, ExpectedOutcome::Equivalent) => true,
+            // ... with one exception: in a z3-only solve nothing else
+            // rules the row, so a Z3 `not_equivalent` verdict (plain or
+            // +exp-axiom) is an affirmative refutation of the expected
+            // equivalence and fails the benchmark. It could in principle
+            // be spurious - volta_z3's translation documents one known
+            // semantic divergence, SMT's underspecified division at zero
+            // (`x/x = 1` is falsifiable there but not in canon's field
+            // model) - which is precisely why it must be surfaced for
+            // inspection rather than swallowed. Non-verdicts
+            // (unknown/timeout/unsupported/error elements) stay
+            // non-failing data, faithful to the paper's Table 8 rows.
+            (Self::Z3Only { refutations }, ExpectedOutcome::Equivalent) => *refutations == 0,
             _ => false,
         }
     }
@@ -179,7 +198,8 @@ impl ActualOutcome {
             Self::Rejected { is_race: false, .. } => "REJECT",
             Self::RaceFree => "OK",
             Self::VcsGenerated => "GEN",
-            Self::Z3Only => "Z3",
+            Self::Z3Only { refutations: 0 } => "Z3",
+            Self::Z3Only { .. } => "Z3 DIFF",
             Self::Error { .. } => "ERR",
         }
     }
@@ -193,12 +213,17 @@ pub struct BenchmarkResult {
     pub elapsed_secs: f64,
     pub outcome: ActualOutcome,
     pub stats: BenchmarkStats,
-    /// The outcome matched the benchmark's expectation (the Z3 phase
-    /// plays no part in this).
+    /// The outcome matched the benchmark's expectation. When the
+    /// decision procedure ran, the Z3 phase plays no part in this; in a
+    /// z3-only solve the Z3 `not_equivalent` counts *are* part of the
+    /// outcome ([`ActualOutcome::Z3Only`]'s refutations), because
+    /// nothing else rules the row there.
     pub outcome_matched: bool,
-    /// `outcome_matched` and, when `--z3` was on, the Z3 phase ran to
-    /// completion. Z3 *verdicts* (unknown/timeout/...) never affect this
-    /// - they are the comparison's data, not failures.
+    /// `outcome_matched` and, when a Z3 phase was requested, it ran to
+    /// completion. Z3 *non-verdicts* (unknown/timeout/unsupported) never
+    /// affect this - they are the comparison's data, not failures; an
+    /// affirmative Z3 refutation fails a z3-only row via
+    /// `outcome_matched` (see `ActualOutcome::matches`).
     pub passed: bool,
     /// Where this benchmark's VC dump was written (equivalence benchmarks
     /// under a configured `vcs_dir` only).
@@ -245,13 +270,16 @@ impl Default for RunnerConfig {
     }
 }
 
-/// An infrastructure failure inside [`BenchmarkRunner::run_inner`],
-/// carrying any VC dump written before the failure: the file exists on
-/// disk, and the benchmark's record should say so even when the run
-/// errors after the dump (e.g. a failed equivalence check).
-struct RunFailure {
-    error: anyhow::Error,
-    dump_path: Option<PathBuf>,
+/// An infrastructure failure inside a per-benchmark run
+/// ([`BenchmarkRunner::run_inner`], the `generate` and `solve` inners),
+/// carrying the path of any VC dump that exists on disk despite the
+/// failure - written before it (a one-shot solve error, a `generate`
+/// manifest-write failure) or found and then rejected by it (`solve`'s
+/// manifest disagreement or fingerprint mismatch). The benchmark's
+/// record should keep pointing at the file in all these cases.
+pub(crate) struct RunFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) dump_path: Option<PathBuf>,
 }
 
 impl From<anyhow::Error> for RunFailure {
@@ -271,7 +299,7 @@ impl RunFailure {
     /// empty stats. A failure after the dump was written (e.g. the
     /// equivalence check erroring) still leaves the dump on disk; the
     /// record keeps pointing at it.
-    fn into_output(self) -> RunOutput {
+    pub(crate) fn into_output(self) -> RunOutput {
         RunOutput {
             outcome: ActualOutcome::Error {
                 message: format!("{:#}", self.error),
@@ -294,6 +322,11 @@ pub(crate) struct RunOutput {
     pub(crate) z3: Option<Z3PhaseOutcome>,
 }
 
+/// One equivalence benchmark's paired footprints: per output array, the
+/// common `(index, reference expr, optimized expr)` element list
+/// (`driver::paired_elements`' shape).
+type PairedFootprints = Vec<(String, Vec<(u64, ExprId, ExprId)>)>;
+
 /// The generation half of the pipeline, as produced by
 /// [`BenchmarkRunner::generate_inner`].
 enum GeneratedRun {
@@ -313,13 +346,47 @@ struct GeneratedVcs {
     stats: BenchmarkStats,
     reference: AnalysisOutput,
     optimized: AnalysisOutput,
-    paired: Vec<(String, Vec<(u64, ExprId, ExprId)>)>,
-    dump_path: Option<PathBuf>,
-    /// Why the dump write failed, when it did. The one-shot pipeline
-    /// treats this as a warning (the verdict is still computable); the
+    paired: PairedFootprints,
+    /// What became of the VC dump. The one-shot pipeline treats a failed
+    /// write as a warning (the verdict is still computable); the
     /// `generate` subcommand treats it as a failure (the dump is its
     /// product).
-    dump_write_error: Option<String>,
+    dump: DumpPersistence,
+}
+
+/// What persisting one benchmark's VCs produced (see [`persist_vcs`]).
+enum DumpPersistence {
+    /// No `vcs_dir` configured: nothing was (or should have been)
+    /// written.
+    NotConfigured,
+    /// The dump is on disk.
+    Written {
+        path: PathBuf,
+        /// Wall time of the write (the stats' `dump_write_secs`).
+        write_secs: f64,
+        /// FNV-1a hash of the exact bytes written - what `generate`
+        /// records as the manifest's `vc_fingerprint` (`crate::manifest`).
+        fingerprint: u64,
+    },
+    /// The write was attempted and failed (already warned on stderr);
+    /// nothing usable is on disk.
+    Failed(String),
+}
+
+impl DumpPersistence {
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Written { path, .. } => Some(path),
+            Self::NotConfigured | Self::Failed(_) => None,
+        }
+    }
+
+    fn write_secs(&self) -> Option<f64> {
+        match self {
+            Self::Written { write_secs, .. } => Some(*write_secs),
+            Self::NotConfigured | Self::Failed(_) => None,
+        }
+    }
 }
 
 /// One VC-generation iteration's product.
@@ -334,7 +401,7 @@ enum Generated {
     Equivalence {
         reference: AnalysisOutput,
         optimized: AnalysisOutput,
-        paired: Vec<(String, Vec<(u64, ExprId, ExprId)>)>,
+        paired: PairedFootprints,
     },
 }
 
@@ -589,55 +656,144 @@ impl BenchmarkRunner {
     pub fn run_generate(&self, def: &BenchmarkDef) -> BenchmarkResult {
         self.note_raceless_dump(def);
         let start = Instant::now();
-        let output = self.generate_only_inner(def).unwrap_or_else(|e| RunOutput {
-            outcome: ActualOutcome::Error {
-                message: format!("{:#}", e),
-            },
-            stats: BenchmarkStats::default(),
-            dump_path: None,
-            z3: None,
-        });
+        let output = self
+            .generate_only_inner(def)
+            .unwrap_or_else(|failure| failure.into_output());
         self.assemble_result(def, start, output)
     }
 
     /// `generate` for one benchmark, up to the manifest update; `Err` is
-    /// an infrastructure failure.
-    fn generate_only_inner(&self, def: &BenchmarkDef) -> Result<RunOutput> {
+    /// an infrastructure failure. A failure that leaves no valid fresh
+    /// dump also removes any previous run's dump and manifest entry
+    /// ([`remove_stale_dump`](Self::remove_stale_dump)); a failure *with*
+    /// a fresh dump on disk (the manifest update failing after a
+    /// successful write) keeps the dump and points the record at it.
+    fn generate_only_inner(&self, def: &BenchmarkDef) -> Result<RunOutput, RunFailure> {
         let Some(vcs_dir) = self.config.vcs_dir.as_deref() else {
             // `generate` without a dump directory would produce nothing;
             // the CLI always configures one.
-            return Err(anyhow!("generate requires a VC dump directory"));
+            return Err(anyhow!("generate requires a VC dump directory").into());
         };
-        // Fail before the (possibly hours-long) generation loop if the
-        // manifest can't be read-modify-written afterwards; race-check
-        // benchmarks write no dump and skip the manifest entirely.
-        let manifest = if def.optimized.is_some() {
-            Some(crate::manifest::read_or_new(vcs_dir)?)
-        } else {
-            None
-        };
-        let vcs = match self.generate_inner(def).map_err(|f| f.error)? {
+        // Pre-flight: fail before the (possibly hours-long) generation
+        // loop if the manifest is unreadable. The read feeding the
+        // read-modify-write happens again just before the write below,
+        // so the update is against a manifest microseconds old, not
+        // hours. Race-check benchmarks write no dump and skip the
+        // manifest entirely.
+        if def.optimized.is_some()
+            && let Err(e) = crate::manifest::read_or_new(vcs_dir)
+        {
+            return Err(self.fail_generate(def, e));
+        }
+        let vcs = match self
+            .generate_inner(def)
+            .map_err(|f| self.fail_generate(def, f.error))?
+        {
             GeneratedRun::Done(output) => return Ok(output),
             GeneratedRun::Vcs(vcs) => vcs,
         };
-        if let Some(e) = vcs.dump_write_error {
-            return Err(anyhow!("writing the VC dump failed: {}", e));
-        }
-        let mut manifest = manifest.expect("equivalence benchmarks read the manifest above");
+        let (dump_path, fingerprint) = match vcs.dump {
+            DumpPersistence::Written {
+                ref path,
+                fingerprint,
+                ..
+            } => (path.clone(), fingerprint),
+            DumpPersistence::Failed(ref e) => {
+                return Err(self.fail_generate(def, anyhow!("writing the VC dump failed: {}", e)));
+            }
+            DumpPersistence::NotConfigured => {
+                unreachable!("vcs_dir is checked at the top of generate_only_inner")
+            }
+        };
+        // The read-modify-write. From here on the fresh dump is on disk
+        // and valid, so failures carry its path (and nothing is removed):
+        // a later `solve` against a stale manifest entry fails loudly on
+        // the fingerprint check.
+        let with_dump = |error: anyhow::Error| RunFailure {
+            error,
+            dump_path: Some(dump_path.clone()),
+        };
+        let mut manifest = crate::manifest::read_or_new(vcs_dir)
+            .context("VC dump written, but re-reading the manifest failed")
+            .map_err(with_dump)?;
         crate::manifest::record_dump(
             &mut manifest,
             &def.name,
+            fingerprint,
             &vcs.reference.outputs,
             &vcs.optimized.outputs,
         );
         crate::manifest::write_manifest(vcs_dir, &manifest)
-            .context("VC dump written, but updating the manifest failed")?;
+            .context("VC dump written, but updating the manifest failed")
+            .map_err(with_dump)?;
         Ok(RunOutput {
             outcome: ActualOutcome::VcsGenerated,
             stats: vcs.stats,
-            dump_path: vcs.dump_path,
+            dump_path: Some(dump_path),
             z3: None,
         })
+    }
+
+    /// Wrap a `generate` failure that leaves no valid fresh dump on
+    /// disk, first removing whatever a *previous* run left there
+    /// (`remove_stale_dump`): the user asked to regenerate and the
+    /// regeneration failed, so an old dump surviving would let a later
+    /// `solve` silently solve pre-failure VCs.
+    fn fail_generate(&self, def: &BenchmarkDef, error: anyhow::Error) -> RunFailure {
+        self.remove_stale_dump(def);
+        RunFailure {
+            error,
+            dump_path: None,
+        }
+    }
+
+    /// Best-effort removal of a benchmark's dump file and manifest entry
+    /// after a failed regeneration, so a later `solve` hits the loud
+    /// missing-dump error naming `generate` instead of silently solving
+    /// an older run's VCs. Removal failures only warn: the benchmark is
+    /// already failing, and `solve` still fails loudly on whichever
+    /// piece could not be cleaned up (an unreadable manifest is itself a
+    /// hard `solve` error).
+    fn remove_stale_dump(&self, def: &BenchmarkDef) {
+        let Some(vcs_dir) = self.config.vcs_dir.as_deref() else {
+            return;
+        };
+        if def.optimized.is_none() {
+            return; // race-check benchmarks have no dump
+        }
+        let path = vc_dump_path(vcs_dir, &def.name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => eprintln!(
+                "note: {}: removed outdated VC dump {} (this generation failed; \
+                 re-run `volta-bench generate` before solving)",
+                def.name,
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "warning: {}: could not remove outdated VC dump {}: {}",
+                def.name,
+                path.display(),
+                e
+            ),
+        }
+        match crate::manifest::read_manifest(vcs_dir) {
+            Ok(Some(mut manifest)) => {
+                if crate::manifest::remove_entry(&mut manifest, &def.name)
+                    && let Err(e) = crate::manifest::write_manifest(vcs_dir, &manifest)
+                {
+                    eprintln!(
+                        "warning: {}: could not drop the vcs manifest entry: {:#}",
+                        def.name, e
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "warning: {}: could not read the vcs manifest to drop its entry: {:#}",
+                def.name, e
+            ),
+        }
     }
 
     /// The console note for race-check benchmarks under a configured
@@ -656,16 +812,29 @@ impl BenchmarkRunner {
 
     /// The one result-assembly tail, shared by every per-benchmark entry
     /// point (`run`, `run_generate`, and `solve`'s `run_solve`): elapsed
-    /// time from `start`, the expected-outcome judgment, the pass rule
-    /// (outcome matched, and the Z3 phase - when one ran - completed; Z3
-    /// *verdicts* are data, never failures), and the noisy-timing warning.
+    /// time from `start`, the expected-outcome judgment, the pass rule,
+    /// and the noisy-timing warning.
+    ///
+    /// The pass rule: the outcome matched the expectation, and the Z3
+    /// phase - when one ran - completed. Z3 *non-verdicts*
+    /// (unknown/timeout/unsupported/error elements) are the comparison's
+    /// data, never failures. A Z3 `not_equivalent` verdict is data too
+    /// when the decision procedure ruled the row, but in a z3-only solve
+    /// nothing else rules it, so the refutation counts (plain run plus
+    /// the `+exp-axiom` sub-run) are folded into the `Z3Only` outcome
+    /// here and fail the row through the expectation match - see
+    /// [`ActualOutcome::matches`] for why a possibly-spurious refutation
+    /// must still be surfaced.
     pub(crate) fn assemble_result(
         &self,
         def: &BenchmarkDef,
         start: Instant,
-        output: RunOutput,
+        mut output: RunOutput,
     ) -> BenchmarkResult {
         let elapsed_secs = start.elapsed().as_secs_f64();
+        if let ActualOutcome::Z3Only { refutations } = &mut output.outcome {
+            *refutations = z3_refutations(output.z3.as_ref());
+        }
         let outcome_matched = output.outcome.matches(def.expected);
         let passed = outcome_matched && !matches!(output.z3, Some(Z3PhaseOutcome::Failed(_)));
         let result = BenchmarkResult {
@@ -742,11 +911,12 @@ impl BenchmarkRunner {
             reference,
             optimized,
             paired,
-            dump_path,
-            // Already warned about inside `persist_vcs`; the one-shot
-            // verdict does not depend on the dump.
-            dump_write_error: _,
+            // A failed write was already warned about inside
+            // `persist_vcs`; the one-shot verdict does not depend on the
+            // dump.
+            dump,
         } = vcs;
+        let dump_path = dump.path().map(Path::to_path_buf);
 
         // --- Decision solve: `iterations` runs over the same sampled
         // elements. A failure past this point happens *after* the dump
@@ -875,15 +1045,14 @@ impl BenchmarkRunner {
             reference,
             optimized,
         );
-        stats.dump_write_secs = persisted.write_secs;
+        stats.dump_write_secs = persisted.dump.write_secs();
 
         Ok(GeneratedRun::Vcs(GeneratedVcs {
             stats,
             reference: persisted.reference,
             optimized: persisted.optimized,
             paired,
-            dump_path: persisted.path,
-            dump_write_error: persisted.write_error,
+            dump: persisted.dump,
         }))
     }
 
@@ -928,6 +1097,23 @@ impl BenchmarkRunner {
     }
 }
 
+/// Total `not_equivalent` verdicts across a completed Z3 phase - the
+/// plain encoding plus, when present, the `+exp-axiom` sub-run. Zero for
+/// an absent or failed phase (a failed phase already fails the pass rule
+/// on its own).
+fn z3_refutations(z3: Option<&Z3PhaseOutcome>) -> usize {
+    match z3 {
+        Some(Z3PhaseOutcome::Ran(phase)) => {
+            phase.plain.counts.not_equivalent
+                + phase
+                    .axiom
+                    .as_ref()
+                    .map_or(0, |axiom| axiom.counts.not_equivalent)
+        }
+        Some(Z3PhaseOutcome::Failed(_)) | None => 0,
+    }
+}
+
 /// Print a stderr warning for every timed phase whose per-iteration
 /// coefficient of variation exceeds [`NOISY_CV_THRESHOLD`]: the median
 /// is still the headline number, but the reader should know it came from
@@ -963,13 +1149,20 @@ fn warn_noisy_phases(result: &BenchmarkResult) {
 struct PersistedVcs {
     reference: AnalysisOutput,
     optimized: AnalysisOutput,
-    /// The `.vcdump` path, when a dump was written.
-    path: Option<PathBuf>,
-    /// Time spent writing it, when a dump was written.
-    write_secs: Option<f64>,
-    /// The write failure, when a dump was attempted but not written
-    /// (always `None` when no `vcs_dir` is configured).
-    write_error: Option<String>,
+    dump: DumpPersistence,
+}
+
+/// Write one dump and return the FNV-1a fingerprint of the exact bytes
+/// put on disk (the manifest's `vc_fingerprint`; see `crate::manifest`).
+/// The dump serializes straight through the hashing tee to the file, so
+/// no second in-memory copy of the (possibly GiB-scale) payload exists;
+/// `solve` recomputes the same digest from `fs::read` of the file.
+fn write_dump_hashed(path: &Path, dump: &VcDump) -> std::io::Result<u64> {
+    let file = std::fs::File::create(path)?;
+    let mut writer = crate::manifest::HashingWriter::new(std::io::BufWriter::new(file));
+    write_vc_dump_to(&mut writer, dump)?;
+    std::io::Write::flush(&mut writer)?;
+    Ok(writer.fingerprint())
 }
 
 /// Persist one equivalence benchmark's verification conditions to
@@ -990,7 +1183,8 @@ struct PersistedVcs {
 /// counter), so every id in a dump is deterministic; a future
 /// machine-symbol caller would void byte-identity across runs but not
 /// the dumps' validity - `--from-dump` never depends on the numeric id
-/// values.
+/// values, and the manifest fingerprint pins whatever bytes were
+/// actually written.
 fn persist_vcs(
     vcs_dir: Option<&Path>,
     benchmark_name: &str,
@@ -1001,9 +1195,7 @@ fn persist_vcs(
         return PersistedVcs {
             reference,
             optimized,
-            path: None,
-            write_secs: None,
-            write_error: None,
+            dump: DumpPersistence::NotConfigured,
         };
     };
     let path = vc_dump_path(vcs_dir, benchmark_name);
@@ -1012,23 +1204,26 @@ fn persist_vcs(
         optimized: VcSnapshot::from_output(optimized),
     };
     // The directory is a one-time setup cost, not part of any dump's
-    // write time - create it before starting the write timer.
+    // write time - create it before starting the write timer. (Hashing
+    // is inside the timed write: it rides along with the byte stream.)
     let created = std::fs::create_dir_all(vcs_dir);
     let write0 = Instant::now();
-    let written = created.and_then(|_| write_vc_dump(&path, &dump));
-    let (path, write_secs, write_error) = match written {
-        Ok(()) => (Some(path), Some(write0.elapsed().as_secs_f64()), None),
+    let written = created.and_then(|_| write_dump_hashed(&path, &dump));
+    let persisted = match written {
+        Ok(fingerprint) => DumpPersistence::Written {
+            path,
+            write_secs: write0.elapsed().as_secs_f64(),
+            fingerprint,
+        },
         Err(e) => {
             eprintln!("warning: could not write VC dump {}: {}", path.display(), e);
-            (None, None, Some(e.to_string()))
+            DumpPersistence::Failed(e.to_string())
         }
     };
     PersistedVcs {
         reference: dump.reference.into_analysis_output(),
         optimized: dump.optimized.into_analysis_output(),
-        path,
-        write_secs,
-        write_error,
+        dump: persisted,
     }
 }
 
@@ -1108,6 +1303,132 @@ mod tests {
         );
         let msg = gen_shape_mismatch(&race, &reject).unwrap();
         assert!(msg.contains("RACE") && msg.contains("REJECT"), "{}", msg);
+    }
+
+    /// An equivalence benchmark (expected Equivalent) whose kernel paths
+    /// are never read - only `assemble_result` is exercised.
+    fn equivalence_def() -> BenchmarkDef {
+        let mut config = volta_analysis::eval::AnalysisConfig::new((1, 1, 1));
+        config.arrays = vec![crate::config::f32_output("out", 0x1000, 1)];
+        let run = || crate::config::KernelRun::new("unused.ptx", "k", config.clone());
+        BenchmarkDef::equivalence(
+            "Synthetic Pair",
+            crate::config::BenchmarkCategory::Reduction,
+            run(),
+            run(),
+        )
+    }
+
+    fn z3_mode_run(counts: volta_z3::Z3Counts) -> crate::z3_phase::Z3ModeRun {
+        crate::z3_phase::Z3ModeRun {
+            iters_secs: vec![0.0],
+            counts,
+            elements: Vec::new(),
+        }
+    }
+
+    fn assemble_z3_only(z3: Z3PhaseOutcome) -> BenchmarkResult {
+        let runner = BenchmarkRunner::new(RunnerConfig::default());
+        runner.assemble_result(
+            &equivalence_def(),
+            Instant::now(),
+            RunOutput {
+                // `refutations` starts at 0; `assemble_result` folds the
+                // real counts in - exactly what `solve --backend z3`
+                // hands it.
+                outcome: ActualOutcome::Z3Only { refutations: 0 },
+                stats: BenchmarkStats::default(),
+                dump_path: None,
+                z3: Some(z3),
+            },
+        )
+    }
+
+    /// The Z3-refutation pass rule: in a z3-only solve, a
+    /// `not_equivalent` count > 0 fails the row (status `Z3 DIFF`) - in
+    /// that mode nothing else rules it, and an affirmative refutation
+    /// (even a potentially spurious one) must be surfaced, not swallowed.
+    #[test]
+    fn z3_only_refutation_fails_the_row() {
+        use crate::z3_phase::Z3Phase;
+
+        let refuted = |not_equivalent| volta_z3::Z3Counts {
+            not_equivalent,
+            ..Default::default()
+        };
+
+        // A refutation in the plain run.
+        let result = assemble_z3_only(Z3PhaseOutcome::Ran(Z3Phase {
+            plain: z3_mode_run(refuted(1)),
+            axiom: None,
+        }));
+        assert!(!result.passed);
+        assert!(!result.outcome_matched);
+        assert_eq!(result.outcome.status(), "Z3 DIFF");
+        assert!(matches!(
+            result.outcome,
+            ActualOutcome::Z3Only { refutations: 1 }
+        ));
+
+        // A refutation only in the +exp-axiom sub-run counts the same.
+        let result = assemble_z3_only(Z3PhaseOutcome::Ran(Z3Phase {
+            plain: z3_mode_run(volta_z3::Z3Counts::default()),
+            axiom: Some(z3_mode_run(refuted(2))),
+        }));
+        assert!(!result.passed);
+        assert_eq!(result.outcome.status(), "Z3 DIFF");
+        assert!(matches!(
+            result.outcome,
+            ActualOutcome::Z3Only { refutations: 2 }
+        ));
+    }
+
+    /// Z3 non-verdicts (unknown/timeout/unsupported) stay non-failures
+    /// in a z3-only solve - the paper-honest reading of Table 8's rows.
+    #[test]
+    fn z3_only_non_verdicts_still_pass() {
+        use crate::z3_phase::Z3Phase;
+
+        let result = assemble_z3_only(Z3PhaseOutcome::Ran(Z3Phase {
+            plain: z3_mode_run(volta_z3::Z3Counts {
+                unknown: 1,
+                timeout: 2,
+                unsupported: 3,
+                ..Default::default()
+            }),
+            axiom: None,
+        }));
+        assert!(result.passed);
+        assert!(result.outcome_matched);
+        assert_eq!(result.outcome.status(), "Z3");
+    }
+
+    /// When the decision procedure ruled the row (one-shot `--z3` or
+    /// `solve --backend both`), z3 counts stay comparison data: a
+    /// `not_equivalent` there does not override the decision verdict.
+    #[test]
+    fn z3_refutation_is_data_when_the_decision_procedure_ruled() {
+        use crate::z3_phase::Z3Phase;
+
+        let runner = BenchmarkRunner::new(RunnerConfig::default());
+        let result = runner.assemble_result(
+            &equivalence_def(),
+            Instant::now(),
+            RunOutput {
+                outcome: ActualOutcome::Equivalent,
+                stats: BenchmarkStats::default(),
+                dump_path: None,
+                z3: Some(Z3PhaseOutcome::Ran(Z3Phase {
+                    plain: z3_mode_run(volta_z3::Z3Counts {
+                        not_equivalent: 1,
+                        ..Default::default()
+                    }),
+                    axiom: None,
+                })),
+            },
+        );
+        assert!(result.passed);
+        assert_eq!(result.outcome.status(), "EQUIV");
     }
 }
 

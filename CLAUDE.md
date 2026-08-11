@@ -195,11 +195,15 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   `IdVec` via `id_collections`'s `serde` feature (wire-identical to `Vec`,
   serialized in place - no clone of GiB-scale arenas at dump time).
 - `vc_dump` submodule - the one `.vcdump` on-disk format implementation:
-  `write_vc_dump(path, &VcDump)` / `read_vc_dump(path)`. `VOLTAVCD` magic
+  `write_vc_dump(path, &VcDump)` / `read_vc_dump(path)`, layered over
+  `write_vc_dump_to(&mut impl Write, ..)` / `read_vc_dump_bytes(&[u8])`
+  so volta-bench can hash the exact byte stream on write (through a tee
+  writer) and fingerprint-check raw file bytes before decoding on solve.
+  `VOLTAVCD` magic
   + u16 major/minor header (a reader accepts its own major with minor <=
-  its own), bincode fixint payload with decode allocations capped at file
-  size, `validate()` on load. Shared by `volta_cli` and `volta_bench`, so
-  a dump written by either tool loads in both.
+  its own), bincode fixint payload with decode allocations capped at
+  payload size, `validate()` on load. Shared by `volta_cli` and
+  `volta_bench`, so a dump written by either tool loads in both.
 - `write_op_counts(out, label, counts)` - the one profile-table formatter,
   used by both `volta` and `volta-bench`
 
@@ -369,27 +373,43 @@ The pipeline's halves also run separately, calling the same phase
 functions (no duplicated pipeline): `generate <all|category <c>|single
 <name>>` runs the generation half only (`generate_inner`: fingerprint
 check, dump write) and records each dump in `vcs/manifest.json`
-(`src/manifest.rs`: benchmark name, timestamp, per-array footprint
-element counts; read-modify-write per dump, so partial regenerations
-keep other entries) - race-check benchmarks reach their real verdicts
-here, so the race table comes from a `generate` run; equivalence
-benchmarks report `GEN` (`ActualOutcome::VcsGenerated`) and a failed
-dump/manifest write fails them (the dump is the product). `solve
-<target> [--backend decision|z3|both]` (`src/solve.rs`) replays the
-solve phase(s) from the dumps via `check_equivalence`/`run_z3_phase`:
-dumps load through the shared validated reader (`dump_load_secs`
-recorded, excluded from solve timings), a missing dump or a
-manifest/dump disagreement (the stale/mixed-vcs-dir guard; missing
-manifest = warning only) is a per-benchmark failure naming `generate`,
-race benchmarks are skipped with a note, and `--backend z3` yields no
-decision verdict (`ActualOutcome::Z3Only`: passing = the phase
-completed). `--sample`/`--verify-numeric` (decision|both only)/
-`--recycle-terms` apply to `solve`; `--z3` is one-shot-only and both
-new subcommands reject it. Records split accordingly: `generate`
-records carry gen fields only, `solve` records carry solve fields plus
-`dump_load_secs`, and the header adds `backend` + `vcs_from_dumps`.
-Paper workflow: `generate all`, then `--recycle-terms 0 solve all`,
-`solve all --sample 1`, `solve all --sample 1 --backend z3
+(`src/manifest.rs`: benchmark name, timestamp, `vc_fingerprint` = FNV-1a
+of the exact dump bytes as written - hashed through a tee writer, no
+second in-memory copy - plus informational per-array element counts;
+read-modify-write per dump with the read just before the atomic
+temp+rename write, so partial regenerations keep other entries; single
+writer per out-dir assumed) - race-check benchmarks reach their real
+verdicts here, so the race table comes from a `generate` run;
+equivalence benchmarks report `GEN` (`ActualOutcome::VcsGenerated`), a
+failed dump/manifest write fails them (the dump is the product), and any
+failure leaving no fresh dump also deletes the benchmark's stale dump +
+manifest entry so a later `solve` errs on the missing dump instead of
+silently solving pre-failure VCs. `solve <target> [--backend
+decision|z3|both]` (`src/solve.rs`) replays the solve phase(s) from the
+dumps via `check_equivalence`/`run_z3_phase`: each dump's raw bytes are
+fingerprint-checked against the manifest *before* decoding (catches any
+content difference from what the last successful `generate` recorded,
+including same-shape expression drift; deliberately does not check
+currency with the source tree - regenerated-together stale sets pass by
+design; missing manifest = warning only), then decoded through the
+shared validated reader (`dump_load_secs` recorded, excluded from solve
+timings); a missing dump or a fingerprint/name disagreement is a
+per-benchmark failure naming `generate` (with `dump_path` still set
+whenever the file exists), race benchmarks are skipped with a note, and
+`--backend z3` yields no decision verdict (`ActualOutcome::Z3Only`:
+passing = the phase completed *and* z3 refuted nothing - a
+`not_equivalent` count > 0, plain or `+exp-axiom`, fails the row as `Z3
+DIFF`, since nothing else rules it and even a spurious refutation -
+volta_z3's division-at-zero divergence - must surface;
+unknown/timeout/unsupported stay non-failing data). `--sample` applies
+to `solve`; `--verify-numeric`/`--recycle-terms` act on its decision
+phase and `--z3-timeout` on its z3 phase (each noted-and-ignored under a
+backend without that phase, and by `generate`); `--z3` is one-shot-only
+and both new subcommands reject it. Records split accordingly:
+`generate` records carry gen fields only, `solve` records carry solve
+fields plus `dump_load_secs`, and the header adds `backend` +
+`vcs_from_dumps`. Paper workflow: `generate all`, then `--recycle-terms
+0 solve all`, `solve all --sample 1`, `solve all --sample 1 --backend z3
 --z3-timeout 600` (Table 8; Table 7 is static, from `generate`).
 
 Output files under `--out-dir` (default `bench-out/`, gitignored):

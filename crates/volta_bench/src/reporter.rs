@@ -199,15 +199,25 @@ pub fn print_summary(out: &mut impl Write, results: &[BenchmarkResult]) -> Resul
 }
 
 /// The `single` command's detailed report for one benchmark (also used
-/// by `generate single`/`solve single`; phases that didn't run print no
-/// line).
-pub fn print_single_result(out: &mut impl Write, result: &BenchmarkResult) -> Result<()> {
+/// by `generate single`/`solve single` with the matching [`TableMode`]).
+/// In `Combined` mode the generation lines (VC gen, Instrs, Syncs) print
+/// unconditionally - zeros included - exactly as the one-shot report
+/// always has, failed runs included; the phase-limited modes print no
+/// line for a phase that didn't run.
+pub fn print_single_result(
+    out: &mut impl Write,
+    result: &BenchmarkResult,
+    mode: TableMode,
+) -> Result<()> {
     writeln!(out, "Status:  {}", result.outcome.status())?;
     writeln!(out, "Detail:  {}", describe(&result.outcome))?;
     writeln!(out, "Passed:  {}", if result.passed { "yes" } else { "no" })?;
-    // `solve` runs (and failed runs) have no generation phase; don't
-    // print a "0.000s median of 0 iteration(s)" line.
-    if !result.stats.vc_gen_iters_secs.is_empty() {
+    // A `solve` run has no generation phase; don't print a "0.000s
+    // median of 0 iteration(s)" line there. (Combined keeps the one-shot
+    // report's historical all-lines shape even for failures.)
+    let generation_lines =
+        mode == TableMode::Combined || !result.stats.vc_gen_iters_secs.is_empty();
+    if generation_lines {
         writeln!(
             out,
             "VC gen:  {:.3}s median of {} iteration(s) (lowering + exec + footprint pairing)",
@@ -219,7 +229,8 @@ pub fn print_single_result(out: &mut impl Write, result: &BenchmarkResult) -> Re
         writeln!(out, "VC load: {:.3}s (excluded from solve times)", secs)?;
     }
     // Race-check benchmarks (and failed or z3-only runs) have no
-    // decision-solve phase; same rule.
+    // decision-solve phase - matching the pre-decoupling report, which
+    // also skipped this line for them.
     if !result.stats.solve_iters_secs.is_empty() {
         writeln!(
             out,
@@ -255,9 +266,7 @@ pub fn print_single_result(out: &mut impl Write, result: &BenchmarkResult) -> Re
     if let Some(path) = &result.dump_path {
         writeln!(out, "VC dump: {}", path.display())?;
     }
-    // Execution counters exist only when this run executed the kernels;
-    // a `solve` run (VCs from a dump) has none to report.
-    if !result.stats.vc_gen_iters_secs.is_empty() {
+    if generation_lines {
         writeln!(out, "Instrs:  {}", result.stats.instructions)?;
         writeln!(
             out,
@@ -265,11 +274,20 @@ pub fn print_single_result(out: &mut impl Write, result: &BenchmarkResult) -> Re
             result.stats.block_syncs, result.stats.warp_syncs
         )?;
     }
-    writeln!(
-        out,
-        "Elems:   {} checked of {}",
-        result.stats.elements_checked, result.stats.elements_total
-    )?;
+    match mode {
+        // `generate` solves nothing: the footprint total is the number,
+        // not a misleading "0 checked".
+        TableMode::GenerateOnly => writeln!(
+            out,
+            "Elems:   {} generated (not solved)",
+            result.stats.elements_total
+        )?,
+        TableMode::Combined | TableMode::SolveOnly => writeln!(
+            out,
+            "Elems:   {} checked of {}",
+            result.stats.elements_checked, result.stats.elements_total
+        )?,
+    }
     Ok(())
 }
 
@@ -284,7 +302,82 @@ pub fn describe(outcome: &ActualOutcome) -> String {
         ActualOutcome::VcsGenerated => {
             "VCs generated and dumped (not solved; run `volta-bench solve`)".to_string()
         }
-        ActualOutcome::Z3Only => "z3 comparison only (no decision-procedure verdict)".to_string(),
+        ActualOutcome::Z3Only { refutations: 0 } => {
+            "z3 comparison only (no decision-procedure verdict)".to_string()
+        }
+        ActualOutcome::Z3Only { refutations } => format!(
+            "z3 reported not_equivalent for {} element(s) across its runs - an \
+             affirmative refutation, and no decision-procedure verdict exists in \
+             --backend z3 to weigh it against",
+            refutations
+        ),
         ActualOutcome::Error { message } => message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed_result() -> BenchmarkResult {
+        BenchmarkResult {
+            name: "x".to_string(),
+            category: crate::config::BenchmarkCategory::Reduction,
+            elapsed_secs: 0.0,
+            outcome: ActualOutcome::Error {
+                message: "boom".to_string(),
+            },
+            stats: Default::default(),
+            outcome_matched: false,
+            passed: false,
+            dump_path: None,
+            z3: None,
+        }
+    }
+
+    /// The one-shot (`Combined`) single report prints its generation
+    /// lines unconditionally - zeros included - even for a failed run
+    /// with empty stats, exactly as it did before the phase-decoupled
+    /// modes existed; the phase-limited modes keep gating them on the
+    /// phase having run.
+    #[test]
+    fn combined_single_report_prints_generation_lines_unconditionally() {
+        let result = failed_result();
+        let mut combined = Vec::new();
+        print_single_result(&mut combined, &result, TableMode::Combined).unwrap();
+        let text = String::from_utf8(combined).unwrap();
+        assert!(
+            text.contains("VC gen:  0.000s median of 0 iteration(s)"),
+            "{text}"
+        );
+        assert!(text.contains("Instrs:  0"), "{text}");
+        assert!(text.contains("Syncs:   0 block, 0 warp"), "{text}");
+        assert!(text.contains("Elems:   0 checked of 0"), "{text}");
+
+        let mut solve_only = Vec::new();
+        print_single_result(&mut solve_only, &result, TableMode::SolveOnly).unwrap();
+        let text = String::from_utf8(solve_only).unwrap();
+        assert!(!text.contains("VC gen:"), "{text}");
+        assert!(!text.contains("Instrs:"), "{text}");
+    }
+
+    /// `generate single` reports the generated footprint total, not a
+    /// misleading "0 checked of N" (nothing is solved by `generate`).
+    #[test]
+    fn generate_only_single_report_prints_totals_only_elems() {
+        let mut result = failed_result();
+        result.outcome = ActualOutcome::VcsGenerated;
+        result.outcome_matched = true;
+        result.passed = true;
+        result.stats.vc_gen_iters_secs = vec![0.25];
+        result.stats.elements_total = 42;
+        let mut out = Vec::new();
+        print_single_result(&mut out, &result, TableMode::GenerateOnly).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("Elems:   42 generated (not solved)"),
+            "{text}"
+        );
+        assert!(!text.contains("checked of"), "{text}");
     }
 }
