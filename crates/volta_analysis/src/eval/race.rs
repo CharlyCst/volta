@@ -128,19 +128,27 @@ impl RaceTracker {
         };
         for byte in addr..addr + width {
             let cell = self.cells.entry((space, byte)).or_default();
-            for (reader, (pending, rpc)) in &cell.rd {
-                if *reader != t && pending.contains(t as usize) {
-                    return Err(RaceInfo {
-                        space,
-                        addr: byte,
-                        prior: AccessSite {
-                            thread: ThreadId(*reader),
-                            pc: *rpc,
-                            is_write: false,
-                        },
-                        current,
-                    });
-                }
+            // Report the lowest-numbered conflicting reader. HashMap
+            // iteration order varies per instance, and a race verdict is
+            // terminal, so completing the scan costs nothing and makes
+            // the diagnostic deterministic across runs.
+            if let Some((reader, rpc)) = cell
+                .rd
+                .iter()
+                .filter(|(reader, (pending, _))| **reader != t && pending.contains(t as usize))
+                .map(|(reader, (_, rpc))| (*reader, *rpc))
+                .min_by_key(|&(reader, _)| reader)
+            {
+                return Err(RaceInfo {
+                    space,
+                    addr: byte,
+                    prior: AccessSite {
+                        thread: ThreadId(reader),
+                        pc: rpc,
+                        is_write: false,
+                    },
+                    current,
+                });
             }
             if let Some((writer, pending, wpc)) = &cell.wr
                 && *writer != t
@@ -295,5 +303,23 @@ mod tests {
         let err = chi.write(S, 0x10, 4, ThreadId(2), pc(3)).unwrap_err();
         assert_eq!(err.prior.thread, ThreadId(0));
         assert!(!err.prior.is_write);
+    }
+
+    #[test]
+    fn test_race_report_names_the_lowest_conflicting_reader() {
+        // Several threads read the same byte; the reported victim must be
+        // the lowest-numbered conflicting reader regardless of HashMap
+        // iteration order (which varies per map instance). Two trackers
+        // with different insertion orders must agree.
+        for order in [[5u32, 2, 9], [9, 5, 2]] {
+            let mut chi = RaceTracker::new(16);
+            for t in order {
+                chi.read(S, 0x10, 1, ThreadId(t), pc(t)).unwrap();
+            }
+            let err = chi.write(S, 0x10, 1, ThreadId(0), pc(100)).unwrap_err();
+            assert_eq!(err.prior.thread, ThreadId(2));
+            assert_eq!(err.prior.pc, pc(2));
+            assert!(!err.prior.is_write);
+        }
     }
 }
