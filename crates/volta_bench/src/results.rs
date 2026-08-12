@@ -360,6 +360,11 @@ pub fn results_doc(meta: &RunMeta, benchmarks: Vec<Value>) -> Value {
     }
     doc.insert("z3".into(), json!(meta.z3_timeout_secs.is_some()));
     if let Some(timeout) = meta.z3_timeout_secs {
+        // Record the linked libz3's version: solver behavior (notably how
+        // the exp-axiom quantifier loop exits - budget kill vs its own
+        // resource-bound "unknown") is version-dependent, so a results
+        // file must say which solver produced it.
+        doc.insert("z3_version".into(), json!(volta_z3::z3_version()));
         doc.insert("z3_timeout_secs".into(), json!(timeout));
         // The carve-out convention (see `z3_phase`): re-solving a
         // timeout would multiply its full budget into every iteration,
