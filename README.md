@@ -331,6 +331,16 @@ cargo run --release -p volta_bench -- solve all --sample 1
 cargo run --release -p volta_bench -- solve all --sample 1 --backend z3 --z3-timeout 600
 ```
 
+Render the tables from the four results files with
+
+```bash
+python3 scripts/generate_tables.py bench-out/results/
+```
+
+which emits the paper's tables in markdown (plus a VC-generation column
+the paper doesn't have), auto-discovering each run by its header and
+computing PTX LOC from the corpus.
+
 Step 1 also settles the race table: Table 7 is static - verdicts, not
 solve timings - and those verdicts come from generation (race-check
 benchmarks' whole analysis is the symbolic execution), so they land in
