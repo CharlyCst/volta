@@ -337,9 +337,10 @@ Render the tables from the four results files with
 python3 scripts/generate_tables.py bench-out/results/
 ```
 
-which emits the paper's tables in markdown (plus a VC-generation column
-the paper doesn't have), auto-discovering each run by its header and
-computing PTX LOC from the corpus.
+which emits the paper's tables in markdown or LaTeX (`--format latex`,
+booktabs) plus a VC-generation column the paper doesn't have,
+auto-discovering each run by its header and computing PTX LOC from the
+corpus.
 
 Step 1 also settles the race table: Table 7 is static - verdicts, not
 solve timings - and those verdicts come from generation (race-check
