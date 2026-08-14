@@ -64,13 +64,13 @@ Pratt parser producing AST. Entry point: `parse_module()`.
 
 - `Module` - Top-level: version, target, address_size, directives
 - `Function` - Kernel/device function with params and body
-- `Instruction` - Generic instruction with mnemonic string and operands
+- `Instruction` - Generic instruction: the trie already resolves the mnemonic to a typed `InstrKind` at parse time (`InstructionOp::Unparsed { kind, modifiers, operands }`)
 - `ScalarType` - Pred, Signed/Unsigned/Float/Bits with width
 
 ### Instruction Parsing (`instr.rs`, `instr_parse.rs`)
 
 - `InstrTrie` - O(n) lookup for PTX mnemonics → `InstrKind`
-- `ParsedInstruction` - Strongly-typed enum (~80 instruction variants)
+- `ParsedInstruction` - Strongly-typed enum (~105 instruction variants, defined in `ast.rs`)
 - Converts generic `Instruction` to typed variants with validated modifiers
 
 ## Crate: volta_analysis
@@ -498,7 +498,7 @@ All values are `Expr` (symbolic expressions). This allows analyzing behavior for
 
 ### 2. Concrete Addresses for Race Detection
 
-Memory addresses must be concrete (`u64`) for race detection. Thread indices are concrete (specific block configuration). Symbolic address accesses produce `SymbolicAddress` error.
+Memory addresses must be concrete (`u64`) for race detection. Thread indices are concrete (specific block configuration). Symbolic address accesses produce a `NotConcrete` error.
 
 ### 3. χ-Context for Race Detection
 
