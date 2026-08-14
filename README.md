@@ -96,18 +96,19 @@ from the CLI (races/deadlocks are still checked for each kernel individually).
 Arrays/params/globals are shared by both kernels by default; give `--block2`/
 `--grid2` if the optimized kernel's launch config differs (e.g. a
 single-thread reference vs. a 128-thread optimized kernel computing the
-same tile). Comparison follows the paper's CTA-to-CTA model: it runs
-along the declared output arrays (`out`/`inout` kinds), and both CTA-0
-runs must write each of them with identical per-array footprints.
-Arrays not declared as outputs are not compared - which is how
-auxiliary exports like FlashAttention's softmax statistics stay out of
-a comparison against a reference that never computes them.
+same tile). Comparison follows the paper's CTA-to-CTA model:
+`--check-array` names the output arrays to compare (repeatable, at
+least one required; each must be declared with an `out`/`inout` kind),
+and both CTA-0 runs must write each named array with identical
+per-array footprints. Arrays you don't name are not compared - which
+is how auxiliary exports like FlashAttention's softmax statistics stay
+out of a comparison against a reference that never computes them.
 
 ```bash
 cargo run --release -- compare <ref.ptx> <opt.ptx> \
     --kernel1 <ref_kernel> --kernel2 <opt_kernel> -b 128 \
     --array "in:0x10000:4:128:in" --array "out:0x20000:4:1:out" \
-    --param ptr:in --param ptr:out
+    --param ptr:in --param ptr:out --check-array out
 ```
 
 - `--sample N`, `--verify-numeric`, `--recycle-terms N`, `--iterations N`:
@@ -131,7 +132,7 @@ lowering, or symbolic execution involved on replay.
 
 ```bash
 cargo run --release -- compare <ref.ptx> <opt.ptx> ... --dump-vcs pair.vcdump
-cargo run --release -- compare --from-dump pair.vcdump   # rerun later, instantly
+cargo run --release -- compare --from-dump pair.vcdump --check-array out   # rerun later, instantly
 ```
 
 Dump files carry a magic/version header and are validated on load, so a

@@ -160,8 +160,9 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   elements for each array the caller names (both sides must have each
   named array with identical index sets; unnamed arrays are not compared
   - FlashAttention's optimized-only `l`/`m` exports rely on this; an
-  empty list is an error). Callers derive the list explicitly: the bench
-  harness and CLI use the reference config's declared output arrays.
+  empty list is an error). Callers supply the list explicitly: the bench
+  harness derives it from the reference config's declared output arrays;
+  the CLI requires it on the command line (`--check-array`).
   Shared by the decision procedure and `volta_z3` so both backends check
   exactly the same elements. `sampled_elements(paired, sample)` flattens
   the paired footprints to each array's sampled prefix - the one
@@ -450,9 +451,12 @@ Commands:
 
 - `volta parse <file>` - Check syntax
 - `volta analyze <file> -k <kernel> -b 32,4 -g 1,2 --array name:base:width:len:kind --param ptr:name ...` - Run symbolic execution, report races/deadlocks, print output expressions (+ a per-instruction-kind profile; `--no-profile` to skip)
-- `volta compare <ref.ptx> <opt.ptx> --kernel1 .. --kernel2 ..` - Two-kernel
+- `volta compare <ref.ptx> <opt.ptx> --kernel1 .. --kernel2 .. --check-array out` - Two-kernel
   equivalence check (launch flags shared with `analyze` via a flattened
   `LaunchArgs`; `--block2`/`--grid2` override the optimized kernel's dims).
+  `--check-array NAME` (repeatable, required) names the output arrays to
+  check - the explicit `paired_elements` list, checked against the
+  declared config before execution and by `paired_elements` after.
   `--backend decision|z3`, `--iterations N` (decision backend only,
   default 1), `--dump-vcs`/
   `--from-dump` (the shared `driver::vc_dump` format - volta-bench's

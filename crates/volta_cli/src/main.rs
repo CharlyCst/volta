@@ -189,6 +189,13 @@ struct CompareArgs {
     #[arg(long)]
     grid2: Option<String>,
 
+    /// Output array to check, by name (repeatable, at least one
+    /// required; order = check order). Each name must be an output
+    /// array declared in the launch config (with --from-dump: recorded
+    /// in the dump).
+    #[arg(long = "check-array", value_name = "NAME", required = true)]
+    check_arrays: Vec<String>,
+
     /// Check at most this many common elements per array (0 = all)
     #[arg(long, default_value_t = 0)]
     sample: u64,
@@ -498,7 +505,26 @@ fn z3_verdict(counts: &volta_z3::Z3Counts) -> Z3Verdict {
     }
 }
 
+/// Reject duplicate `--check-array` names - checking an array twice only
+/// double-counts its elements. Clap enforces that at least one name was
+/// given (the list is always explicit, matching `paired_elements`'
+/// interface - there is no derived default); membership is checked
+/// against the declared launch config before symbolic execution, and by
+/// `paired_elements` (the authority) after.
+fn validate_check_arrays(arrays: &[String]) -> Result<(), String> {
+    for (i, name) in arrays.iter().enumerate() {
+        if arrays[..i].contains(name) {
+            return Err(format!("--check-array '{}' given more than once", name));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
+    if let Err(e) = validate_check_arrays(&args.check_arrays) {
+        eprintln!("error: {}", e);
+        return ExitCode::FAILURE;
+    }
     if args.from_dump.is_some() && args.dump_vcs.is_some() {
         eprintln!("note: --dump-vcs is a no-op with --from-dump (nothing new to dump)");
     }
@@ -560,6 +586,25 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                 }
             };
 
+            // Fail fast on a name no declared output array matches: a
+            // run's recorded outputs are exactly the config's out/inout
+            // arrays (and the config is shared by both kernels), so this
+            // catches a typo before symbolic execution, which can run
+            // minutes. `paired_elements` stays the authority afterwards.
+            for name in &args.check_arrays {
+                if !config1
+                    .arrays
+                    .iter()
+                    .any(|a| a.kind.is_output() && &a.name == name)
+                {
+                    eprintln!(
+                        "error: --check-array '{}' is not a declared output array",
+                        name
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+
             let start = Instant::now();
             let reference = match analyze_kernel(&module1, args.kernel1.as_deref(), config1) {
                 Ok(o) => o,
@@ -616,9 +661,9 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
         println!("Loaded verification conditions from dump (no fresh symbolic execution).");
     }
 
-    // The arrays to check: the launch config's declared output arrays, as
-    // recorded in the reference run (a dump records the same list).
-    let check_arrays: Vec<String> = reference.outputs.iter().map(|(n, _)| n.clone()).collect();
+    // The arrays to check: exactly the --check-array names, in their given
+    // order. `paired_elements` rejects any that both runs don't have.
+    let check_arrays: &[String] = &args.check_arrays;
 
     match args.backend {
         BackendArg::Decision => {
@@ -630,7 +675,7 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
             };
             let vc_start = Instant::now();
             let report =
-                check_output_equivalence_with(&reference, &optimized, &check_arrays, &options);
+                check_output_equivalence_with(&reference, &optimized, check_arrays, &options);
             let vc_secs = vc_start.elapsed().as_secs_f64();
 
             match report {
@@ -705,7 +750,7 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
             let report = volta_z3::check_output_equivalence(
                 &reference,
                 &optimized,
-                &check_arrays,
+                check_arrays,
                 args.sample,
                 timeout,
                 mode,
@@ -877,6 +922,30 @@ mod tests {
             unknown,
             ..Z3Counts::default()
         }
+    }
+
+    #[test]
+    fn unique_check_arrays_validate() {
+        // Membership is deliberately not checked here: the declared-config
+        // check owns it before execution, `paired_elements` after.
+        assert!(validate_check_arrays(&["out".to_string(), "aux".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn duplicate_check_arrays_are_rejected() {
+        let arrays = vec!["out".to_string(), "aux".to_string(), "out".to_string()];
+        let err = validate_check_arrays(&arrays).unwrap_err();
+        assert!(err.contains("'out'"), "{}", err);
+    }
+
+    #[test]
+    fn compare_requires_at_least_one_check_array() {
+        // The list is required, never derived - parity with
+        // `paired_elements`' explicit-list interface.
+        let without = ["volta", "compare", "a.ptx", "b.ptx"];
+        assert!(Cli::try_parse_from(without).is_err());
+        let with = ["volta", "compare", "a.ptx", "b.ptx", "--check-array", "out"];
+        assert!(Cli::try_parse_from(with).is_ok());
     }
 
     #[test]
