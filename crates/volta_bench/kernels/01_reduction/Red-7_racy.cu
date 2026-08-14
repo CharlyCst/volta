@@ -56,6 +56,6 @@ __global__ void reduce1block(const int *g_idata, int *g_odata) {
     g_odata[0] = sdata[0];
 }
 
-// and here is the concrete instantiation for blockSize = 1024:
-template __global__ void reduce1block<8>(const int * /*g_idata*/,
-                                         int * /*g_odata*/);
+// and here is the concrete instantiation for blockSize = 128:
+template __global__ void reduce1block<128>(const int * /*g_idata*/,
+                                           int * /*g_odata*/);

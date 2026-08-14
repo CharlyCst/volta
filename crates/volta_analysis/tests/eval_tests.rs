@@ -422,7 +422,7 @@ fn test_out_of_bounds_shared_access() {
 }
 
 // =========================================================================
-// Natural alignment (PTX ISA 6.4.2: "The address must be naturally aligned
+// Natural alignment (PTX ISA 6.4.1: "The address must be naturally aligned
 // to a multiple of the access size"; misaligned accesses are undefined
 // behavior on hardware, so the evaluator rejects them)
 // =========================================================================

@@ -70,7 +70,7 @@ pub enum EvalError {
         width: u64,
     },
     /// A memory access whose address is not a multiple of its required
-    /// alignment. PTX ISA 6.4.2: "The address must be naturally aligned to
+    /// alignment. PTX ISA 6.4.1: "The address must be naturally aligned to
     /// a multiple of the access size. If an address is not properly
     /// aligned, the resulting behavior is undefined" - the undefined
     /// behavior is rejected rather than silently given well-defined

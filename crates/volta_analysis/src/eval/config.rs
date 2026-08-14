@@ -148,7 +148,7 @@ impl AnalysisConfig {
                 ));
             }
             // PTX requires every access to be naturally aligned (ISA
-            // 6.4.2); a base that is not a multiple of the element width
+            // 6.4.1); a base that is not a multiple of the element width
             // would make *every* element access misaligned, so reject it
             // once here instead of per access.
             if a.base % a.elem_width != 0 {
@@ -289,7 +289,7 @@ mod tests {
     }
 
     /// A base that is not a multiple of the element width would make every
-    /// element access misaligned (PTX ISA 6.4.2), so it is rejected once at
+    /// element access misaligned (PTX ISA 6.4.1), so it is rejected once at
     /// config time rather than per access.
     #[test]
     fn validate_rejects_misaligned_array_base() {

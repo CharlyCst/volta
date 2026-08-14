@@ -689,7 +689,7 @@ impl<'p> Interpreter<'p> {
                 let width = ty.size_bytes() as u64;
                 // The access size of a vector load is the *total* number of
                 // bytes accessed (`ld.v4.b32` is one 16-byte access, PTX
-                // ISA 6.4.2), so the whole vector's bounds and alignment
+                // ISA 6.4.1), so the whole vector's bounds and alignment
                 // are checked once here. The whole-footprint bounds check
                 // is load-bearing: the per-element checks in `mem_read`
                 // below would each pass inside a *different* region and let
@@ -1242,7 +1242,7 @@ impl<'p> Interpreter<'p> {
         }
     }
 
-    /// Natural-alignment check. PTX ISA 6.4.2: "The address must be
+    /// Natural-alignment check. PTX ISA 6.4.1: "The address must be
     /// naturally aligned to a multiple of the access size. If an address is
     /// not properly aligned, the resulting behavior is undefined". A
     /// misaligned kernel has no defined hardware semantics to model, so the

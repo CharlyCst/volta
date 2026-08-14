@@ -58,24 +58,24 @@ pub fn benchmarks() -> Vec<BenchmarkDef> {
     // in[0..128) (the reduction loop starts at s = blockDim.x/4 = 32, so
     // only sdata[0..64) feeds the result). Static shared, dyn 0.
     let red4 = kernel("Red-4.ptx", "_Z7reduce0PiS_", 128, 192, 0);
-    // Red-5/6/7 were compiled with BLOCKSIZE=8 (8 threads; Red-6/7 bake it
-    // as the `Lj8E` template arg in the mangled names). All three use real
-    // `.extern .shared`, and their deprecated warp-synchronous tails read
-    // past the initialized 8 ints, so the dynamic window must cover the
-    // over-reads: Red-5's tail starts at `sdata[tid+32]` (max byte offset
-    // 7*4+128, so 160 bytes = 40 ints); Red-6/7's blockSize=8
-    // instantiations only reach `sdata[tid+4]` (48 bytes = 12 ints).
-    // 256 bytes covers all three with headroom. n = 128 is likewise
-    // generous: Red-5 reads in[0..12) (i and i + BLOCKSIZE/2), Red-6/7
-    // read in[0..8).
-    let red5 = kernel("Red-5_racy.ptx", "_Z7reduce0PiS_", 8, 128, 256);
-    let red6 = kernel("Red-6_racy.ptx", "_Z7reduce6ILj8EEvPiS0_", 8, 128, 256);
+    // Red-5/6/7 are compiled with BLOCKSIZE=128, matching Red-1..4 (Red-6/7
+    // bake it as the `Lj128E` template arg in the mangled names). All three
+    // use real `.extern .shared`. Their warp-synchronous tails stay inside
+    // the 128 initialized ints, but Red-7's shifted tree step
+    // (`if (tid < 128) sdata[tid] += sdata[tid + 128]`) reads up to
+    // sdata[255], so the dynamic window must cover 256 ints = 1024 bytes;
+    // 2048 bytes covers all three with headroom. The uninitialized values
+    // feed pure data (never an address or branch), which a race check
+    // tolerates. Red-5 loads `in[i] + in[i + BLOCKSIZE/2]`, reading
+    // in[0..192) like Red-4, hence n = 192; Red-6/7 read in[0..128).
+    let red5 = kernel("Red-5_racy.ptx", "_Z7reduce0PiS_", 128, 192, 2048);
+    let red6 = kernel("Red-6_racy.ptx", "_Z7reduce6ILj128EEvPiS0_", 128, 128, 2048);
     let red7 = kernel(
         "Red-7_racy.ptx",
-        "_Z12reduce1blockILj8EEvPKiPi",
-        8,
+        "_Z12reduce1blockILj128EEvPKiPi",
         128,
-        256,
+        128,
+        2048,
     );
 
     vec![

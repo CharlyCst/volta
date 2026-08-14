@@ -1,5 +1,5 @@
 // red5.cu
-#define BLOCKSIZE 8
+#define BLOCKSIZE 128
 
 __device__ __forceinline__ void warpReduce(volatile int *sdata, int tid) {
   sdata[tid] += sdata[tid + 32];

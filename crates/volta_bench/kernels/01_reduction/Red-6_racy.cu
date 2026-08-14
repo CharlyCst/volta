@@ -1,4 +1,4 @@
-#define BLOCKSIZE 8
+#define BLOCKSIZE 128
 template <unsigned int blockSize>
 __device__ void warpReduce(volatile int *sdata, unsigned int tid) {
   if (blockSize >= 64)

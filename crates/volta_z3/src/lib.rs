@@ -19,7 +19,7 @@
 mod ffi;
 mod translate;
 
-pub use ffi::{init_worker, z3_version};
+pub use ffi::{EvalOutcome, eval_smtlib2, init_worker, z3_version};
 pub use translate::{Builder, ExpMode, Unsupported, translate_root};
 
 use std::fmt;
