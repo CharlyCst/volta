@@ -185,7 +185,7 @@ two documented baselines, and the backend implements both:
   fast `unknown` the query runs until the time budget kills it -
   reported as `timeout`. The paper used a 10-minute budget.
 
-`--z3-timeout` is a *hard* per-query bound: z3 4.8.12 does not reliably
+`--z3-timeout` is a _hard_ per-query bound: z3 4.8.12 does not reliably
 honor its own soft timeout in the axiom-induced loop (measured: a
 3-second soft timeout still running after 90 seconds), so each query
 evaluates in a worker subprocess (the binary re-invoking itself; no
@@ -193,21 +193,22 @@ separate executable) that is killed on expiry. `timeout` in the
 element counts means the budget expired; `unknown` means z3 itself gave
 up with budget to spare.
 
-Because the translation deliberately does no reasoning, *every* element
+Because the translation deliberately does no reasoning, _every_ element
 costs a genuine spawn+solve - trivially identical sides included, at
 tens of milliseconds of wall clock each. Reported Z3 time is the
-*solver* time only: it is measured inside the worker, spanning exactly
+_solver_ time only: it is measured inside the worker, spanning exactly
 libz3's evaluation of the query text, so the worker's fixed scaffolding
+
 - process spawn/exec/pipes plus z3's context creation and lazy frontend
-setup, ~10.5ms together (measured), which would otherwise swamp a
-polynomial-fragment query's actual solve - is excluded, as is
-translation/query construction. Elements that exhaust the budget report
-the budget itself as their time - the paper's convention for timeout
-rows - whether the budget was enforced by the parent's hard kill or by
-z3's own soft cancellation. A full-footprint run over a large output
-(tens of thousands of elements) therefore takes hours where the decision
-procedure takes seconds; that gap is a result, not an inefficiency. Use
-`--sample` to bound the element count (Table 8 uses `--sample 1`).
+  setup, ~10.5ms together (measured), which would otherwise swamp a
+  polynomial-fragment query's actual solve - is excluded, as is
+  translation/query construction. Elements that exhaust the budget report
+  the budget itself as their time - the paper's convention for timeout
+  rows - whether the budget was enforced by the parent's hard kill or by
+  z3's own soft cancellation. A full-footprint run over a large output
+  (tens of thousands of elements) therefore takes hours where the decision
+  procedure takes seconds; that gap is a result, not an inefficiency. Use
+  `--sample` to bound the element count (Table 8 uses `--sample 1`).
 
 Covers the arithmetic + `Exp` + `Max`/`Min` fragment as a **direct
 semantic image**: every expression node maps to its defining SMT term
@@ -254,11 +255,12 @@ The pipeline's two halves also run separately, over the same `all`/
 generation phase and writes the dumps (plus `vcs/manifest.json`, its
 record of what each dump contains), and `solve` replays just the solve
 phase(s) from those dumps - no parsing, lowering, or symbolic execution
+
 - with `--backend decision|z3|both` choosing the solver(s). Both halves
-call the same phase functions as the one-shot pipeline, so they measure
-and decide exactly the same things; see
-[Reproducing the paper](#reproducing-the-paper) for the intended
-workflow.
+  call the same phase functions as the one-shot pipeline, so they measure
+  and decide exactly the same things; see
+  [Reproducing the paper](#reproducing-the-paper) for the intended
+  workflow.
 
 ```bash
 cargo run --release -p volta_bench -- generate category attention   # VCs + dumps only
@@ -281,7 +283,7 @@ Useful flags (global):
   [Comparing against Z3](#comparing-against-z3)
 - `--out-dir <path>` (default `bench-out/`): where VC dumps and results
   JSON files land - same section
-- `--json <path>` (on every run command): *also* write the
+- `--json <path>` (on every run command): _also_ write the
   results JSON document to this explicit path (the timestamped file under
   `<out-dir>/results/` is always written; both contain the same document)
 
@@ -348,7 +350,7 @@ benchmarks' whole analysis is the symbolic execution), so they land in
 step 1's results file and `solve` skips those benchmarks with a note.
 Steps 2-4 never re-execute a kernel: they load `bench-out/vcs/*.vcdump`
 (each file's bytes are hashed against `bench-out/vcs/manifest.json`
-*before* decoding, then validated on load, so a stale, mixed, or
+_before_ decoding, then validated on load, so a stale, mixed, or
 modified dump directory fails loudly instead of quietly solving the
 wrong VCs; the load time is reported as `dump_load_secs`, excluded from
 the solve timings). On a memory-limited machine, replace step 2 with
@@ -361,7 +363,7 @@ the full-footprint attention working set.
 Every benchmark's work splits into separately-timed phases:
 
 - **VC generation** (`vc_gen_*`): lowering, both kernels' symbolic
-  executions, and footprint pairing - everything it takes to *produce*
+  executions, and footprint pairing - everything it takes to _produce_
   the verification conditions from the parsed modules. Each kernel file
   is read and parsed once per benchmark, outside the timed loop; writing
   the dump file is excluded too (reported separately as
@@ -395,7 +397,7 @@ Re-running phases is also a correctness check, not just a timing one:
   iteration 1, and later iterations must reproduce it - a disagreement
   is a hard error.
 - Every generation iteration must reproduce iteration 1's
-  *fingerprint* - the same outcome kind and, element for element, the
+  _fingerprint_ - the same outcome kind and, element for element, the
   same written footprints and expression identities (arena node count plus
   per-element `ExprId`s: each generation builds a fresh arena
   deterministically, so identical construction order is equivalent to
@@ -428,20 +430,21 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
 
   Race-check benchmarks have no VCs (nothing to compare); they are
   skipped with a console note.
+
 - `bench-out/vcs/manifest.json` - written by `generate` (read-modify-
   write per dump, atomically via temp file + rename, so partial
   regenerations keep the other entries): each dump's benchmark name,
   generation timestamp, `vc_fingerprint` (a stable FNV-1a hash of the
   exact `.vcdump` bytes written), and per-array footprint element
   counts (informational). `solve` hashes every dump file's bytes
-  against the manifest *before* decoding them and hard-errors on
+  against the manifest _before_ decoding them and hard-errors on
   disagreement. The guard catches any difference between the dump
   being solved and the one the last successful `generate` recorded -
   footprint drift, same-shape expression drift (a one-constant change
   in the PTX), truncation or corruption; what it deliberately does not
   check is currency with the current source tree (a dump set
   consistently regenerated together stays valid however old - solving
-  from dumps is decoupled by design). A generate run that *fails* for
+  from dumps is decoupled by design). A generate run that _fails_ for
   a benchmark also deletes that benchmark's leftover dump and entry,
   so a later `solve` errors on the missing dump instead of silently
   solving pre-failure VCs. A missing manifest or entry is only a
@@ -452,8 +455,7 @@ Each run writes under `--out-dir` (default `bench-out/`, gitignored):
   run: a header (argv, timestamp, iterations, sample, recycle-terms,
   whether `--z3` was on plus its timeout and the iteration carve-out
   convention; `solve` headers add the `backend` and `vcs_from_dumps:
-  true`), and one record per benchmark:
-
+true`), and one record per benchmark:
   - identity and verdict: `name`, `category`, `status`, `detail`,
     `passed`, `elements_checked`/`elements_total`
   - per-phase timing stats, one set per timed phase
@@ -487,7 +489,7 @@ cargo run --release -p volta_bench -- --z3 category reduction
 cargo run --release -p volta_bench -- --z3 single "(Attention, FA1)"
 ```
 
-Every equivalence benchmark's VCs are then solved by *both* backends -
+Every equivalence benchmark's VCs are then solved by _both_ backends -
 the exact same sampled elements - and the tables gain two columns: the
 median Z3 solve time and Z3's per-element
 equivalent/not-equivalent/unknown/timeout/unsupported/error breakdown.
@@ -498,7 +500,7 @@ pairing and the optional `--verify-numeric` oracle excluded), and
 [Z3 backend](#z3-backend) - worker spawn/exec and translation excluded,
 timeout elements counted at their full budget. Both are medians over
 `--iterations`, with one Z3 carve-out: an element whose iteration-1
-outcome is timeout/unsupported/error is *not* re-solved in later
+outcome is timeout/unsupported/error is _not_ re-solved in later
 iterations (re-solving a timeout would multiply its full budget into
 every iteration; unsupported/error elements never reach the solver) -
 its iteration-1 time is charged to every iteration's total, and the
@@ -518,7 +520,7 @@ In the results JSON, each benchmark's `z3` section carries the phase's
 full data: `solve_iters_secs` (every iteration, carve-out included) with
 median/min/mean/CV, the verdict `counts`, and `elements` - iteration 1's
 per-element results as `{array, index, outcome, detail, solve_secs}`
-(per-element times for *every* iteration would bloat the document;
+(per-element times for _every_ iteration would bloat the document;
 iteration-1 elements plus per-iteration totals is the shape). The
 `axiom` sub-section repeats all of that for the `+exp-axiom` rerun
 (null for exponential-free benchmarks), and `error` is non-null when
