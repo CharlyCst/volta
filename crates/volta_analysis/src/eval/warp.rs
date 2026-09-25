@@ -783,7 +783,8 @@ impl Interpreter<'_> {
         };
 
         // An `.f16` accumulator holds the same four C/D elements packed
-        // two to a register; an f32 one is a single element per register.
+        // two to a register; every other modeled accumulator (f32, s32)
+        // is one unpacked element per register.
         let packed_accumulator = *d_type == ScalarType::F16;
         let accumulator = |lane: u32| {
             if packed_accumulator {
@@ -1297,21 +1298,20 @@ impl Interpreter<'_> {
         }
     }
 
-    /// `tcgen05.ld`: collective async load into `dst.len()` registers per
-    /// thread, from the Tensor Memory rectangle based at the warp-uniform
-    /// `taddr` that `shape` and the register count describe. Which cell a
-    /// given thread's register names is `shape`'s business
-    /// ([`Tcgen05LdStShape::cell`]); `.32x32b` is the identity case, one
-    /// column per register on the thread's own physical lane.
+    /// `tcgen05.ld`: collective async load of `dst.len()` Tensor Memory
+    /// columns (base column from the warp-uniform `taddr`) into `dst.len()`
+    /// registers per lane - one column per register, each thread reading
+    /// its own physical lane (see `tcgen05_lane`).
     ///
     /// Checked once for the whole op against `RaceTracker::tcgen05_begin`,
     /// not per cell: PTX ISA 9.7.17.8's `taddr`+`.num` always describes one
     /// contiguous column range within one lane quadrant (every member
     /// shares the same quadrant - see `sm100a_support_plan.md`'s hazard
     /// design), so a single range check covers the whole footprint.
-    /// Beyond that, each cell is χ-checked per lane thread: a
-    /// `tcgen05.mma` is issued by one thread for all 128 lanes, so another
-    /// warp reading its result needs a happens-before edge to the issuer.
+    /// Beyond that in-flight check, each cell is χ-checked per lane thread,
+    /// and the range must not belong to a `tcgen05.mma` still in flight: an
+    /// MMA is issued by one thread for all 128 lanes, so reading its result
+    /// needs the completion edge (the mbarrier its commit arrives on).
     fn exec_tcgen05_ld(
         &mut self,
         pc: InstrId,
@@ -1333,6 +1333,7 @@ impl Interpreter<'_> {
         self.race
             .tcgen05_begin(quadrant, base_col, num_cols, false, current)
             .map_err(Self::tcgen05_hazard_error)?;
+        self.check_inflight_mma_tmem(quadrant, base_col, num_cols, current, None)?;
         for &m in members {
             for (k, &reg) in dst.iter().enumerate() {
                 let (lane, col) = shape.cell(m.0 % WARP_SIZE, k as u32);
@@ -1354,17 +1355,18 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// `tcgen05.st`: collective async store of `src.len()` registers per
-    /// thread, to the same rectangle `exec_tcgen05_ld` reads - its mirror. Each thread evaluates `src` against its own
+    /// `tcgen05.st`: collective async store of `src.len()` Tensor Memory
+    /// columns from `src.len()` registers per lane - the mirror of
+    /// `exec_tcgen05_ld`. Each thread evaluates `src` against its own
     /// registers (the operand list is shared syntax, not shared values -
     /// e.g. the driving kernel's zero-fill idiom repeats one register
     /// holding a per-thread-identical constant across every slot). Hazard
     /// footprint checked once for the whole op, same reasoning as `.ld`.
     ///
     /// A source register's whole [`Value`] lands in the cell, packed
-    /// halves included: publishing `f16x2` data for a later tensor-core
-    /// read is what this instruction is for, and collapsing the pair to
-    /// one expression would lose a half.
+    /// halves included: publishing `f16x2` `A` operands for a later
+    /// `tcgen05.mma [a-tmem]` is exactly what this instruction is for, and
+    /// collapsing the pair to one expression would lose a half.
     fn exec_tcgen05_st(
         &mut self,
         pc: InstrId,
@@ -1386,6 +1388,7 @@ impl Interpreter<'_> {
         self.race
             .tcgen05_begin(quadrant, base_col, num_cols, true, current)
             .map_err(Self::tcgen05_hazard_error)?;
+        self.check_inflight_mma_tmem(quadrant, base_col, num_cols, current, None)?;
         for &m in members {
             for (k, op) in src.iter().enumerate() {
                 let (lane, col) = shape.cell(m.0 % WARP_SIZE, k as u32);

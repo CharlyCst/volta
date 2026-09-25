@@ -22,7 +22,7 @@ use crate::eval::mbarrier::MbarrierTable;
 use crate::eval::memory::{GranuleKind, MemAccessError, Memory};
 use crate::eval::race::{MemHazard, Proxy, RaceTracker, TensorMemRaceInfo};
 use crate::eval::target::TargetFeatures;
-use crate::eval::tcgen05_mma::{self, Major, OperandFormat};
+use crate::eval::tcgen05_mma::{self, InflightMma, Major, OperandFormat, TmemRange};
 use crate::eval::tensor_map_table::{self, TensorMapTable};
 use crate::eval::tensor_memory::TensorMemory;
 use crate::eval::value::{MbarrierId, RegFile, Value};
@@ -389,6 +389,9 @@ pub struct Interpreter<'p> {
     pub(in crate::eval) shared: Memory,
     locals: IdVec<ThreadId, Memory>,
     pub(in crate::eval) tensor: TensorMemory,
+    /// Issued `tcgen05.mma`s no waiter has yet observed complete - see
+    /// `tcgen05_mma::InflightMma`.
+    pub(in crate::eval) tcgen05_inflight: Vec<InflightMma>,
     /// Issued `cp.async.bulk{.tensor}` copies no waiter has yet observed
     /// complete - see `InflightBulkCopy`.
     bulk_inflight: Vec<InflightBulkCopy>,
@@ -617,6 +620,7 @@ impl<'p> Interpreter<'p> {
             shared: Memory::new(),
             locals,
             tensor: TensorMemory::new(),
+            tcgen05_inflight: Vec::new(),
             bulk_inflight: Vec::new(),
             regions,
             race: RaceTracker::new(n_threads as usize),
@@ -844,8 +848,8 @@ impl<'p> Interpreter<'p> {
     /// here (9.7.14.16.19, ordering items 1-3): before waking, each waiter
     /// is `sync_group`-ed with the mbarrier's `prior_participants` (the
     /// threads whose `mbarrier.arrive` completed the phase it was waiting
-    /// on) plus itself - all of one barrier's waiters in a single χ pass,
-    /// `RaceTracker::sync_mbarrier_waiters` - so their prior accesses become
+    /// on) plus itself (all of one barrier's waiters in a single χ pass,
+    /// `RaceTracker::sync_mbarrier_waiters`), so their prior accesses become
     /// visible to it rather
     /// than continuing to look like unsynchronized races. Lowering rejects
     /// non-default (`.relaxed`) semantics on `mbarrier.arrive`/`test_wait`/
@@ -874,6 +878,7 @@ impl<'p> Interpreter<'p> {
         for (id, waiters) in &waiters_by_barrier {
             let participants = self.mbarriers.prior_participants(*id);
             self.race.sync_mbarrier_waiters(participants, waiters);
+            self.release_observed_mmas(*id);
             self.release_observed_bulk_copies(*id);
         }
         for (tid, _) in &ready {
@@ -1413,64 +1418,15 @@ impl<'p> Interpreter<'p> {
                 selector,
             } => {
                 let selector = self.concrete_operand(t, pc, selector, "prmt selector")? as u16;
-                let fp8_sign_xor = |this: &mut Self, value: ExprId| {
-                    let ExprNode::BitXor(left, right) = this.arena.node(value).clone() else {
-                        return value;
-                    };
-                    let magnitude = if this.arena.as_int_const(left) == Some(128) {
-                        Some(right)
-                    } else if this.arena.as_int_const(right) == Some(128) {
-                        Some(left)
-                    } else {
-                        None
-                    };
-                    magnitude.map_or(value, |value| this.arena.neg(value))
-                };
-                // A scalar byte loaded from an FP8 array already denotes
-                // its real value. A vector-loaded word is a Quad of four
-                // such values, not a scalar bit pattern. Keep those lanes
-                // split while applying the byte selector.
-                let lanes = |this: &mut Self, value: Value| match value {
-                    Value::Scalar(value) => Ok([Some(fp8_sign_xor(this, value)), None, None, None]),
-                    Value::Quad(b0, b1, b2, b3) => Ok([Some(b0), Some(b1), Some(b2), Some(b3)]),
-                    Value::Pair(..) => Err(EvalError::ValueKindMismatch {
-                        thread: t,
-                        pc,
-                        what: "packed pair used as a prmt source",
-                    }),
-                    Value::Mbarrier(_) => Err(EvalError::ValueKindMismatch {
-                        thread: t,
-                        pc,
-                        what: "mbarrier handle used as a prmt source",
-                    }),
-                };
+                let nibbles = [0u16, 4, 8, 12].map(|shift| (selector >> shift) & 0xf);
                 let src_a = self.operand_value(t, pc, src_a)?;
                 let src_b = self.operand_value(t, pc, src_b)?;
-                let a = lanes(self, src_a)?;
-                let b = lanes(self, src_b)?;
-                let select_byte = |this: &mut Self, nibble: u16| {
-                    let source = if nibble & 7 < 4 { &a } else { &b };
-                    let byte = source[(nibble & 3) as usize].ok_or(EvalError::Unsupported {
-                        pc,
-                        what: format!(
-                            "prmt selector {selector:#06x}: byte {} is unavailable from a scalar \
-                             FP8 input",
-                            nibble & 7
-                        ),
-                    })?;
-                    Ok(if nibble & 8 == 0 {
-                        byte
-                    } else {
-                        this.arena.neg(byte)
-                    })
+                let value = match self.prmt_lane_permutation(t, pc, src_a, src_b, nibbles)? {
+                    Some(quad) => quad,
+                    None => self.prmt_bit_permutation(pc, selector, src_a, src_b, nibbles)?,
                 };
-                let b0 = select_byte(self, selector & 0xf)?;
-                let b1 = select_byte(self, (selector >> 4) & 0xf)?;
-                let b2 = select_byte(self, (selector >> 8) & 0xf)?;
-                let b3 = select_byte(self, (selector >> 12) & 0xf)?;
-                self.write_reg(t, pc, *dst, Value::Quad(b0, b1, b2, b3))?;
+                self.write_reg(t, pc, *dst, value)?;
             }
-
             LoweredInstr::Lop3 {
                 dst,
                 src_a,
@@ -2199,7 +2155,9 @@ impl<'p> Interpreter<'p> {
             // thread so far has completed, perform an mbarrier
             // arrive-on(count=1) - same per-thread, non-warp-cooperative
             // shape as `MbarrierArrive` below (issued by a single thread,
-            // not a warp rendezvous).
+            // not a warp rendezvous). The arrive is the completion signal,
+            // so this is where this thread's in-flight MMAs become
+            // trackable by the phase it contributes to.
             LoweredInstr::Tcgen05Commit {
                 addr_base,
                 addr_offset,
@@ -2211,6 +2169,7 @@ impl<'p> Interpreter<'p> {
                     .shared
                     .read_mbarrier(addr)
                     .map_err(|e| self.mem_error(t, pc, MemSpace::Shared, e))?;
+                self.commit_tcgen05_mmas(t, id)?;
                 self.mbarriers.arrive(id, t, 1, None);
             }
 
@@ -2392,15 +2351,9 @@ impl<'p> Interpreter<'p> {
                 tx_count,
             } => {
                 let addr = self.effective_addr(t, pc, addr_base, *addr_offset)?;
-                self.check_bounds(t, pc, MemSpace::Shared, addr, 8)?;
-                self.check_alignment(t, pc, MemSpace::Shared, addr, 8)?;
-                let id = self
-                    .shared
-                    .read_mbarrier(addr)
-                    .map_err(|e| self.mem_error(t, pc, MemSpace::Shared, e))?;
                 let tx_count =
                     self.non_negative_operand(t, pc, tx_count, "mbarrier.complete_tx txCount")?;
-                self.mbarriers.complete_tx(id, tx_count);
+                self.mbarrier_complete_tx(t, pc, addr, tx_count)?;
             }
 
             LoweredInstr::MbarrierWaitParity {
@@ -2496,22 +2449,38 @@ impl<'p> Interpreter<'p> {
         Ok(())
     }
 
-    /// `tcgen05.mma.cta_group::1.kind::{f16,f8f6f4} [d-tmem], a-desc, b-desc,
-    /// idesc, enable-input-d`: `D = A*B+D` (or `A*B` if `enable-input-d` is
-    /// false), `M x N x K` (`K` fixed by `.kind` - `tcgen05_mma::k_dim`),
+    /// `tcgen05.mma.cta_group::1.kind::{f16,f8f6f4} [d-tmem],
+    /// a-desc|[a-tmem], b-desc, idesc, enable-input-d`: `D = A*B+D` (or
+    /// `A*B` if `enable-input-d` is false), `M x N x K` (`K` fixed by
+    /// `.kind` - `tcgen05_mma::k_dim`),
     /// `A`/`B` read from shared memory through their matrix descriptors
     /// under the ISA's canonical layouts
-    /// (`eval::tcgen05_mma::operand_element_addr`), `D` written into Tensor
-    /// Memory by `tcgen05_mma::d_cell` (Layout D for `.cta_group::1`: one
-    /// CTA-wide `warp-rank % 4` grouping of 32 lanes each - confirmed
-    /// against Figures 211/212 - matching the existing `tcgen05.ld`/`.st`
-    /// `(lane, column)` addressing this reuses; `M = 128` puts element
-    /// `(m, n)` at lane `m`, column `d_tmem + n`, while a smaller `M`
-    /// folds `N` across the 128 lanes). Decodes and validates `idesc`/`a_desc`/`b_desc` first,
+    /// (`eval::tcgen05_mma::operand_element_addr`) - or, for `A` in the
+    /// bracketed form, straight out of Tensor Memory
+    /// ([`Self::read_mma_a_tmem`]). `D` written into Tensor
+    /// Memory at lane `m`, column `d_tmem + n` (Layout D for `M = 128`/
+    /// `.cta_group::1`: one CTA-wide `warp-rank % 4` grouping of 32 lanes
+    /// each - confirmed against Figures 211/212, fetched this session -
+    /// matching the existing `tcgen05.ld`/`.st` `(lane, column)` addressing
+    /// this reuses). Decodes and validates `idesc`/`a_desc`/`b_desc` first,
     /// in order, each with a specific reason, against the forms modeled:
-    /// dense, `M = 32` or `M = 128`, `D` f32, `A`/`B` f16 (`.kind::f16`) or e4m3/e5m2
+    /// dense, `M = 128`, `D` f32, `A`/`B` f16 (`.kind::f16`) or e4m3/e5m2
     /// (`.kind::f8f6f4`), no negate, relative leading-dimension stride,
     /// `base_offset == 0` on both descriptors.
+    ///
+    /// The data is computed here, at issue, but the ISA makes the operation
+    /// asynchronous, so it stays in flight (`tcgen05_mma::InflightMma`)
+    /// until a waiter observes an mbarrier phase a later `tcgen05.commit`
+    /// by `t` arrived on:
+    /// - operand reads are χ-checked now (their producers must be ordered
+    ///   before the issue), and the bytes stay write-locked in flight;
+    /// - `D` must not overlap an un-waited `tcgen05.ld`/`.st` or another
+    ///   issuer's in-flight MMA, and stays locked against `tcgen05.ld`/
+    ///   `.st` in flight - later MMAs from `t` are exempt, since the ISA
+    ///   executes one thread's MMAs in issue order;
+    /// - the accesses enter χ at the commit
+    ///   ([`Self::commit_tcgen05_mmas`]), so a sync that merely follows the
+    ///   issue orders nothing for other threads.
     #[allow(clippy::too_many_arguments)]
     fn exec_tcgen05_mma(
         &mut self,
@@ -2576,22 +2545,52 @@ impl<'p> Interpreter<'p> {
                 id.m, id.n
             )));
         }
-
-        let Tcgen05MmaA::Desc(a_desc) = a else {
-            return Err(unsupported(
-                "tcgen05.mma reading A from Tensor Memory ([a-tmem]) is not modeled".to_string(),
-            ));
-        };
-        let a_md = self.mma_matrix_descriptor(t, pc, a_desc, "tcgen05.mma a-desc")?;
-        let b_md = self.mma_matrix_descriptor(t, pc, b_desc, "tcgen05.mma b-desc")?;
+        let d_num_cols = id.n / d_groups;
 
         let k_dim = tcgen05_mma::k_dim(kind) as usize;
         let major = |transpose: bool| if transpose { Major::Mn } else { Major::K };
-        let a =
-            self.read_mma_operand(t, pc, (&a_md, major(id.transpose_a), a_format), id.m, k_dim)?;
-        let b =
-            self.read_mma_operand(t, pc, (&b_md, major(id.transpose_b), b_format), id.n, k_dim)?;
-
+        let mut operand_bytes = Vec::new();
+        let (a, a_tmem) = match a {
+            Tcgen05MmaA::Desc(desc) => {
+                let a_md = self.mma_matrix_descriptor(t, pc, desc, "tcgen05.mma a-desc")?;
+                let a = self.read_mma_operand(
+                    t,
+                    pc,
+                    (&a_md, major(id.transpose_a), a_format),
+                    id.m,
+                    k_dim,
+                    &mut operand_bytes,
+                )?;
+                (a, None)
+            }
+            Tcgen05MmaA::Tmem { base, offset } => {
+                if a_format != OperandFormat::F16 {
+                    return Err(unsupported(format!(
+                        "tcgen05.mma [a-tmem] with {a_format:?} elements is not modeled \
+                         (only .kind::f16's packed f16 pairs)"
+                    )));
+                }
+                if id.transpose_a {
+                    return Err(unsupported(
+                        "tcgen05.mma [a-tmem] with Transpose A is not modeled (Tensor \
+                         Memory holds A K-major already)"
+                            .to_string(),
+                    ));
+                }
+                self.read_mma_a_tmem(t, pc, (base, *offset), (id.m, k_dim))?
+            }
+        };
+        let b_md = self.mma_matrix_descriptor(t, pc, b_desc, "tcgen05.mma b-desc")?;
+        let b = self.read_mma_operand(
+            t,
+            pc,
+            (&b_md, major(id.transpose_b), b_format),
+            id.n,
+            k_dim,
+            &mut operand_bytes,
+        )?;
+        operand_bytes.sort_unstable();
+        operand_bytes.dedup();
         if let Some(Tcgen05Collector { buffer, op }) = collector {
             let slot = &mut self.threads[t].tcgen05_collectors[buffer as usize];
             if matches!(op, Tcgen05CollectorOp::Use | Tcgen05CollectorOp::LastUse)
@@ -2621,17 +2620,45 @@ impl<'p> Interpreter<'p> {
         for (slot, op) in disable_mask.iter_mut().zip(disable_output_lane) {
             *slot = self.concrete_operand(t, pc, op, "tcgen05.mma disable-output-lane")? as u32;
         }
-        let lane_disabled =
-            |lane: u32| -> bool { (disable_mask[(lane / 32) as usize] >> (lane % 32)) & 1 != 0 };
+        let lane_enabled = |lane: u32| (disable_mask[(lane / 32) as usize] >> (lane % 32)) & 1 == 0;
+        // `D` spans all 128 lanes whatever `M` is - an `M < 128` result
+        // simply folds `N` across them (`tcgen05_mma::d_cell`).
+        let d_lanes: Vec<u32> = (0..128).filter(|&lane| lane_enabled(lane)).collect();
+
+        let current = AccessSite {
+            thread: t,
+            pc,
+            is_write: true,
+        };
+        let mut quadrants: Vec<u32> = d_lanes.iter().map(|lane| lane / WARP_SIZE).collect();
+        quadrants.dedup();
+        for quadrant in quadrants {
+            if let Some(prior) = self
+                .race
+                .tcgen05_pending_conflict(quadrant, d_col_base, d_num_cols, true)
+            {
+                return Err(EvalError::Tcgen05AsyncHazard {
+                    quadrant,
+                    start_col: d_col_base,
+                    num_cols: d_num_cols,
+                    prior,
+                    current,
+                });
+            }
+            self.check_inflight_mma_tmem(quadrant, d_col_base, d_num_cols, current, Some(t))?;
+        }
 
         for m in 0..id.m {
             for n in 0..id.n {
                 let (lane, col) = tcgen05_mma::d_cell(m, n, (id.m, id.n));
                 let col = d_col_base + col;
-                if lane_disabled(lane) {
+                if !lane_enabled(lane) {
                     continue;
                 }
                 let mut acc = if enable_input_d {
+                    self.race
+                        .tmem_read(lane, col, t, pc)
+                        .map_err(Self::tmem_race_error)?;
                     match self
                         .tensor
                         .read(lane, col)
@@ -2665,15 +2692,29 @@ impl<'p> Interpreter<'p> {
                     .map_err(|e| self.tcgen05_error(t, pc, e))?;
             }
         }
+
+        for &byte in &operand_bytes {
+            self.race.lock_src(MemSpace::Shared, byte, 1, t, pc);
+        }
+        self.tcgen05_inflight.push(InflightMma {
+            issuer: t,
+            pc,
+            operand_bytes,
+            a_tmem,
+            d_lanes,
+            d_start_col: d_col_base,
+            d_num_cols,
+            trackers: Vec::new(),
+        });
         Ok(())
     }
 
     /// Read one `tcgen05.mma` operand - `rows x k_dim` elements, `rows`
     /// being its `M` (for `A`) or `N` (for `B`) extent - from shared memory
-    /// in row-major order. A concrete fp8 byte (never an input element:
-    /// e.g. zero padding a kernel stored itself) is decoded from its bit
-    /// encoding; a symbolic element already is its real value (see
-    /// `eval::fp8`'s module doc).
+    /// in row-major order, appending every byte it touches to `bytes`. A
+    /// concrete fp8 byte (never an input element: e.g. zero padding a
+    /// kernel stored itself) is decoded from its bit encoding; a symbolic
+    /// element already is its real value (see `eval::fp8`'s module doc).
     fn read_mma_operand(
         &mut self,
         t: ThreadId,
@@ -2681,6 +2722,7 @@ impl<'p> Interpreter<'p> {
         (desc, major, format): (&tcgen05_mma::MatrixDescriptor, Major, OperandFormat),
         rows: u32,
         k_dim: usize,
+        bytes: &mut Vec<u64>,
     ) -> EvalResult<Vec<ExprId>> {
         let elem_bytes = format.bytes();
         let mut elems = Vec::with_capacity(rows as usize * k_dim);
@@ -2717,6 +2759,7 @@ impl<'p> Interpreter<'p> {
                     _ => e,
                 };
                 elems.push(e);
+                bytes.extend(addr..addr + elem_bytes);
             }
         }
         Ok(elems)
@@ -2749,6 +2792,210 @@ impl<'p> Interpreter<'p> {
             )));
         }
         Ok(md)
+    }
+
+    /// Read `tcgen05.mma`'s `A` operand out of Tensor Memory (the
+    /// `[a-tmem]` form): `rows x k_dim` f16 elements, row `m` in lane
+    /// `lane_base + m` of the address's own lane field and element `k` in
+    /// the low (`k` even) or high (`k` odd) half of column `col_base +
+    /// k / 2` - the packing a `tcgen05.st` of `cvt.rn.f16x2.f32` results
+    /// leaves behind, and the layout `A`'s `K` contiguous 16-bit elements
+    /// have across 32-bit columns. Returns the elements row-major
+    /// alongside the cell range, which the caller keeps as part of the
+    /// operation's in-flight footprint.
+    ///
+    /// Each cell is χ-checked here at issue, the same point `D`'s
+    /// accumulator read is checked; the shared-memory operand path instead
+    /// locks its bytes now and enters χ at the commit, because only there
+    /// does it know which mbarrier phase completes it.
+    fn read_mma_a_tmem(
+        &mut self,
+        t: ThreadId,
+        pc: InstrId,
+        (base, offset): (&Operand, i64),
+        (rows, k_dim): (u32, usize),
+    ) -> EvalResult<(Vec<ExprId>, Option<TmemRange>)> {
+        let packed = self.effective_addr(t, pc, base, offset)? as u32;
+        let range = TmemRange {
+            lane_base: packed >> 16,
+            num_lanes: rows,
+            start_col: packed & 0xFFFF,
+            // Two f16 elements ride in each 32-bit column.
+            num_cols: (k_dim / 2) as u32,
+        };
+        let current = AccessSite {
+            thread: t,
+            pc,
+            is_write: false,
+        };
+        for quadrant in range.quadrants() {
+            if let Some(prior) =
+                self.race
+                    .tcgen05_pending_conflict(quadrant, range.start_col, range.num_cols, false)
+            {
+                return Err(EvalError::Tcgen05AsyncHazard {
+                    quadrant,
+                    start_col: range.start_col,
+                    num_cols: range.num_cols,
+                    prior,
+                    current,
+                });
+            }
+            self.check_inflight_mma_tmem(
+                quadrant,
+                range.start_col,
+                range.num_cols,
+                current,
+                Some(t),
+            )?;
+        }
+        let mut elems = Vec::with_capacity(rows as usize * k_dim);
+        for row in 0..rows {
+            let lane = range.lane_base + row;
+            for c in 0..range.num_cols {
+                let col = range.start_col + c;
+                self.race
+                    .tmem_read(lane, col, t, pc)
+                    .map_err(Self::tmem_race_error)?;
+                let cell = self
+                    .tensor
+                    .read(lane, col)
+                    .map_err(|e| self.tcgen05_error(t, pc, e))?;
+                let (lo, hi) = match cell {
+                    Some(Value::Pair(lo, hi)) => (lo, hi),
+                    Some(_) => {
+                        return Err(EvalError::ValueKindMismatch {
+                            thread: t,
+                            pc,
+                            what: "tcgen05.mma [a-tmem] cell does not hold a packed f16 pair",
+                        });
+                    }
+                    None => {
+                        let undefined = self.arena.undefined();
+                        (undefined, undefined)
+                    }
+                };
+                elems.push(lo);
+                elems.push(hi);
+            }
+        }
+        Ok((elems, Some(range)))
+    }
+
+    /// Reject an access to columns `[start_col, start_col + num_cols)` of
+    /// Tensor Memory `quadrant` while an in-flight `tcgen05.mma` - other
+    /// than one issued by `exempt` - still owns them: its `D` range either
+    /// way, and its `[a-tmem]` `A` range for a write, which would change
+    /// the operand under an operation that has not completed.
+    pub(in crate::eval) fn check_inflight_mma_tmem(
+        &self,
+        quadrant: u32,
+        start_col: u32,
+        num_cols: u32,
+        current: AccessSite,
+        exempt: Option<ThreadId>,
+    ) -> EvalResult<()> {
+        match self.tcgen05_inflight.iter().find(|op| {
+            Some(op.issuer) != exempt
+                && (op.d_overlaps(quadrant, start_col, num_cols)
+                    || (current.is_write && op.a_overlaps(quadrant, start_col, num_cols)))
+        }) {
+            Some(op) => Err(EvalError::Tcgen05AsyncHazard {
+                quadrant,
+                start_col,
+                num_cols,
+                prior: AccessSite {
+                    thread: op.issuer,
+                    pc: op.pc,
+                    is_write: true,
+                },
+                current,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Land one deferred `cp.async` copy: drop its locks and perform its
+    /// shared-memory write - a generic-proxy write (PTX ISA 9.7.10.28.3:
+    /// "cp.async is treated as a weak memory operation performed in the
+    /// generic proxy"), but one whose completion mechanism, like a bulk
+    /// copy's, orders it ahead of a later async-proxy read with no
+    /// `fence.proxy.async` (see `eval::race`'s module docs), so
+    /// `mem_write`'s generic-unfenced mark comes straight back off.
+    /// Shared by `cp.async.wait_group` and `cp.async.mbarrier.arrive`, the
+    /// two completion points.
+    fn complete_cp_async_copy(&mut self, t: ThreadId, copy: PendingCopy) -> EvalResult<()> {
+        // Release before writing: the deferred write must
+        // not trip the copy's own still-held dst lock (and
+        // an early same-thread peek before this point must
+        // still be caught by it - see the design writeup).
+        self.race
+            .release_dst(MemSpace::Shared, copy.dst_addr, copy.cp_size, t, copy.pc);
+        if copy.real_bytes > 0 {
+            self.race
+                .release_src(MemSpace::Global, copy.src_addr, copy.real_bytes, t, copy.pc);
+        }
+        for (i, v) in copy.words.into_iter().enumerate() {
+            self.mem_write(
+                t,
+                copy.pc,
+                MemSpace::Shared,
+                copy.dst_addr + i as u64 * 4,
+                4,
+                v,
+            )?;
+        }
+        self.race
+            .clear_generic_unfenced(copy.dst_addr, copy.cp_size);
+        Ok(())
+    }
+
+    /// `tcgen05.commit`'s tracking half: every MMA `t` has in flight
+    /// becomes completable by `mbar`'s forming phase. The first commit
+    /// covering an MMA is also its earliest possible completion signal, so
+    /// that is where its accesses enter χ, attributed to `t`: a waiter
+    /// observing the phase syncs with `t` (`try_fire_mbarrier`), making
+    /// them visible exactly along the ISA's completion edge.
+    fn commit_tcgen05_mmas(&mut self, t: ThreadId, mbar: MbarrierId) -> EvalResult<()> {
+        let phase = self.mbarriers.completed_phases(mbar);
+        for op in self.tcgen05_inflight.iter_mut().filter(|op| op.issuer == t) {
+            if op.trackers.is_empty() {
+                for &byte in &op.operand_bytes {
+                    self.race
+                        .read_via(MemSpace::Shared, byte, 1, t, op.pc, Proxy::Async)
+                        .map_err(Self::mem_hazard_error)?;
+                }
+                for &lane in &op.d_lanes {
+                    for col in op.d_start_col..op.d_start_col + op.d_num_cols {
+                        self.race
+                            .tmem_write(lane, col, t, op.pc)
+                            .map_err(Self::tmem_race_error)?;
+                    }
+                }
+            }
+            op.trackers.push((mbar, phase));
+        }
+        Ok(())
+    }
+
+    /// A waiter just observed `mbar`'s last completed phase: every MMA
+    /// tracked by that phase (or an earlier one of `mbar`) has completed,
+    /// so its operand locks and in-flight `D` footprint are dropped.
+    fn release_observed_mmas(&mut self, mbar: MbarrierId) {
+        let observed = self.mbarriers.completed_phases(mbar);
+        let race = &mut self.race;
+        self.tcgen05_inflight.retain(|op| {
+            let done = op
+                .trackers
+                .iter()
+                .any(|&(m, phase)| m == mbar && phase < observed);
+            if done {
+                for &byte in &op.operand_bytes {
+                    race.release_src(MemSpace::Shared, byte, 1, op.issuer, op.pc);
+                }
+            }
+            !done
+        });
     }
 
     // =====================================================================
@@ -3765,10 +4012,10 @@ impl<'p> Interpreter<'p> {
                 what: format!("cp.async.bulk size {size} is not a multiple of 16 bytes"),
             });
         }
-        self.check_bounds(t, pc, MemSpace::Global, src_addr, size)?;
         self.check_bounds(t, pc, MemSpace::Shared, dst_addr, size)?;
-        self.check_alignment(t, pc, MemSpace::Global, src_addr, 16)?;
         self.check_alignment(t, pc, MemSpace::Shared, dst_addr, 16)?;
+        self.check_bounds(t, pc, MemSpace::Global, src_addr, size)?;
+        self.check_alignment(t, pc, MemSpace::Global, src_addr, 16)?;
 
         for byte in (0..size).step_by(WORD_BYTES as usize) {
             let value = self.mem_read(t, pc, MemSpace::Global, src_addr + byte, WORD_BYTES)?;
@@ -3950,38 +4197,6 @@ impl<'p> Interpreter<'p> {
     ) -> EvalResult<u64> {
         let base = self.concrete_operand(t, pc, base, "memory address")?;
         Ok((base as u64).wrapping_add(offset as u64))
-    }
-
-    /// Land one deferred `cp.async` copy: drop its locks, then perform
-    /// its shared-memory write. Shared by `cp.async.wait_group` and
-    /// `cp.async.mbarrier.arrive`, the two completion points.
-    fn complete_cp_async_copy(&mut self, t: ThreadId, copy: PendingCopy) -> EvalResult<()> {
-        // Release before writing: the deferred write must
-        // not trip the copy's own still-held dst lock (and
-        // an early same-thread peek before this point must
-        // still be caught by it - see the design writeup).
-        self.race
-            .release_dst(MemSpace::Shared, copy.dst_addr, copy.cp_size, t, copy.pc);
-        if copy.real_bytes > 0 {
-            self.race
-                .release_src(MemSpace::Global, copy.src_addr, copy.real_bytes, t, copy.pc);
-        }
-        for (i, v) in copy.words.into_iter().enumerate() {
-            self.mem_write(
-                t,
-                copy.pc,
-                MemSpace::Shared,
-                copy.dst_addr + i as u64 * 4,
-                4,
-                v,
-            )?;
-        }
-        // The copy's own completion mechanism orders these bytes for a
-        // later async-proxy read, so the generic mark `mem_write` just
-        // left behind comes straight back off.
-        self.race
-            .clear_generic_unfenced(copy.dst_addr, copy.cp_size);
-        Ok(())
     }
 
     /// Ownership containment: the region owning the access's *first byte*
@@ -4607,6 +4822,118 @@ impl<'p> Interpreter<'p> {
             (_, Some(0)) => a,
             _ => self.eval_xor(ScalarType::B32, a, b),
         }
+    }
+
+    /// `prmt.b32` read as a permutation of byte-granular *real values*: a
+    /// `Quad` offers four fp8 lanes, a `Pair` two 16-bit halves, and a
+    /// `Scalar` a single fp8 element in lane 0 (where `xor` by 0x80 is the
+    /// sign flip, folded back to a negation). Keeping those lanes split is
+    /// what lets Volta carry fp8 data without ever bit-encoding it.
+    ///
+    /// `None` when the selector reaches a lane no source offers: the
+    /// byte-granular reading of the sources is then impossible, and
+    /// [`Self::prmt_bit_permutation`] takes over.
+    fn prmt_lane_permutation(
+        &mut self,
+        t: ThreadId,
+        pc: InstrId,
+        src_a: Value,
+        src_b: Value,
+        nibbles: [u16; 4],
+    ) -> EvalResult<Option<Value>> {
+        let lanes = |this: &mut Self, value: Value| match value {
+            Value::Scalar(value) => Ok([Some(Self::fp8_sign_xor(this, value)), None, None, None]),
+            Value::Pair(b0, b1) => Ok([Some(b0), Some(b1), None, None]),
+            Value::Quad(b0, b1, b2, b3) => Ok([Some(b0), Some(b1), Some(b2), Some(b3)]),
+            Value::Mbarrier(_) => Err(EvalError::ValueKindMismatch {
+                thread: t,
+                pc,
+                what: "mbarrier handle used as a prmt source",
+            }),
+        };
+        let a = lanes(self, src_a)?;
+        let b = lanes(self, src_b)?;
+        let select = |this: &mut Self, nibble: u16| {
+            let source = if nibble & 7 < 4 { &a } else { &b };
+            let lane = source[(nibble & 3) as usize]?;
+            Some(if nibble & 8 == 0 {
+                lane
+            } else {
+                this.arena.neg(lane)
+            })
+        };
+        let selected = (
+            select(self, nibbles[0]),
+            select(self, nibbles[1]),
+            select(self, nibbles[2]),
+            select(self, nibbles[3]),
+        );
+        let (Some(b0), Some(b1), Some(b2), Some(b3)) = selected else {
+            return Ok(None);
+        };
+        Ok(Some(Value::Quad(b0, b1, b2, b3)))
+    }
+
+    /// `xor` by 0x80 on a byte-granular fp8 lane is the sign flip; fold it
+    /// to a negation so the lane keeps denoting its real value.
+    fn fp8_sign_xor(&mut self, value: ExprId) -> ExprId {
+        let ExprNode::BitXor(left, right) = *self.arena.node(value) else {
+            return value;
+        };
+        let magnitude = if self.arena.as_int_const(left) == Some(128) {
+            Some(right)
+        } else if self.arena.as_int_const(right) == Some(128) {
+            Some(left)
+        } else {
+            None
+        };
+        magnitude.map_or(value, |value| self.arena.neg(value))
+    }
+
+    /// `prmt.b32` as the ISA defines it (9.7.7.7.1): each result byte is
+    /// the source byte its nibble names, or - when the nibble's bit 3 is
+    /// set - that byte's sign bit replicated eight times.
+    ///
+    /// Only reached once [`Self::prmt_lane_permutation`] has ruled out the
+    /// byte-granular reading, which is what settles a `Scalar` source's
+    /// ambiguity: a single fp8 lane has no bytes 1..3 to give, so a
+    /// selector that asks for one is over a real 32-bit bit pattern. A
+    /// `Pair`/`Quad` holds real values that are never bit-encoded, so a
+    /// selector reaching an absent lane of one stays unsupported.
+    fn prmt_bit_permutation(
+        &mut self,
+        pc: InstrId,
+        selector: u16,
+        src_a: Value,
+        src_b: Value,
+        nibbles: [u16; 4],
+    ) -> EvalResult<Value> {
+        let mut result = self.arena.int(0);
+        for (position, nibble) in nibbles.into_iter().enumerate() {
+            let source = if nibble & 7 < 4 { src_a } else { src_b };
+            let word = source.as_scalar().ok_or(EvalError::Unsupported {
+                pc,
+                what: format!(
+                    "prmt selector {selector:#06x}: byte {} is unavailable from a narrow \
+                     FP8 input",
+                    nibble & 7
+                ),
+            })?;
+            let shift = self.arena.int(i64::from(nibble & 3) * 8);
+            let shifted = self.arena.lshr(word, shift);
+            let mask = self.arena.int(0xff);
+            let mut byte = self.arena.bit_and(shifted, mask);
+            if nibble & 8 != 0 {
+                let sign_shift = self.arena.int(7);
+                let sign = self.arena.lshr(byte, sign_shift);
+                let ones = self.arena.int(0xff);
+                byte = self.arena.mul(sign, ones);
+            }
+            let place = self.arena.int(position as i64 * 8);
+            let placed = self.arena.shl(byte, place);
+            result = self.arena.bit_or(result, placed);
+        }
+        Ok(Value::Scalar(result))
     }
 
     /// Exact concrete integer semantics for `ty`.
